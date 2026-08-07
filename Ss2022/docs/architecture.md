@@ -2,7 +2,7 @@
 
 ## 进程模型
 
-Ss2022 不为节点创建进程。启用节点被转换为同一 `config.json` 的多个 Shadowsocks inbound，由一个 `sing-box.service` 负责启动、停止和重启。
+Ss2022 不为节点创建进程。启用节点被转换为同一 `config.json` 的多个 Shadowsocks inbound，由一个 sing-box 服务负责启动、停止和重启；Debian/Ubuntu/CentOS/AlmaLinux 使用 systemd，Alpine Linux 使用 OpenRC。
 
 节点地址是客户端分享信息，监听地址由系统 IPv4/IPv6 能力单独决定。IPv6 可用且 `bindv6only=0` 时默认监听 `::`；IPv4-only 系统监听 `0.0.0.0`；`bindv6only=1` 时按地址家庭生成监听地址。
 

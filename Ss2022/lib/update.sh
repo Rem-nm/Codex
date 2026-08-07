@@ -52,7 +52,7 @@ singbox_update_flow() {
     [[ -f "$old_config" ]] && install -m 600 -- "$old_config" "$SING_BOX_CONFIG"
     manager_state_set_json sing_box_version "$(jq -Rn --arg value "$old_version" '$value')" >/dev/null 2>&1 || true
     manager_state_set_json sing_box_binary_managed "$old_managed" >/dev/null 2>&1 || true
-    systemctl restart "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+    singbox_restart >/dev/null 2>&1 || true
     if singbox_health_check "$NODES_FILE" >/dev/null 2>&1; then
       warn '旧版 sing-box 已恢复并通过健康检查。'
     else
@@ -68,7 +68,7 @@ singbox_update_flow() {
       [[ -f "$old_config" ]] && install -m 600 -- "$old_config" "$SING_BOX_CONFIG"
       manager_state_set_json sing_box_version "$(jq -Rn --arg value "$old_version" '$value')" >/dev/null 2>&1 || true
       manager_state_set_json sing_box_binary_managed "$old_managed" >/dev/null 2>&1 || true
-      systemctl stop "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+      singbox_stop >/dev/null 2>&1 || true
       rm -f -- "$old_binary" "$old_config"
       return 1
     }
@@ -78,7 +78,7 @@ singbox_update_flow() {
       [[ -f "$old_config" ]] && install -m 600 -- "$old_config" "$SING_BOX_CONFIG"
       manager_state_set_json sing_box_version "$(jq -Rn --arg value "$old_version" '$value')" >/dev/null 2>&1 || true
       manager_state_set_json sing_box_binary_managed "$old_managed" >/dev/null 2>&1 || true
-      systemctl stop "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+      singbox_stop >/dev/null 2>&1 || true
       rm -f -- "$old_binary" "$old_config"
       return 1
     fi
@@ -152,11 +152,19 @@ manager_update_flow() {
 
   archive="$RUNTIME_DIR/ss-manager-$version.tar.gz"
   checksum="$RUNTIME_DIR/ss-manager-$version.SHA256SUMS"
-  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 120 -- "$asset_url" -o "$archive"
+  if ! curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 120 \
+    --output "$archive" -- "$asset_url"; then
+    rm -f -- "$archive"
+    die 'manager Release 下载失败；未替换当前程序。'
+  fi
   if [[ -n "$asset_digest" ]]; then
     expected=${asset_digest#sha256:}
   else
-    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 30 -- "$checksum_url" -o "$checksum"
+    if ! curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 30 \
+      --output "$checksum" -- "$checksum_url"; then
+      rm -f -- "$archive" "$checksum"
+      die 'manager 校验文件下载失败；未替换当前程序。'
+    fi
     expected=$(awk -v file="$asset_name" '$2 == file || $2 == "*" file {print $1; exit}' "$checksum")
   fi
   [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || die 'manager Release SHA256 校验值无效。'
@@ -171,8 +179,11 @@ manager_update_flow() {
   [[ -n "$source_entry" ]] || die 'manager 归档结构无效：缺少 ss-manager.sh。'
   source_root=$(dirname -- "$source_entry")
   [[ -n "$source_root" && -f "$source_root/VERSION" ]] || die 'manager 归档结构无效。'
+  [[ -f "$source_root/lib/service.sh" && -f "$source_root/openrc/sing-box" && -f "$source_root/systemd/sing-box.service" ]] \
+    || die 'manager 归档缺少服务管理模板。'
   [[ "$(tr -d '[:space:]' <"$source_root/VERSION")" == "$version" ]] || die 'manager 归档 VERSION 与 Release 标签不一致。'
   while IFS= read -r file; do bash -n "$file" || die "manager 更新包语法检查失败：$file"; done < <(find "$source_root" -type f -name '*.sh')
+  while IFS= read -r file; do sh -n "$file" || die "OpenRC 模板语法检查失败：$file"; done < <(find "$source_root/openrc" -maxdepth 1 -type f -print)
 
   old_program="${PROGRAM_DIR}.update-old.$$"
   new_program="${PROGRAM_DIR}.update-new.$$"

@@ -96,6 +96,16 @@ if grep -q '\$(node_count)' "$ROOT/install.sh"; then
   exit 1
 fi
 grep -q '"$SCRIPT_DIR/VERSION" "$PROGRAM_DIR/VERSION"' "$ROOT/install.sh"
+grep -q 'source "$SCRIPT_DIR/lib/service.sh"' "$ROOT/install.sh"
+grep -q 'manager_state_set_json install_completed true' "$ROOT/ss-manager.sh"
+grep -q 'enable_manager_maintenance_service' "$ROOT/install.sh"
+
+for service_aware_file in install.sh lib/backup.sh lib/menu.sh lib/singbox.sh lib/update.sh; do
+  if grep -q 'systemctl' "$ROOT/$service_aware_file"; then
+    printf 'assertion failed: %s bypasses the init-system abstraction\n' "$service_aware_file" >&2
+    exit 1
+  fi
+done
 
 test_tmp=$(mktemp -d)
 trap 'rm -rf -- "$test_tmp"' EXIT

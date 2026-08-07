@@ -322,11 +322,11 @@ singbox_management_flow() {
     printf '\nSing-box 管理\n1. 查看状态\n2. 启动\n3. 停止\n4. 重启\n5. 查看最近日志\n0. 返回\n> '
     IFS= read -r choice || die '读取输入失败。'
     case "$choice" in
-      1) systemctl status "$SING_BOX_SERVICE" --no-pager ;;
+      1) service_status "$SING_BOX_SERVICE" ;;
       2) run_menu_action singbox_start_action ;;
       3) run_menu_action singbox_stop_action ;;
       4) run_menu_action singbox_restart_action ;;
-      5) journalctl -u "$SING_BOX_SERVICE" --output cat -n 80 --no-pager ;;
+      5) service_recent_logs "$SING_BOX_SERVICE" ;;
       0) return 0 ;;
       *) warn '无效选项。' ;;
     esac
@@ -403,11 +403,7 @@ system_refresh_interfaces_action() {
 }
 
 remove_manager_service_files() {
-  systemctl disable --now "$SYSTEMD_TRAFFIC_TIMER" >/dev/null 2>&1 || true
-  systemctl disable --now "$SYSTEMD_TRAFFIC_SERVICE" >/dev/null 2>&1 || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  rm -f -- "$SYSTEMD_DIR/$SYSTEMD_TRAFFIC_TIMER" "$SYSTEMD_DIR/$SYSTEMD_TRAFFIC_SERVICE"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  remove_manager_maintenance_service_files
 }
 
 remove_rem_command() {
@@ -429,9 +425,9 @@ uninstall_flow() {
   remove_manager_service_files
   remove_rem_command
   if [[ "$mode" != 1 ]]; then
-    systemctl disable --now "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
-    if singbox_service_unit_is_managed; then rm -f -- "$SYSTEMD_DIR/$SING_BOX_SERVICE"; fi
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    singbox_stop >/dev/null 2>&1 || true
+    service_disable "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+    service_remove_managed_definition "$SING_BOX_SERVICE"
     if [[ "$(manager_state_get sing_box_binary_managed false)" == true ]]; then rm -f -- "$SING_BOX_BINARY"; fi
     rm -f -- "$SING_BOX_CONFIG"
     if [[ "$mode" == 2 ]]; then

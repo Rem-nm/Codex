@@ -10,6 +10,8 @@ source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/system.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/service.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/singbox.sh"
 
 require_root
@@ -44,8 +46,9 @@ ensure_dir "$BACKUP_DIR" 700
 if [[ ! -f "$MANAGER_STATE" ]]; then
   jq -n \
     --arg manager_version "$MANAGER_VERSION" \
+    --arg init_system "$INIT_SYSTEM" \
     --arg created_at "$(timestamp_iso)" \
-    '{schema_version:1,manager_version:$manager_version,sing_box_version:"",sing_box_binary_managed:false,sing_box_version_lock:null,created_at:$created_at,listen_mode:"ipv4",listen_address:"0.0.0.0",tfo_kernel_supported:false,tfo_kernel_enabled:false,tfo_config_supported:false,bbr_supported:false,bbr_enabled:false}' \
+    '{schema_version:1,manager_version:$manager_version,init_system:$init_system,install_completed:false,sing_box_version:"",sing_box_binary_managed:false,sing_box_version_lock:null,created_at:$created_at,listen_mode:"ipv4",listen_address:"0.0.0.0",tfo_kernel_supported:false,tfo_kernel_enabled:false,tfo_config_supported:false,bbr_supported:false,bbr_enabled:false}' \
     | atomic_json_from_stdin "$MANAGER_STATE" 600
 else
   jq -e . "$MANAGER_STATE" >/dev/null || die 'manager.json 无效，安装不会覆盖；请先使用备份恢复。'
@@ -60,16 +63,18 @@ if [[ -f "$SING_BOX_CONFIG" ]]; then
 fi
 
 copy_program() {
-  install -d -m 700 -- "$PROGRAM_DIR/lib" "$PROGRAM_DIR/config" "$PROGRAM_DIR/systemd"
+  install -d -m 700 -- "$PROGRAM_DIR/lib" "$PROGRAM_DIR/config" "$PROGRAM_DIR/systemd" "$PROGRAM_DIR/openrc"
   install -m 755 -- "$SCRIPT_DIR/ss-manager.sh" "$PROGRAM_DIR/ss-manager.sh"
   install -m 644 -- "$SCRIPT_DIR/VERSION" "$PROGRAM_DIR/VERSION"
   local file
   while IFS= read -r file; do install -m 700 -- "$file" "$PROGRAM_DIR/lib/$(basename "$file")"; done < <(find "$SCRIPT_DIR/lib" -maxdepth 1 -type f -name '*.sh' -print | sort)
   install -m 600 -- "$SCRIPT_DIR/config/defaults.conf" "$PROGRAM_DIR/config/defaults.conf"
   while IFS= read -r file; do install -m 644 -- "$file" "$PROGRAM_DIR/systemd/$(basename "$file")"; done < <(find "$SCRIPT_DIR/systemd" -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' \) -print | sort)
+  while IFS= read -r file; do install -m 700 -- "$file" "$PROGRAM_DIR/openrc/$(basename "$file")"; done < <(find "$SCRIPT_DIR/openrc" -maxdepth 1 -type f -print | sort)
 }
 copy_program
 manager_state_set_json manager_version "$(jq -Rn --arg value "$MANAGER_VERSION" '$value')"
+manager_state_set_json init_system "$(jq -Rn --arg value "$INIT_SYSTEM" '$value')"
 
 singbox_install_target=latest
 singbox_locked_version=$(manager_state_get sing_box_version_lock '')
@@ -97,32 +102,25 @@ singbox_config_supports_tfo || true
 candidate="$RUNTIME_DIR/config.install-candidate.$$.json"
 generate_singbox_config "$NODES_FILE" "$candidate"
 singbox_check_config "$candidate" >/dev/null || die '节点数据库生成的候选配置未通过 sing-box 官方检查。'
+check_manager_maintenance_service_files
 
-for install_unit in ss-manager-traffic.service ss-manager-traffic.timer; do
-  if [[ -f "$SYSTEMD_DIR/$install_unit" ]] && ! grep -q '^# Managed by Ss2022$' "$SYSTEMD_DIR/$install_unit"; then
-    die "$SYSTEMD_DIR/$install_unit 已存在且不是本项目创建，拒绝静默覆盖。"
-  fi
-done
-
-install_service_path="$SYSTEMD_DIR/$SING_BOX_SERVICE"
+install_service_path=$(service_definition_path "$SING_BOX_SERVICE")
 install_previous_service=''
+install_service_mode=644
+if [[ "$INIT_SYSTEM" == 'openrc' ]]; then
+  install_service_mode=755
+fi
 install_had_service_unit=0
-if systemctl cat "$SING_BOX_SERVICE" >/dev/null 2>&1; then
+if service_exists "$SING_BOX_SERVICE"; then
   install_had_service_unit=1
 fi
 if [[ -f "$install_service_path" ]]; then
   install_previous_service="$RUNTIME_DIR/sing-box.service.install-previous.$$"
-  install -m 644 -- "$install_service_path" "$install_previous_service"
+  install -m "$install_service_mode" -- "$install_service_path" "$install_previous_service"
 fi
 install_singbox_service_unit
 
-systemd_install_units() {
-  install -m 644 -- "$PROGRAM_DIR/systemd/ss-manager-traffic.service" "$SYSTEMD_DIR/ss-manager-traffic.service"
-  install -m 644 -- "$PROGRAM_DIR/systemd/ss-manager-traffic.timer" "$SYSTEMD_DIR/ss-manager-traffic.timer"
-  systemctl daemon-reload
-  systemctl enable "$SING_BOX_SERVICE" >/dev/null
-}
-systemd_install_units
+install_manager_maintenance_service_files
 
 cat >"$RUNTIME_DIR/rem.wrapper" <<'EOF'
 #!/usr/bin/env bash
@@ -134,33 +132,35 @@ rm -f -- "$RUNTIME_DIR/rem.wrapper"
 install -m 600 -- "$candidate" "$SING_BOX_CONFIG"
 if ! singbox_restart || ! singbox_health_check "$NODES_FILE"; then
   error 'sing-box 安装/修复后的健康检查失败，正在恢复安装前配置。'
-  systemctl stop "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+  singbox_stop >/dev/null 2>&1 || true
   if [[ -n "$install_previous_config" && -f "$install_previous_config" ]]; then
     install -m 600 -- "$install_previous_config" "$SING_BOX_CONFIG"
   else
     rm -f -- "$SING_BOX_CONFIG"
   fi
   if [[ -n "$install_previous_service" && -f "$install_previous_service" ]]; then
-    install -m 644 -- "$install_previous_service" "$install_service_path"
+    install -m "$install_service_mode" -- "$install_previous_service" "$install_service_path"
   else
     rm -f -- "$install_service_path"
   fi
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  service_manager_reload >/dev/null 2>&1 || true
   if (( install_had_service_unit == 1 )) && [[ -n "$install_previous_config" ]]; then
-    systemctl restart "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+    singbox_restart >/dev/null 2>&1 || true
   fi
   rm -f -- "$candidate" "$install_previous_config" "$install_previous_service"
   die '安装/修复失败；安装前配置已恢复，未进入节点创建流程。'
 fi
 rm -f -- "$candidate" "$install_previous_config" "$install_previous_service"
-systemctl enable --now "$SYSTEMD_TRAFFIC_TIMER" >/dev/null
+enable_manager_maintenance_service
 
 success "Ss2022 manager $MANAGER_VERSION 安装/修复完成。"
 printf '以后可在任意目录执行：rem\n'
 printf '本项目不会自动修改服务器防火墙、云安全组或现有安全策略。\n'
 
 installed_node_count=$(jq -er '.nodes | length' "$NODES_FILE") || die '无法读取节点数据库，未进入节点创建流程。'
-if (( fresh_install == 1 && installed_node_count == 0 )); then
+install_completed=$(manager_state_get install_completed false)
+if (( installed_node_count == 0 )) && [[ "$install_completed" != true ]]; then
   exec "$PROGRAM_DIR/ss-manager.sh" --first-run
 fi
+manager_state_set_json install_completed true
 exec "$PROGRAM_DIR/ss-manager.sh" menu

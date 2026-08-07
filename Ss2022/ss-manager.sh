@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installed entry point for rem and systemd timer operations.
+# Installed entry point for rem and scheduled maintenance operations.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -9,6 +9,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/system.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/service.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/singbox.sh"
 # shellcheck disable=SC1091
@@ -50,6 +52,7 @@ case "${1:-menu}" in
       run_menu_action node_add_flow
       (( ${MENU_ACTION_STATUS:-1} == 0 )) || die '首个节点创建未完成。'
     fi
+    manager_state_set_json install_completed true
     main_menu
     ;;
   menu)

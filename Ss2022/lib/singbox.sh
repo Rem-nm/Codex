@@ -53,7 +53,9 @@ install_singbox_from_release() {
   previous_version=$(manager_state_get sing_box_version '')
   previous_managed=$(manager_state_get sing_box_binary_managed false)
   local release_json tag version archive_name checksum_name archive_url checksum_url archive_digest
-  release_json=$(fetch_singbox_release_json "$requested")
+  if ! release_json=$(fetch_singbox_release_json "$requested"); then
+    die '无法查询 SagerNet/sing-box 官方 Release；未修改现有安装。'
+  fi
   jq -e '.tag_name and (.assets | type == "array")' >/dev/null <<<"$release_json" || die "官方 Release 响应格式异常。"
   tag=$(jq -er '.tag_name' <<<"$release_json")
   version=${tag#v}
@@ -78,12 +80,21 @@ install_singbox_from_release() {
   local candidate="$RUNTIME_DIR/sing-box-${version}-${HOST_ARCH}.candidate"
   rm -rf -- "$extract_dir"
   mkdir -p -- "$extract_dir"
-  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 120 -- "$archive_url" -o "$archive_file"
+  info "正在下载 sing-box $version（$HOST_ARCH）……"
+  if ! curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 120 \
+    --output "$archive_file" -- "$archive_url"; then
+    rm -f -- "$archive_file"
+    die 'sing-box 官方 Release 下载失败；未替换现有二进制。'
+  fi
   local expected actual
   if [[ -n "$archive_digest" ]]; then
     expected=${archive_digest#sha256:}
   else
-    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 30 -- "$checksum_url" -o "$checksum_file"
+    if ! curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 30 \
+      --output "$checksum_file" -- "$checksum_url"; then
+      rm -f -- "$archive_file" "$checksum_file"
+      die 'sing-box 官方校验文件下载失败；未替换现有二进制。'
+    fi
     expected=$(awk -v file="$archive_name" '$2 == file || $2 == "*" file { print $1; exit }' "$checksum_file")
   fi
   [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || die "官方 SHA256 文件中没有 $archive_name 的有效校验值。"
@@ -198,40 +209,67 @@ generate_singbox_config() {
 }
 
 singbox_service_unit_is_managed() {
-  [[ -f "$SYSTEMD_DIR/$SING_BOX_SERVICE" ]] && grep -q '^# Managed by Ss2022$' "$SYSTEMD_DIR/$SING_BOX_SERVICE"
+  service_definition_is_managed "$SING_BOX_SERVICE"
 }
 
 install_singbox_service_unit() {
-  local source="$PROJECT_ROOT/systemd/sing-box.service"
-  [[ -f "$source" ]] || die "缺少 sing-box systemd 模板：$source"
-  if [[ -f "$SYSTEMD_DIR/$SING_BOX_SERVICE" ]] && ! singbox_service_unit_is_managed; then
-    die "$SYSTEMD_DIR/$SING_BOX_SERVICE 已存在且不是本项目创建，拒绝静默覆盖。"
+  local source destination mode
+  destination=$(service_definition_path "$SING_BOX_SERVICE")
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    source="$PROJECT_ROOT/systemd/sing-box.service"
+    mode=644
+  else
+    source="$PROJECT_ROOT/openrc/sing-box"
+    mode=755
   fi
-  if [[ ! -f "$SYSTEMD_DIR/$SING_BOX_SERVICE" ]] && systemctl cat "$SING_BOX_SERVICE" >/dev/null 2>&1; then
-    warn "系统已有 $SING_BOX_SERVICE 单元，但它不在本项目路径下。"
-    prompt_yes_no '是否明确接管该 sing-box systemd 单元？' n || die '未接管已有 sing-box 单元，安装已安全停止。'
+  [[ -f "$source" ]] || die "缺少 sing-box 服务模板：$source"
+  if [[ -f "$destination" ]] && ! singbox_service_unit_is_managed; then
+    die "$destination 已存在且不是本项目创建，拒绝静默覆盖。"
   fi
-  install -m 644 -- "$source" "$SYSTEMD_DIR/$SING_BOX_SERVICE"
-  systemctl daemon-reload
-  systemctl enable "$SING_BOX_SERVICE" >/dev/null
+  if [[ ! -f "$destination" ]] && service_exists "$SING_BOX_SERVICE"; then
+    warn "系统已有 $SING_BOX_SERVICE 服务，但它不在本项目管理路径下。"
+    prompt_yes_no '是否明确接管该 sing-box 服务？' n || die '未接管已有 sing-box 服务，安装已安全停止。'
+  fi
+  install -m "$mode" -- "$source" "$destination"
+  service_manager_reload
+  service_enable "$SING_BOX_SERVICE" >/dev/null
 }
 
 singbox_start() {
-  systemctl start "$SING_BOX_SERVICE"
+  service_start "$SING_BOX_SERVICE"
 }
 
 singbox_stop() {
-  systemctl stop "$SING_BOX_SERVICE"
+  service_stop "$SING_BOX_SERVICE"
 }
 
 singbox_restart() {
-  # 当前官方文档提供的是 check/format/merge 与 systemd restart，没有可依赖的
+  # 当前官方文档提供的是 check/format/merge，没有可依赖的
   # 通用热 reload 命令；因此事务使用快速 restart，避免伪造 HUP 行为。
-  systemctl restart "$SING_BOX_SERVICE"
+  if service_is_active "$SING_BOX_SERVICE"; then
+    service_restart "$SING_BOX_SERVICE"
+  else
+    service_start "$SING_BOX_SERVICE"
+  fi
 }
 
 singbox_is_active() {
-  systemctl is-active --quiet "$SING_BOX_SERVICE"
+  service_is_active "$SING_BOX_SERVICE"
+}
+
+singbox_process_pid() {
+  local binary_real proc_path proc_exe
+  local -a pids=()
+  binary_real=$(readlink -f -- "$SING_BOX_BINARY" 2>/dev/null || true)
+  [[ -n "$binary_real" ]] || return 1
+  for proc_path in /proc/[0-9]*; do
+    [[ -r "$proc_path/exe" ]] || continue
+    proc_exe=$(readlink -f -- "$proc_path/exe" 2>/dev/null || true)
+    [[ "$proc_exe" == "$binary_real" ]] || continue
+    pids+=("${proc_path##*/}")
+  done
+  ((${#pids[@]} == 1)) || return 1
+  printf '%s' "${pids[0]}"
 }
 
 port_is_listening_tcp() {
@@ -244,11 +282,11 @@ port_is_listening_udp() {
   ss -H -lun 2>/dev/null | awk -v pattern="(^|:)${port}$" '$4 ~ pattern { found=1 } END { exit !found }'
 }
 
-singbox_health_check() {
+singbox_health_check_once() {
   local nodes_source=${1:-$NODES_FILE}
-  singbox_is_active || { error "sing-box systemd 服务未运行。"; return 1; }
+  singbox_is_active || { error "sing-box 服务未运行。"; return 1; }
   local main_pid
-  main_pid=$(systemctl show -p MainPID --value "$SING_BOX_SERVICE")
+  main_pid=$(singbox_process_pid) || { error "无法确认唯一的 sing-box 主进程。"; return 1; }
   [[ "$main_pid" =~ ^[0-9]+$ && "$main_pid" -gt 0 ]] || { error "无法取得 sing-box 主进程 PID。"; return 1; }
   kill -0 "$main_pid" 2>/dev/null || { error "sing-box 主进程不存在。"; return 1; }
   singbox_check_config "$SING_BOX_CONFIG" >/dev/null || { error "当前运行配置检查失败。"; return 1; }
@@ -261,6 +299,19 @@ singbox_health_check() {
     port_is_listening_udp "$port" || { error "预期 UDP 端口未监听：$port"; return 1; }
   done < <(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source")
   return 0
+}
+
+singbox_health_check() {
+  local nodes_source=${1:-$NODES_FILE}
+  local attempts=0
+  while (( attempts < 10 )); do
+    ((attempts += 1))
+    if singbox_health_check_once "$nodes_source" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  singbox_health_check_once "$nodes_source"
 }
 
 singbox_status_summary() {

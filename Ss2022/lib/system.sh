@@ -16,18 +16,26 @@ detect_host() {
         *) die "仅支持 Debian 11/12，当前为 $HOST_OS_NAME。" ;;
       esac
       PACKAGE_MANAGER=apt-get
+      INIT_SYSTEM=systemd
       ;;
     ubuntu)
       PACKAGE_MANAGER=apt-get
+      INIT_SYSTEM=systemd
       ;;
     centos)
       PACKAGE_MANAGER=$(command -v dnf >/dev/null 2>&1 && printf dnf || printf yum)
+      INIT_SYSTEM=systemd
       ;;
     almalinux)
       PACKAGE_MANAGER=$(command -v dnf >/dev/null 2>&1 && printf dnf || printf yum)
+      INIT_SYSTEM=systemd
+      ;;
+    alpine)
+      PACKAGE_MANAGER=apk
+      INIT_SYSTEM=openrc
       ;;
     *)
-      die "不支持的发行版：$HOST_OS_NAME。支持 Debian 11/12、Ubuntu、CentOS、AlmaLinux。"
+      die "不支持的发行版：$HOST_OS_NAME。支持 Debian 11/12、Ubuntu、CentOS、AlmaLinux、Alpine Linux。"
       ;;
   esac
 
@@ -38,9 +46,13 @@ detect_host() {
     *) die "不支持的 CPU 架构：$HOST_ARCH_RAW。优先支持 amd64 与 arm64。" ;;
   esac
 
-  command -v systemctl >/dev/null 2>&1 || die "当前系统没有 systemd/systemctl，无法满足单进程 systemd 管理要求。"
   (( BASH_VERSINFO[0] >= 4 )) || die "Bash 版本过低，需要 Bash 4 或更高版本。"
-  export HOST_OS_ID HOST_OS_VERSION HOST_OS_NAME PACKAGE_MANAGER HOST_ARCH_RAW HOST_ARCH
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    command -v systemctl >/dev/null 2>&1 || die "当前系统没有 systemd/systemctl，无法管理 sing-box 服务。"
+  elif [[ "$INIT_SYSTEM" == openrc ]]; then
+    command -v apk >/dev/null 2>&1 || die "Alpine Linux 缺少 apk，无法安全安装依赖。"
+  fi
+  export HOST_OS_ID HOST_OS_VERSION HOST_OS_NAME PACKAGE_MANAGER INIT_SYSTEM HOST_ARCH_RAW HOST_ARCH
 }
 
 package_list() {
@@ -51,20 +63,21 @@ gzip
 jq
 openssl
 python3
-qrencode
 tar
 util-linux
 coreutils
 findutils
 EOF
   if [[ "$PACKAGE_MANAGER" == apt-get ]]; then
-    printf '%s\n' iproute2 procps
+    printf '%s\n' iproute2 procps qrencode
   elif [[ "$PACKAGE_MANAGER" == dnf ]]; then
-    printf '%s\n' iproute iproute-tc procps-ng
-  else
+    printf '%s\n' iproute iproute-tc procps-ng qrencode
+  elif [[ "$PACKAGE_MANAGER" == yum ]]; then
     # CentOS 7 commonly ships tc inside iproute rather than a separate
     # iproute-tc package. Keep yum compatible with that layout.
-    printf '%s\n' iproute procps-ng
+    printf '%s\n' iproute procps-ng qrencode
+  else
+    printf '%s\n' bash iproute2 openrc
   fi
 }
 
@@ -92,9 +105,30 @@ install_packages() {
         yum -y install "${packages[@]}"
       }
       ;;
+    apk)
+      apk add --no-cache "${packages[@]}"
+      if ! command -v sysctl >/dev/null 2>&1; then
+        apk add --no-cache procps-ng \
+          || apk add --no-cache procps \
+          || die 'Alpine 软件源未提供 procps-ng/procps，无法安装 sysctl。'
+      fi
+      if ! command -v qrencode >/dev/null 2>&1; then
+        if ! apk add --no-cache libqrencode-tools; then
+          # Older Alpine branches provided the executable from libqrencode.
+          apk add --no-cache libqrencode || die 'Alpine 软件源未提供 qrencode；请确认已启用与当前版本匹配的官方 community 仓库。'
+        fi
+      fi
+      ;;
     *) die "未识别的包管理器：$PACKAGE_MANAGER。" ;;
   esac
-  require_cmd awk base64 curl date find flock grep install ip jq mktemp openssl python3 qrencode readlink sed sha256sum shuf ss sysctl systemctl tar tc tr uname wc
+  require_cmd awk base64 curl date find flock grep install ip jq mktemp openssl python3 qrencode readlink sed sha256sum shuf ss sysctl tar tc tr uname wc
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    require_cmd systemctl journalctl
+  else
+    require_cmd rc-service rc-update supervise-daemon
+    [[ -x /sbin/openrc-run ]] || die "Alpine Linux 缺少 /sbin/openrc-run，无法安装 OpenRC 服务。"
+    [[ -d /run/openrc ]] || die "当前 Alpine 系统并非由 OpenRC 启动，无法可靠管理长期服务。"
+  fi
 }
 
 manager_state_set_json() {

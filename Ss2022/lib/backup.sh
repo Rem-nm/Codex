@@ -109,9 +109,9 @@ restore_runtime_and_state() {
     rm -f -- "$SING_BOX_CONFIG"
   fi
   if (( service_was_active == 1 )); then
-    systemctl restart "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+    singbox_restart >/dev/null 2>&1 || true
   else
-    systemctl stop "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+    singbox_stop >/dev/null 2>&1 || true
   fi
   if ! (bandwidth_apply_nodes "$NODES_FILE" >/dev/null 2>&1); then
     error '旧配置已恢复，但旧 tc 流控规则恢复失败，请立即检查 tc 状态。'
@@ -196,7 +196,7 @@ apply_state_transaction() {
     error '新配置健康检查失败，正在恢复上一版本配置。'
     restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$service_was_active"
     if ! transaction_runtime_health_check "$old_nodes" "$service_was_active" >/dev/null 2>&1; then
-      error '严重：旧配置恢复后健康检查也失败，请立即检查 systemctl status sing-box。'
+      error '严重：旧配置恢复后健康检查也失败，请通过 rem 查看 sing-box 服务状态。'
     fi
     rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1

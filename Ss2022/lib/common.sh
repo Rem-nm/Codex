@@ -20,7 +20,7 @@ if [[ -r "$VERSION_FILE" ]]; then
   IFS= read -r MANAGER_VERSION <"$VERSION_FILE" || true
   MANAGER_VERSION=${MANAGER_VERSION//$'\r'/}
 fi
-MANAGER_VERSION="${MANAGER_VERSION:-1.0.1}"
+MANAGER_VERSION="${MANAGER_VERSION:-1.0.2}"
 [[ "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
   printf 'Invalid manager VERSION: %s\n' "$MANAGER_VERSION" >&2
   exit 1
@@ -32,7 +32,7 @@ RUNTIME_DIR="${RUNTIME_DIR:-/run/ss-manager}"
 BACKUP_DIR="${BACKUP_DIR:-$CONFIG_DIR/backups}"
 SING_BOX_BINARY="${SING_BOX_BINARY:-/usr/local/bin/sing-box}"
 SING_BOX_CONFIG="${SING_BOX_CONFIG:-/etc/sing-box/config.json}"
-SING_BOX_SERVICE="${SING_BOX_SERVICE:-sing-box.service}"
+SING_BOX_SERVICE="${SING_BOX_SERVICE:-sing-box}"
 
 MANAGER_STATE="$CONFIG_DIR/manager.json"
 NODES_FILE="$DATA_DIR/nodes.json"
@@ -44,6 +44,8 @@ TRANSACTION_LOCK="$RUNTIME_DIR/manager.lock"
 SYSTEMD_DIR="/etc/systemd/system"
 SYSTEMD_TRAFFIC_SERVICE="ss-manager-traffic.service"
 SYSTEMD_TRAFFIC_TIMER="ss-manager-traffic.timer"
+OPENRC_DIR="/etc/init.d"
+OPENRC_TRAFFIC_SERVICE="ss-manager-traffic"
 
 RED=""
 GREEN=""

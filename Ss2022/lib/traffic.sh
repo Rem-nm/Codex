@@ -222,9 +222,11 @@ traffic_update_node_settings() {
   local last_reset next
   last_reset=$(jq -r --arg id "$node_id" '.nodes[$id].last_reset_at // empty' "$traffic_tmp")
   [[ -n "$last_reset" ]] || last_reset=$(timestamp_iso)
-  next=$(calculate_next_reset_at "$last_reset" "$reset_day")
-  jq --arg id "$node_id" --argjson quota "$quota" --argjson reset_day "$reset_day" --arg next "$next" \
-    '.nodes[$id].quota_bytes=$quota | .nodes[$id].reset_day=$reset_day | .nodes[$id].next_reset_at=$next | .nodes[$id].updated_at=(now|todateiso8601)' \
+  # Changing a reset day must choose the next occurrence after now; deriving
+  # it from an old last_reset_at could produce a date already in the past.
+  next=$(calculate_next_reset_at "$(timestamp_iso)" "$reset_day")
+  jq --arg id "$node_id" --argjson quota "$quota" --argjson reset_day "$reset_day" --arg last "$last_reset" --arg next "$next" \
+    '.nodes[$id].quota_bytes=$quota | .nodes[$id].reset_day=$reset_day | .nodes[$id].last_reset_at=($last // .nodes[$id].last_reset_at) | .nodes[$id].next_reset_at=$next | .nodes[$id].updated_at=(now|todateiso8601)' \
     "$traffic_tmp" >"$traffic_tmp.next"
   mv -f -- "$traffic_tmp.next" "$traffic_tmp"
   printf '%s' "$traffic_tmp"

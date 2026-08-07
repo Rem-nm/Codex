@@ -49,18 +49,24 @@ install_singbox_from_release() {
   ensure_runtime_dirs
 
   local requested=${1:-latest}
-  local release_json tag version archive_name checksum_name archive_url checksum_url
+  local release_json tag version archive_name checksum_name archive_url checksum_url archive_digest
   release_json=$(fetch_singbox_release_json "$requested")
   jq -e '.tag_name and (.assets | type == "array")' >/dev/null <<<"$release_json" || die "官方 Release 响应格式异常。"
   tag=$(jq -er '.tag_name' <<<"$release_json")
   version=${tag#v}
   archive_name="sing-box-${version}-linux-${HOST_ARCH}.tar.gz"
-  checksum_name=$(jq -er '.assets[].name | select(test("(?i)(sha256|checksum)"))' <<<"$release_json" | head -n 1)
-  [[ -n "$checksum_name" ]] || die "官方 Release 未提供 SHA256 校验文件，已停止替换。"
   archive_url=$(release_asset_url "$release_json" "$archive_name") || die "官方 Release 没有当前架构资产：$archive_name"
-  checksum_url=$(release_asset_url "$release_json" "$checksum_name") || die "无法取得官方校验文件地址。"
   assert_official_singbox_release_url "$archive_url"
-  assert_official_singbox_release_url "$checksum_url"
+  archive_digest=$(jq -r --arg name "$archive_name" '.assets[] | select(.name == $name) | .digest // empty' <<<"$release_json")
+  if [[ "$archive_digest" =~ ^sha256:[A-Fa-f0-9]{64}$ ]]; then
+    checksum_name=''
+    checksum_url=''
+  else
+    checksum_name=$(jq -r '.assets[].name | select(test("(?i)(sha256|checksum)"))' <<<"$release_json" | head -n 1 || true)
+    [[ -n "$checksum_name" ]] || die "官方 Release 未提供 SHA256 校验文件或资产 digest，已停止替换。"
+    checksum_url=$(release_asset_url "$release_json" "$checksum_name") || die "无法取得官方校验文件地址。"
+    assert_official_singbox_release_url "$checksum_url"
+  fi
 
   local archive_file="$RUNTIME_DIR/sing-box-${version}-${HOST_ARCH}.tar.gz"
   local checksum_file="$RUNTIME_DIR/sing-box-${version}-SHA256SUMS"
@@ -69,10 +75,13 @@ install_singbox_from_release() {
   rm -rf -- "$extract_dir"
   mkdir -p -- "$extract_dir"
   curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 120 -- "$archive_url" -o "$archive_file"
-  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 30 -- "$checksum_url" -o "$checksum_file"
-
   local expected actual
-  expected=$(awk -v file="$archive_name" '$2 == file || $2 == "*" file { print $1; exit }' "$checksum_file")
+  if [[ -n "$archive_digest" ]]; then
+    expected=${archive_digest#sha256:}
+  else
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 30 -- "$checksum_url" -o "$checksum_file"
+    expected=$(awk -v file="$archive_name" '$2 == file || $2 == "*" file { print $1; exit }' "$checksum_file")
+  fi
   [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || die "官方 SHA256 文件中没有 $archive_name 的有效校验值。"
   actual=$(sha256sum -- "$archive_file" | awk '{print $1}')
   [[ "${actual,,}" == "${expected,,}" ]] || die "sing-box 下载校验失败，已停止替换。"

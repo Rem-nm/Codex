@@ -68,6 +68,7 @@ show_node_credentials() {
   else
     warn '系统没有 qrencode，无法在终端显示二维码；URI 仍可复制。'
   fi
+  printf '\n请检查服务器防火墙、安全组或云厂商防火墙是否放行 TCP/UDP 端口。\n'
   printf '\n请妥善保管以上密钥、链接和二维码，不要提交到 GitHub 或普通日志。\n'
 }
 

@@ -1,0 +1,60 @@
+# 数据模型
+
+## nodes.json
+
+```json
+{
+  "schema_version": 1,
+  "nodes": [
+    {
+      "node_id": "32 个小写十六进制字符",
+      "name": "Tokyo",
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "base64 密钥",
+      "port": 20001,
+      "address": "example.com",
+      "address_type": "domain",
+      "status": "enabled",
+      "status_reason": "",
+      "quota_bytes": 0,
+      "reset_day": 1,
+      "upload_limit_mbps": 0,
+      "download_limit_mbps": 0,
+      "created_at": "UTC ISO-8601",
+      "updated_at": "UTC ISO-8601",
+      "last_reset_at": "UTC ISO-8601",
+      "next_reset_at": "UTC ISO-8601"
+    }
+  ]
+}
+```
+
+名称、端口只用于展示和监听；Node ID 是永久身份。允许名称重命名、端口重分配和密钥重生成，历史通过 Node ID 关联。
+
+## traffic.json
+
+每个节点至少有：
+
+```json
+{
+  "current_upload_bytes": 0,
+  "current_download_bytes": 0,
+  "total_upload_bytes": 0,
+  "total_download_bytes": 0,
+  "quota_bytes": 0,
+  "reset_day": 1,
+  "last_reset_at": "UTC ISO-8601",
+  "next_reset_at": "UTC ISO-8601"
+}
+```
+
+`tc-counters.json` 只保存内核计数器基线，不是用户流量数据；重建规则后会重新建立基线。
+
+## 状态
+
+- `enabled`：包含在 sing-box 配置中
+- `disabled_manual`：用户手动停用
+- `disabled_quota`：达到本周期限额
+- `disabled_error`：检测到节点配置/运行异常
+
+只有 `disabled_quota` 在节点自己的新周期结算后自动恢复。

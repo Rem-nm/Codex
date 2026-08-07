@@ -149,11 +149,12 @@ node_status_flow() {
   node_id=$(select_node_id '请选择要启用/停用的节点') || return 0
   node=$(node_by_id "$node_id")
   status=$(jq -er '.status' <<<"$node")
-  printf '1. 启用节点\n2. 停用节点\n0. 返回\n> '
+  printf '1. 启用节点\n2. 手动停用节点\n3. 标记为错误停用\n0. 返回\n> '
   IFS= read -r action || die '读取输入失败。'
   case "$action" in
     1) status=enabled; reason='' ;;
     2) status=disabled_manual; reason='用户手动停用' ;;
+    3) status=disabled_error; reason='用户确认节点运行/配置异常' ;;
     0) return 0 ;;
     *) warn '无效选项。'; return 0 ;;
   esac

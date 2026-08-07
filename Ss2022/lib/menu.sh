@@ -106,6 +106,8 @@ node_modify_flow() {
       reset_day=$(jq -er --arg id "$node_id" '.nodes[] | select(.node_id == $id) | .reset_day' "$candidate_nodes")
       traffic_source=$(traffic_update_node_settings "$node_id" "$quota" "$reset_day")
       mv -f -- "$traffic_source" "$candidate_traffic"
+      traffic_sync_nodes_schedule "$candidate_nodes" "$candidate_traffic" "$candidate_nodes.next"
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       jq --arg id "$node_id" --argjson quota "$quota" '.nodes[] |= if .node_id == $id then .quota_bytes=$quota | .updated_at=(now|todateiso8601) else . end' "$candidate_nodes" >"$candidate_nodes.next"
       mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       changed=1
@@ -117,6 +119,8 @@ node_modify_flow() {
       quota=$(jq -er --arg id "$node_id" '.nodes[] | select(.node_id == $id) | .quota_bytes' "$candidate_nodes")
       traffic_source=$(traffic_update_node_settings "$node_id" "$quota" "$reset_day")
       mv -f -- "$traffic_source" "$candidate_traffic"
+      traffic_sync_nodes_schedule "$candidate_nodes" "$candidate_traffic" "$candidate_nodes.next"
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       jq --arg id "$node_id" --argjson reset_day "$reset_day" '.nodes[] |= if .node_id == $id then .reset_day=$reset_day | .updated_at=(now|todateiso8601) else . end' "$candidate_nodes" >"$candidate_nodes.next"
       mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       changed=1
@@ -197,6 +201,8 @@ traffic_quota_flow() {
   traffic_update_node_settings "$node_id" "$quota" "$reset_day" >"$RUNTIME_DIR/traffic.quota.source.$$"
   mv -f -- "$(cat "$RUNTIME_DIR/traffic.quota.source.$$")" "$candidate_traffic"
   rm -f -- "$RUNTIME_DIR/traffic.quota.source.$$"
+  traffic_sync_nodes_schedule "$candidate_nodes" "$candidate_traffic" "$candidate_nodes.next"
+  mv -f -- "$candidate_nodes.next" "$candidate_nodes"
   install -m 600 -- "$HISTORY_FILE" "$candidate_history"
   if apply_state_transaction "$candidate_nodes" "$candidate_traffic" "$candidate_history" "quota-node-$node_id"; then success '月流量限额已更新。'; else error '月流量限额更新失败，已回滚。'; fi
   rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"
@@ -218,6 +224,8 @@ traffic_reset_day_flow() {
   traffic_update_node_settings "$node_id" "$quota" "$reset_day" >"$RUNTIME_DIR/traffic.reset.source.$$"
   mv -f -- "$(cat "$RUNTIME_DIR/traffic.reset.source.$$")" "$candidate_traffic"
   rm -f -- "$RUNTIME_DIR/traffic.reset.source.$$"
+  traffic_sync_nodes_schedule "$candidate_nodes" "$candidate_traffic" "$candidate_nodes.next"
+  mv -f -- "$candidate_nodes.next" "$candidate_nodes"
   install -m 600 -- "$HISTORY_FILE" "$candidate_history"
   if apply_state_transaction "$candidate_nodes" "$candidate_traffic" "$candidate_history" "reset-day-node-$node_id"; then success '流量重置日已更新。'; else error '重置日更新失败，已回滚。'; fi
   rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"

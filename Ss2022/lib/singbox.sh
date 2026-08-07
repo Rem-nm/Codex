@@ -57,6 +57,7 @@ install_singbox_from_release() {
   jq -e '.tag_name and (.assets | type == "array")' >/dev/null <<<"$release_json" || die "官方 Release 响应格式异常。"
   tag=$(jq -er '.tag_name' <<<"$release_json")
   version=${tag#v}
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || die "官方 Release 标签不是可接受的 sing-box 版本：$tag"
   archive_name="sing-box-${version}-linux-${HOST_ARCH}.tar.gz"
   archive_url=$(release_asset_url "$release_json" "$archive_name") || die "官方 Release 没有当前架构资产：$archive_name"
   assert_official_singbox_release_url "$archive_url"

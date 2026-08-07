@@ -94,7 +94,7 @@ install_packages() {
       ;;
     *) die "未识别的包管理器：$PACKAGE_MANAGER。" ;;
   esac
-  require_cmd awk base64 curl date flock grep ip jq openssl python3 qrencode sed ss systemctl tar tr uname
+  require_cmd awk base64 curl date find flock grep install ip jq mktemp openssl python3 qrencode readlink sed sha256sum shuf ss sysctl systemctl tar tc tr uname wc
 }
 
 manager_state_set_json() {

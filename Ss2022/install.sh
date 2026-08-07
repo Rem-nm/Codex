@@ -14,6 +14,7 @@ source "$SCRIPT_DIR/lib/singbox.sh"
 
 require_root
 detect_host
+assert_standard_destructive_paths
 
 existing_rem=$(command -v rem 2>/dev/null || true)
 if [[ -n "$existing_rem" ]] && ! is_command_from_manager "$existing_rem"; then
@@ -22,9 +23,15 @@ if [[ -n "$existing_rem" ]] && ! is_command_from_manager "$existing_rem"; then
 fi
 
 fresh_install=1
-if [[ -f "$MANAGER_STATE" || -f "$NODES_FILE" || -x "$SING_BOX_BINARY" ]]; then
+if [[ -f "$MANAGER_STATE" || -f "$NODES_FILE" || -x "$PROGRAM_DIR/ss-manager.sh" ]]; then
   fresh_install=0
   info '检测到已有安装数据，将执行幂等的修复/补齐流程，不会覆盖节点、密码或流量数据。'
+fi
+
+if (( fresh_install == 1 )) && [[ -f "$SING_BOX_CONFIG" ]]; then
+  warn "检测到已有 sing-box 配置：$SING_BOX_CONFIG；它不属于已识别的 Ss2022 安装。"
+  prompt_yes_no '是否明确由 Ss2022 接管，并以节点数据库生成的配置替换它？失败时会自动恢复' n \
+    || die '未接管已有 sing-box 配置，安装已安全停止。'
 fi
 
 install_packages
@@ -46,15 +53,23 @@ fi
 
 initialize_state_files
 
+install_previous_config=''
+if [[ -f "$SING_BOX_CONFIG" ]]; then
+  install_previous_config="$RUNTIME_DIR/config.install-previous.$$.json"
+  install -m 600 -- "$SING_BOX_CONFIG" "$install_previous_config"
+fi
+
 copy_program() {
   install -d -m 700 -- "$PROGRAM_DIR/lib" "$PROGRAM_DIR/config" "$PROGRAM_DIR/systemd"
   install -m 755 -- "$SCRIPT_DIR/ss-manager.sh" "$PROGRAM_DIR/ss-manager.sh"
+  install -m 644 -- "$SCRIPT_DIR/VERSION" "$PROGRAM_DIR/VERSION"
   local file
   while IFS= read -r file; do install -m 700 -- "$file" "$PROGRAM_DIR/lib/$(basename "$file")"; done < <(find "$SCRIPT_DIR/lib" -maxdepth 1 -type f -name '*.sh' -print | sort)
   install -m 600 -- "$SCRIPT_DIR/config/defaults.conf" "$PROGRAM_DIR/config/defaults.conf"
   while IFS= read -r file; do install -m 644 -- "$file" "$PROGRAM_DIR/systemd/$(basename "$file")"; done < <(find "$SCRIPT_DIR/systemd" -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' \) -print | sort)
 }
 copy_program
+manager_state_set_json manager_version "$(jq -Rn --arg value "$MANAGER_VERSION" '$value')"
 
 singbox_install_target=latest
 singbox_locked_version=$(manager_state_get sing_box_version_lock '')
@@ -79,24 +94,33 @@ configure_bbr
 configure_tcp_fast_open_kernel
 singbox_config_supports_tfo || true
 
-install_singbox_service_unit
-if [[ ! -f "$SING_BOX_CONFIG" ]]; then
-  candidate="$RUNTIME_DIR/config.initial.$$.json"
-  generate_singbox_config "$NODES_FILE" "$candidate"
-  singbox_check_config "$candidate" >/dev/null
-  install -m 600 -- "$candidate" "$SING_BOX_CONFIG"
-  rm -f -- "$candidate"
-else
-  chmod 600 -- "$SING_BOX_CONFIG"
-  singbox_check_config "$SING_BOX_CONFIG" >/dev/null || die '现有 sing-box 配置检查失败；安装不会覆盖它。'
+candidate="$RUNTIME_DIR/config.install-candidate.$$.json"
+generate_singbox_config "$NODES_FILE" "$candidate"
+singbox_check_config "$candidate" >/dev/null || die '节点数据库生成的候选配置未通过 sing-box 官方检查。'
+
+for install_unit in ss-manager-traffic.service ss-manager-traffic.timer; do
+  if [[ -f "$SYSTEMD_DIR/$install_unit" ]] && ! grep -q '^# Managed by Ss2022$' "$SYSTEMD_DIR/$install_unit"; then
+    die "$SYSTEMD_DIR/$install_unit 已存在且不是本项目创建，拒绝静默覆盖。"
+  fi
+done
+
+install_service_path="$SYSTEMD_DIR/$SING_BOX_SERVICE"
+install_previous_service=''
+install_had_service_unit=0
+if systemctl cat "$SING_BOX_SERVICE" >/dev/null 2>&1; then
+  install_had_service_unit=1
 fi
+if [[ -f "$install_service_path" ]]; then
+  install_previous_service="$RUNTIME_DIR/sing-box.service.install-previous.$$"
+  install -m 644 -- "$install_service_path" "$install_previous_service"
+fi
+install_singbox_service_unit
 
 systemd_install_units() {
   install -m 644 -- "$PROGRAM_DIR/systemd/ss-manager-traffic.service" "$SYSTEMD_DIR/ss-manager-traffic.service"
   install -m 644 -- "$PROGRAM_DIR/systemd/ss-manager-traffic.timer" "$SYSTEMD_DIR/ss-manager-traffic.timer"
   systemctl daemon-reload
   systemctl enable "$SING_BOX_SERVICE" >/dev/null
-  systemctl enable --now "$SYSTEMD_TRAFFIC_TIMER" >/dev/null
 }
 systemd_install_units
 
@@ -107,16 +131,36 @@ EOF
 install -m 755 -- "$RUNTIME_DIR/rem.wrapper" /usr/local/bin/rem
 rm -f -- "$RUNTIME_DIR/rem.wrapper"
 
-if ! singbox_is_active; then
-  singbox_start
+install -m 600 -- "$candidate" "$SING_BOX_CONFIG"
+if ! singbox_restart || ! singbox_health_check "$NODES_FILE"; then
+  error 'sing-box 安装/修复后的健康检查失败，正在恢复安装前配置。'
+  systemctl stop "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+  if [[ -n "$install_previous_config" && -f "$install_previous_config" ]]; then
+    install -m 600 -- "$install_previous_config" "$SING_BOX_CONFIG"
+  else
+    rm -f -- "$SING_BOX_CONFIG"
+  fi
+  if [[ -n "$install_previous_service" && -f "$install_previous_service" ]]; then
+    install -m 644 -- "$install_previous_service" "$install_service_path"
+  else
+    rm -f -- "$install_service_path"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if (( install_had_service_unit == 1 )) && [[ -n "$install_previous_config" ]]; then
+    systemctl restart "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+  fi
+  rm -f -- "$candidate" "$install_previous_config" "$install_previous_service"
+  die '安装/修复失败；安装前配置已恢复，未进入节点创建流程。'
 fi
-singbox_health_check "$NODES_FILE" || die 'sing-box 安装后健康检查失败，未进入节点创建流程。'
+rm -f -- "$candidate" "$install_previous_config" "$install_previous_service"
+systemctl enable --now "$SYSTEMD_TRAFFIC_TIMER" >/dev/null
 
 success "Ss2022 manager $MANAGER_VERSION 安装/修复完成。"
 printf '以后可在任意目录执行：rem\n'
 printf '本项目不会自动修改服务器防火墙、云安全组或现有安全策略。\n'
 
-if (( fresh_install == 1 )) && (( $(node_count) == 0 )); then
+installed_node_count=$(jq -er '.nodes | length' "$NODES_FILE") || die '无法读取节点数据库，未进入节点创建流程。'
+if (( fresh_install == 1 && installed_node_count == 0 )); then
   exec "$PROGRAM_DIR/ss-manager.sh" --first-run
 fi
 exec "$PROGRAM_DIR/ss-manager.sh" menu

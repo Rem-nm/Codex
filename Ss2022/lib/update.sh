@@ -23,7 +23,7 @@ singbox_update_info() {
 singbox_update_flow() {
   acquire_manager_lock
   singbox_update_info
-  local lock choice latest latest_version target old_binary old_config old_version
+  local lock latest latest_version target old_binary old_config old_version old_managed old_active=0
   lock=$(singbox_lock_value)
   latest=$(fetch_singbox_release_json latest 2>/dev/null || true)
   latest_version=$(jq -r '.tag_name // empty' <<<"$latest")
@@ -35,6 +35,8 @@ singbox_update_flow() {
   fi
   prompt_yes_no "更新到官方版本 $target？更新前会备份当前二进制和配置" n || return 0
   old_version=$(singbox_binary_version 2>/dev/null || true)
+  old_managed=$(manager_state_get sing_box_binary_managed false)
+  if singbox_is_active; then old_active=1; fi
   old_binary="$RUNTIME_DIR/sing-box.update-old.$$"
   old_config="$RUNTIME_DIR/config.update-old.$$"
   [[ -x "$SING_BOX_BINARY" ]] && install -m 755 -- "$SING_BOX_BINARY" "$old_binary"
@@ -44,11 +46,12 @@ singbox_update_flow() {
     rm -f -- "$old_binary" "$old_config"
     return 1
   fi
-  if ! singbox_restart || ! singbox_health_check "$NODES_FILE"; then
+  if (( old_active == 1 )) && { ! singbox_restart || ! singbox_health_check "$NODES_FILE"; }; then
     error '新版 sing-box 健康检查失败，正在恢复旧版。'
     [[ -x "$old_binary" ]] && install -m 755 -- "$old_binary" "$SING_BOX_BINARY"
     [[ -f "$old_config" ]] && install -m 600 -- "$old_config" "$SING_BOX_CONFIG"
-    [[ -n "$old_version" ]] && manager_state_set_json sing_box_version "$(jq -Rn --arg value "$old_version" '$value')"
+    manager_state_set_json sing_box_version "$(jq -Rn --arg value "$old_version" '$value')" >/dev/null 2>&1 || true
+    manager_state_set_json sing_box_binary_managed "$old_managed" >/dev/null 2>&1 || true
     systemctl restart "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
     if singbox_health_check "$NODES_FILE" >/dev/null 2>&1; then
       warn '旧版 sing-box 已恢复并通过健康检查。'
@@ -57,6 +60,28 @@ singbox_update_flow() {
     fi
     rm -f -- "$old_binary" "$old_config"
     return 1
+  fi
+  if (( old_active == 0 )); then
+    ! singbox_is_active || {
+      error '更新前 sing-box 已停止，但更新过程意外启动了服务。'
+      [[ -x "$old_binary" ]] && install -m 755 -- "$old_binary" "$SING_BOX_BINARY"
+      [[ -f "$old_config" ]] && install -m 600 -- "$old_config" "$SING_BOX_CONFIG"
+      manager_state_set_json sing_box_version "$(jq -Rn --arg value "$old_version" '$value')" >/dev/null 2>&1 || true
+      manager_state_set_json sing_box_binary_managed "$old_managed" >/dev/null 2>&1 || true
+      systemctl stop "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+      rm -f -- "$old_binary" "$old_config"
+      return 1
+    }
+    if ! singbox_check_config "$SING_BOX_CONFIG" >/dev/null; then
+      error '新版 sing-box 在停止状态下未能再次通过当前配置检查，正在恢复旧版。'
+      [[ -x "$old_binary" ]] && install -m 755 -- "$old_binary" "$SING_BOX_BINARY"
+      [[ -f "$old_config" ]] && install -m 600 -- "$old_config" "$SING_BOX_CONFIG"
+      manager_state_set_json sing_box_version "$(jq -Rn --arg value "$old_version" '$value')" >/dev/null 2>&1 || true
+      manager_state_set_json sing_box_binary_managed "$old_managed" >/dev/null 2>&1 || true
+      systemctl stop "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+      rm -f -- "$old_binary" "$old_config"
+      return 1
+    fi
   fi
   rm -f -- "$old_binary" "$old_config"
   success "sing-box 已更新到 $target。"
@@ -102,12 +127,14 @@ manager_update_info() {
 
 manager_update_flow() {
   acquire_manager_lock
+  assert_standard_destructive_paths
   manager_update_info
-  local json tag version asset_name checksum_name asset_url checksum_url asset_digest archive checksum expected actual extract_root source_root old_program new_program
+  local json tag version asset_name checksum_name asset_url checksum_url asset_digest archive checksum expected actual extract_root source_entry source_root old_program new_program
   json=$(manager_release_json 2>/dev/null || true)
   tag=$(jq -r '.tag_name // empty' <<<"$json")
   [[ -n "$tag" ]] || { warn 'Rem-nm/Codex 暂无 manager Release 或查询失败，未执行任何下载。'; return 0; }
   version=${tag#v}
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || die "manager Release 标签格式无效：$tag"
   asset_name="$MANAGER_RELEASE_ASSET"
   asset_url=$(jq -er --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$json" 2>/dev/null) || { warn "manager Release 没有 $asset_name。"; return 0; }
   assert_official_manager_release_url "$asset_url"
@@ -140,24 +167,32 @@ manager_update_flow() {
   mkdir -p -- "$extract_root"
   if tar -tzf "$archive" | awk '/^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}'; then :; else die 'manager 归档包含不安全路径。'; fi
   tar -xzf "$archive" -C "$extract_root" --no-same-owner
-  source_root=$(find "$extract_root" -type f -name ss-manager.sh -print -quit | xargs -r dirname)
+  source_entry=$(find "$extract_root" -type f -name ss-manager.sh -print -quit)
+  [[ -n "$source_entry" ]] || die 'manager 归档结构无效：缺少 ss-manager.sh。'
+  source_root=$(dirname -- "$source_entry")
   [[ -n "$source_root" && -f "$source_root/VERSION" ]] || die 'manager 归档结构无效。'
   [[ "$(tr -d '[:space:]' <"$source_root/VERSION")" == "$version" ]] || die 'manager 归档 VERSION 与 Release 标签不一致。'
   while IFS= read -r file; do bash -n "$file" || die "manager 更新包语法检查失败：$file"; done < <(find "$source_root" -type f -name '*.sh')
 
-  old_program="$RUNTIME_DIR/ss-manager-program-old.$$"
-  new_program="$RUNTIME_DIR/ss-manager-program-new.$$"
-  cp -a -- "$PROGRAM_DIR" "$old_program"
+  old_program="${PROGRAM_DIR}.update-old.$$"
+  new_program="${PROGRAM_DIR}.update-new.$$"
+  [[ -d "$PROGRAM_DIR" && -x "$PROGRAM_DIR/ss-manager.sh" ]] || die '当前 manager 程序目录无效，拒绝更新。'
+  [[ ! -e "$old_program" && ! -e "$new_program" ]] || die 'manager 更新暂存目录已存在，拒绝覆盖。'
   cp -a -- "$source_root" "$new_program"
-  if ! rm -rf -- "$PROGRAM_DIR" || ! mv -- "$new_program" "$PROGRAM_DIR"; then
-    rm -rf -- "$PROGRAM_DIR"
+  if ! mv -- "$PROGRAM_DIR" "$old_program"; then
+    rm -rf -- "$extract_root" "$archive" "$checksum" "$new_program"
+    die 'manager 更新无法保存当前程序，未执行切换。'
+  fi
+  if ! mv -- "$new_program" "$PROGRAM_DIR"; then
     mv -- "$old_program" "$PROGRAM_DIR" || die 'manager 更新切换失败，且旧程序恢复失败。'
     rm -rf -- "$extract_root" "$archive" "$checksum" "$new_program"
     die 'manager 更新切换失败，已恢复旧版本。'
   fi
   if ! [[ -x "$PROGRAM_DIR/ss-manager.sh" ]]; then
-    rm -rf -- "$PROGRAM_DIR"
-    mv -- "$old_program" "$PROGRAM_DIR"
+    local invalid_program="${PROGRAM_DIR}.update-invalid.$$"
+    mv -- "$PROGRAM_DIR" "$invalid_program" || true
+    mv -- "$old_program" "$PROGRAM_DIR" || die 'manager 新入口无效，且旧程序恢复失败。'
+    rm -rf -- "$invalid_program"
     die 'manager 更新后入口不存在，已恢复旧版本。'
   fi
   rm -rf -- "$old_program" "$extract_root" "$archive" "$checksum"
@@ -171,11 +206,11 @@ update_menu_flow() {
     IFS= read -r choice || die '读取输入失败。'
     case "$choice" in
       1) singbox_update_info ;;
-      2) singbox_update_flow ;;
-      3) singbox_set_lock_flow ;;
-      4) singbox_clear_lock_flow ;;
+      2) run_menu_action singbox_update_flow ;;
+      3) run_menu_action singbox_set_lock_flow ;;
+      4) run_menu_action singbox_clear_lock_flow ;;
       5) manager_update_info ;;
-      6) manager_update_flow ;;
+      6) run_menu_action manager_update_flow ;;
       0) return 0 ;;
       *) warn '无效选项。' ;;
     esac

@@ -21,8 +21,8 @@ Ss2022 不为节点创建进程。启用节点被转换为同一 `config.json` �
 下载：egress  src_port=node.port
 ```
 
-每分钟读取过滤器 bytes 计数，和 `tc-counters.json` 上次基线做差后加到 `traffic.json`。规则重建导致内核计数器变小会被当作计数器重置，避免负数。
+每分钟读取过滤器 action 的 bytes 计数，和 `tc-counters.json` 上次基线做差后加到 `traffic.json`。服务器重启或规则缺失时会先重建规则并重置内核基线，避免把计数归零误判成新增流量。
 
 ## 系统范围
 
-项目只使用 `tc` 进行统计和限速，不使用 iptables/nftables/UFW/firewalld/ipset。BBR/TFO 只写本项目标记的 sysctl 文件，且只在内核声明支持时开启；卸载会尝试恢复本项目记录的原值。
+项目只使用 `tc` 进行统计和限速，不使用 iptables/nftables/UFW/firewalld/ipset。BBR/TFO 只写本项目标记的 sysctl 文件，且只在内核声明支持时开启；完全卸载会尝试恢复本项目记录的原值。

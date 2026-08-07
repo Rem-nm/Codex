@@ -37,14 +37,19 @@ validate_candidate_nodes() {
   jq -e '([.nodes[] | (.name | ascii_downcase)] | length == (unique | length))' "$nodes_source" >/dev/null || die '候选节点名称必须唯一。'
   jq -e '([.nodes[].port] | length == (unique | length))' "$nodes_source" >/dev/null || die '候选节点端口必须唯一。'
 
-  local current_node current_id current_port current_status
+  local current_id current_port current_status live_port live_status
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     current_id=$(jq -er '.node_id' <<<"$node")
     current_port=$(jq -er '.port' <<<"$node")
+    current_status=$(jq -er '.status' <<<"$node")
+    # Disabled nodes do not bind their reserved port.  Do not let a service
+    # that started after such a node was disabled block unrelated changes.
+    [[ "$current_status" == enabled ]] || continue
     if system_port_in_use "$current_port"; then
-      current_status=$(jq -r --arg id "$current_id" '.nodes[] | select(.node_id == $id) | .status' "$NODES_FILE")
-      if [[ "$current_status" != enabled ]]; then
+      live_port=$(jq -r --arg id "$current_id" '.nodes[] | select(.node_id == $id) | .port' "$NODES_FILE")
+      live_status=$(jq -r --arg id "$current_id" '.nodes[] | select(.node_id == $id) | .status' "$NODES_FILE")
+      if [[ "$live_status" != enabled || "$live_port" != "$current_port" ]]; then
         die "候选端口 $current_port 已被系统其他服务占用。"
       fi
     fi
@@ -53,7 +58,8 @@ validate_candidate_nodes() {
 
 backup_create_snapshot() {
   local reason=$1
-  local backup_path="$BACKUP_DIR/$(timestamp_compact)-$reason"
+  local backup_path
+  backup_path="$BACKUP_DIR/$(timestamp_compact)-$reason"
   local suffix=1
   while [[ -e "$backup_path" ]]; do
     backup_path="$BACKUP_DIR/$(timestamp_compact)-$reason-$suffix"
@@ -93,7 +99,7 @@ backup_prune() {
 }
 
 restore_runtime_and_state() {
-  local old_nodes=$1 old_traffic=$2 old_history=$3 old_config=$4
+  local old_nodes=$1 old_traffic=$2 old_history=$3 old_config=$4 service_was_active=${5:-1}
   if [[ -f "$old_nodes" ]]; then install -m 600 -- "$old_nodes" "$NODES_FILE"; fi
   if [[ -f "$old_traffic" ]]; then install -m 600 -- "$old_traffic" "$TRAFFIC_FILE"; fi
   if [[ -f "$old_history" ]]; then install -m 600 -- "$old_history" "$HISTORY_FILE"; fi
@@ -102,11 +108,30 @@ restore_runtime_and_state() {
   else
     rm -f -- "$SING_BOX_CONFIG"
   fi
-  if systemctl is-enabled --quiet "$SING_BOX_SERVICE" 2>/dev/null || systemctl is-active --quiet "$SING_BOX_SERVICE" 2>/dev/null; then
+  if (( service_was_active == 1 )); then
     systemctl restart "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+  else
+    systemctl stop "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
   fi
-  bandwidth_apply_nodes "$NODES_FILE" >/dev/null 2>&1 || true
-  traffic_reset_kernel_baselines "$NODES_FILE" >/dev/null 2>&1 || true
+  if ! (bandwidth_apply_nodes "$NODES_FILE" >/dev/null 2>&1); then
+    error '旧配置已恢复，但旧 tc 流控规则恢复失败，请立即检查 tc 状态。'
+  fi
+  if ! (traffic_reset_kernel_baselines "$NODES_FILE" >/dev/null 2>&1); then
+    error '旧配置已恢复，但 tc 计数基线恢复失败。'
+  fi
+}
+
+transaction_runtime_health_check() {
+  local nodes_source=$1 service_was_active=$2
+  if (( service_was_active == 1 )); then
+    singbox_health_check "$nodes_source"
+  else
+    # A user-stopped service must stay stopped.  The installed configuration
+    # still receives the official parser check, while process/port checks are
+    # intentionally skipped because no process is expected.
+    ! singbox_is_active || { error 'sing-box 在保持停止的事务中被意外启动。'; return 1; }
+    singbox_check_config "$SING_BOX_CONFIG" >/dev/null
+  fi
 }
 
 apply_state_transaction() {
@@ -144,6 +169,8 @@ apply_state_transaction() {
   local old_traffic="$RUNTIME_DIR/traffic.previous.$$.json"
   local old_history="$RUNTIME_DIR/history.previous.$$.json"
   local old_config="$RUNTIME_DIR/config.previous.$$.json"
+  local service_was_active=0
+  if singbox_is_active; then service_was_active=1; fi
   generate_singbox_config "$candidate_nodes" "$candidate_config"
   if ! singbox_check_config "$candidate_config" >/dev/null 2>&1; then
     error '新配置未通过 sing-box 官方配置检查；未重启服务，也未修改节点数据库。'
@@ -159,26 +186,26 @@ apply_state_transaction() {
   backup_path=$(backup_create_snapshot "$reason")
 
   install -m 600 -- "$candidate_config" "$SING_BOX_CONFIG"
-  if ! singbox_restart; then
+  if (( service_was_active == 1 )) && ! singbox_restart; then
     error 'sing-box 重启失败，正在恢复上一版本配置。'
-    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config"
+    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$service_was_active"
     rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi
-  if ! singbox_health_check "$candidate_nodes"; then
+  if ! transaction_runtime_health_check "$candidate_nodes" "$service_was_active"; then
     error '新配置健康检查失败，正在恢复上一版本配置。'
-    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config"
-    if ! singbox_health_check "$old_nodes" >/dev/null 2>&1; then
+    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$service_was_active"
+    if ! transaction_runtime_health_check "$old_nodes" "$service_was_active" >/dev/null 2>&1; then
       error '严重：旧配置恢复后健康检查也失败，请立即检查 systemctl status sing-box。'
     fi
     rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi
 
-  if ! bandwidth_apply_and_check "$candidate_nodes"; then
+  if ! (bandwidth_apply_and_check "$candidate_nodes"); then
     error '新 tc 流控规则应用/检查失败，正在恢复上一版本配置和规则。'
-    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config"
-    if ! singbox_health_check "$old_nodes" >/dev/null 2>&1; then
+    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$service_was_active"
+    if ! transaction_runtime_health_check "$old_nodes" "$service_was_active" >/dev/null 2>&1; then
       error '严重：流控回滚后旧配置健康检查失败，请立即检查服务。'
     fi
     rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
@@ -188,26 +215,28 @@ apply_state_transaction() {
   # tc rules are recreated during every transaction, so their byte counters
   # start from zero. Reset persisted baselines to prevent the next sample
   # from comparing a new port/rule counter with an old one.
-  if ! traffic_reset_kernel_baselines "$candidate_nodes"; then
+  if ! (traffic_reset_kernel_baselines "$candidate_nodes"); then
     error '新的 tc 计数基线无法保存，正在恢复上一版本配置和规则。'
-    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config"
+    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$service_was_active"
     rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi
 
-  if ! atomic_json_write "$candidate_nodes" "$NODES_FILE" 600 \
-    || ! atomic_json_write "$candidate_traffic" "$TRAFFIC_FILE" 600 \
-    || ! atomic_json_write "$candidate_history" "$HISTORY_FILE" 600; then
+  if ! (
+    atomic_json_write "$candidate_nodes" "$NODES_FILE" 600
+    atomic_json_write "$candidate_traffic" "$TRAFFIC_FILE" 600
+    atomic_json_write "$candidate_history" "$HISTORY_FILE" 600
+  ); then
     error '节点数据库提交失败，正在回滚运行配置和数据。'
-    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config"
+    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$service_was_active"
     rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi
 
-  if ! singbox_health_check "$NODES_FILE"; then
+  if ! transaction_runtime_health_check "$NODES_FILE" "$service_was_active"; then
     error '提交后最终健康检查失败，正在回滚上一版本。'
-    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config"
-    if ! singbox_health_check "$old_nodes" >/dev/null 2>&1; then
+    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$service_was_active"
+    if ! transaction_runtime_health_check "$old_nodes" "$service_was_active" >/dev/null 2>&1; then
       error '严重：最终回滚后的旧配置健康检查失败，请立即人工处理。'
     fi
     rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
@@ -222,6 +251,15 @@ apply_state_transaction() {
 
 backup_list() {
   find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r
+}
+
+backup_create_manual_flow() {
+  acquire_manager_lock
+  traffic_collect_no_lock
+  local backup_path
+  backup_path=$(backup_create_snapshot manual)
+  backup_prune
+  success "手动备份已创建：$backup_path"
 }
 
 backup_restore_flow() {
@@ -243,4 +281,18 @@ backup_restore_flow() {
   traffic_collect_no_lock
   apply_state_transaction "$selected/nodes.json" "$selected/traffic.json" "$selected/traffic-history.json" "restore-${backups[$((choice-1))]}" 0 || die '恢复失败，已自动回滚。'
   success '备份恢复完成。'
+}
+
+backup_management_flow() {
+  local choice
+  while true; do
+    printf '\n备份与恢复\n1. 立即创建备份\n2. 从历史备份恢复\n0. 返回\n> '
+    IFS= read -r choice || die '读取输入失败。'
+    case "$choice" in
+      1) run_menu_action backup_create_manual_flow ;;
+      2) run_menu_action backup_restore_flow ;;
+      0) return 0 ;;
+      *) warn '无效选项。' ;;
+    esac
+  done
 }

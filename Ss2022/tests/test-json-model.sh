@@ -2,7 +2,6 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 command -v jq >/dev/null 2>&1 || { printf 'jq is required\n' >&2; exit 77; }
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 

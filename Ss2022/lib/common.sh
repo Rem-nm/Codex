@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Common primitives shared by install.sh and the installed manager.
+# Module constants are consumed by scripts that source this file.
+# shellcheck disable=SC2034
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -13,7 +15,16 @@ if [[ -r "$DEFAULTS_FILE" ]]; then
   source "$DEFAULTS_FILE"
 fi
 
-MANAGER_VERSION="${MANAGER_VERSION:-1.0.0}"
+VERSION_FILE="${SS_MANAGER_VERSION_FILE:-$PROJECT_ROOT/VERSION}"
+if [[ -r "$VERSION_FILE" ]]; then
+  IFS= read -r MANAGER_VERSION <"$VERSION_FILE" || true
+  MANAGER_VERSION=${MANAGER_VERSION//$'\r'/}
+fi
+MANAGER_VERSION="${MANAGER_VERSION:-1.0.1}"
+[[ "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+  printf 'Invalid manager VERSION: %s\n' "$MANAGER_VERSION" >&2
+  exit 1
+}
 PROGRAM_DIR="${PROGRAM_DIR:-/opt/ss-manager}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/ss-manager}"
 DATA_DIR="${DATA_DIR:-/var/lib/ss-manager}"
@@ -143,8 +154,8 @@ atomic_json_from_stdin() {
     rm -f -- "$temporary"
     die "拒绝写入无效 JSON：$destination"
   }
-  install -m "$mode" -- "$temporary" "$destination"
-  rm -f -- "$temporary"
+  chmod "$mode" -- "$temporary"
+  mv -f -- "$temporary" "$destination"
 }
 
 json_value() {
@@ -352,13 +363,29 @@ url_encode() {
 
 is_command_from_manager() {
   local command_path=$1
-  [[ "$command_path" == "/usr/local/bin/rem" ]] && [[ -L "$command_path" || -f "$command_path" ]] && grep -q 'ss-manager' "$command_path" 2>/dev/null
+  [[ "$command_path" == "/usr/local/bin/rem" ]] || return 1
+  if [[ -L "$command_path" ]]; then
+    [[ "$(readlink -f -- "$command_path" 2>/dev/null || true)" == "$PROGRAM_DIR/ss-manager.sh" ]]
+    return
+  fi
+  [[ -f "$command_path" ]] || return 1
+  grep -Fqx "exec $PROGRAM_DIR/ss-manager.sh \"\$@\"" "$command_path" 2>/dev/null
 }
 
 cleanup_path() {
   local path=$1
   [[ -n "$path" && "$path" != '/' && "$path" != '.' ]] || die "拒绝清理危险路径。"
   rm -f -- "$path"
+}
+
+assert_standard_destructive_paths() {
+  [[ "$PROGRAM_DIR" == /opt/ss-manager ]] || die "拒绝对非标准程序目录执行递归替换/卸载：$PROGRAM_DIR"
+  [[ "$CONFIG_DIR" == /etc/ss-manager ]] || die "拒绝对非标准配置目录执行递归卸载：$CONFIG_DIR"
+  [[ "$DATA_DIR" == /var/lib/ss-manager ]] || die "拒绝对非标准数据目录执行递归卸载：$DATA_DIR"
+  [[ "$RUNTIME_DIR" == /run/ss-manager ]] || die "拒绝使用非标准运行目录：$RUNTIME_DIR"
+  [[ "$BACKUP_DIR" == /etc/ss-manager/backups ]] || die "拒绝对非标准备份目录执行递归卸载：$BACKUP_DIR"
+  [[ "$SING_BOX_BINARY" == /usr/local/bin/sing-box ]] || die "拒绝替换或删除非标准 sing-box 路径：$SING_BOX_BINARY"
+  [[ "$SING_BOX_CONFIG" == /etc/sing-box/config.json ]] || die "拒绝替换或删除非标准 sing-box 配置：$SING_BOX_CONFIG"
 }
 
 trap_cleanup_file() {

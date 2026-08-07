@@ -61,7 +61,16 @@ port_available() {
   local exclude_id=${2:-}
   validate_port "$port" || return 1
   ! node_port_in_database "$port" "$exclude_id" || return 1
-  ! system_port_in_use "$port"
+  if system_port_in_use "$port"; then
+    # While editing an enabled node, its unchanged live port is expected to
+    # be occupied by sing-box.  Every other occupied port remains forbidden.
+    [[ -n "$exclude_id" ]] || return 1
+    local live_port live_status
+    live_port=$(jq -r --arg id "$exclude_id" '.nodes[] | select(.node_id == $id) | .port' "$NODES_FILE")
+    live_status=$(jq -r --arg id "$exclude_id" '.nodes[] | select(.node_id == $id) | .status' "$NODES_FILE")
+    [[ "$live_status" == enabled && "$live_port" == "$port" ]] || return 1
+  fi
+  return 0
 }
 
 choose_port() {
@@ -73,7 +82,7 @@ choose_port() {
     IFS= read -r choice || die "读取输入失败。"
     case "$choice" in
       1)
-        for attempt in $(seq 1 500); do
+        for ((attempt=1; attempt<=500; attempt++)); do
           port=$(shuf -i "${DEFAULT_PORT_MIN}-${DEFAULT_PORT_MAX}" -n 1)
           if port_available "$port" "$exclude_id"; then
             printf '%s' "$port"

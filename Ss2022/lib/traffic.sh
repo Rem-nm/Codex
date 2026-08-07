@@ -47,6 +47,11 @@ traffic_candidate_archive_deleted_node() {
     '.deleted_nodes[$id] = {node_name:$name,deleted_at:$deleted_at,traffic:$snapshot}' "$history_source"
 }
 
+traffic_candidate_purge_deleted_node() {
+  local history_source=$1 node_id=$2
+  jq --arg id "$node_id" 'del(.cycles[$id], .deleted_nodes[$id])' "$history_source"
+}
+
 traffic_value() {
   local node_id=$1 filter=$2
   jq -r --arg id "$node_id" "(.nodes[\$id] // {} | ($filter) // 0)" "$TRAFFIC_FILE" 2>/dev/null || printf '0\n'
@@ -57,8 +62,34 @@ traffic_history_for_node() {
   jq -c --arg id "$node_id" '(.cycles[$id].entries // [])' "$HISTORY_FILE"
 }
 
+tc_counter_from_json() {
+  local output=$1 pref=$2 direction=$3 port=$4
+  local port_field
+  [[ "$pref" =~ ^[0-9]+$ ]] || return 1
+  validate_port "$port" || return 1
+  case "$direction" in
+    ingress) port_field=dst_port ;;
+    egress) port_field=src_port ;;
+    *) return 1 ;;
+  esac
+
+  jq -r --argjson pref "$pref" --argjson port "$port" --arg port_field "$port_field" '
+    [ .[]
+      | select((((.pref // 0) | tonumber?) // -1) == $pref)
+      | (.options // {}) as $options
+      | select(((($options[$port_field] // 0) | tonumber?) // -1) == $port)
+      | ($options.actions // []) as $actions
+      | select(($actions | length) == 0 or any($actions[]; (.kind // "") == "police" or (.kind // "") == "gact"))
+      | if ($actions | length) > 0
+        then (((($actions[0].stats.bytes // 0) | tonumber?) // 0))
+        else ((((.bytes // 0) | tonumber?) // 0))
+        end
+    ] | add // 0
+  ' <<<"$output"
+}
+
 tc_counter_json() {
-  local interface=$1 direction=$2 port=$3
+  local interface=$1 direction=$2 port=$3 pref=$4
   local output
   if [[ "$direction" == ingress ]]; then
     output=$(tc -s -j filter show dev "$interface" ingress 2>/dev/null || true)
@@ -66,31 +97,55 @@ tc_counter_json() {
     output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null || true)
   fi
   [[ -n "$output" ]] || { printf '0'; return 0; }
-  jq -r --argjson port "$port" '
-    [ .[]
-      | select((.pref // 0) == 49100)
-      | (.options // {}) as $options
-      | select((($options.dst_port // $options.src_port // 0) | tonumber?) == $port)
-      | ((.stats.bytes // 0) | tonumber?)
-      | select(. != null)
-    ] | add // 0
-  ' <<<"$output" 2>/dev/null || printf '0'
+  tc_counter_from_json "$output" "$pref" "$direction" "$port" 2>/dev/null || printf '0'
 }
 
 tc_node_counter() {
   local node_id=$1 port=$2 direction=$3
-  local interface value sum=0
+  : "$node_id"
+  local interface value pref sum=0
+  pref=$(manager_state_get tc_pref '49100')
+  [[ "$pref" =~ ^[0-9]+$ ]] || pref=49100
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    value=$(tc_counter_json "$interface" "$direction" "$port")
+    value=$(tc_counter_json "$interface" "$direction" "$port" "$pref")
     [[ "$value" =~ ^[0-9]+$ ]] || value=0
     sum=$((sum + value))
   done < <(traffic_interfaces)
   printf '%s' "$sum"
 }
 
+traffic_ensure_tc_rules_no_lock() {
+  # tc state is not persistent across a server reboot. Validate before every
+  # sample so a reboot or external rule removal cannot silently stop traffic
+  # accounting. Recreated rules start at zero, therefore persisted kernel
+  # baselines must be reset before the next delta is calculated.
+  local boot_changed=0
+  if ! bandwidth_plan_matches_current_boot; then
+    boot_changed=1
+    if ! (detect_traffic_interfaces); then
+      error '服务器重启后无法刷新流量接口，本次不会写入流量增量。'
+      return 1
+    fi
+  fi
+  if (( boot_changed == 0 )) && (bandwidth_check_nodes "$NODES_FILE" >/dev/null 2>&1); then
+    return 0
+  fi
+  warn '检测到 tc 统计/限速规则缺失或不完整，正在安全重建。'
+  if ! (bandwidth_apply_and_check "$NODES_FILE"); then
+    error 'tc 统计/限速规则重建失败，本次不会写入流量增量。'
+    return 1
+  fi
+  if ! (traffic_reset_kernel_baselines "$NODES_FILE"); then
+    error 'tc 规则已重建，但计数基线保存失败，本次不会写入流量增量。'
+    return 1
+  fi
+  return 0
+}
+
 traffic_collect_no_lock() {
   [[ -f "$TRAFFIC_FILE" ]] || return 0
+  traffic_ensure_tc_rules_no_lock || return 1
   local traffic_tmp="$RUNTIME_DIR/traffic.collect.$$.json"
   local counters_tmp="$RUNTIME_DIR/counters.collect.$$.json"
   install -m 600 -- "$TRAFFIC_FILE" "$traffic_tmp"
@@ -137,14 +192,25 @@ traffic_reset_kernel_baselines() {
 }
 
 traffic_append_history() {
-  local history_file=$1 node_id=$2 node_name=$3 period=$4 upload=$5 download=$6 closed_at=$7
+  local history_file=$1 node_id=$2 node_name=$3 period=$4 upload=$5 download=$6 closed_at=$7 period_start=$8 period_end=$9
   local entry
-  entry=$(jq -n --arg period "$period" --arg closed_at "$closed_at" --argjson upload "$upload" --argjson download "$download" \
-    '{period:$period,upload_bytes:$upload,download_bytes:$download,total_bytes:($upload+$download),closed_at:$closed_at}')
+  entry=$(jq -n --arg period "$period" --arg closed_at "$closed_at" --arg period_start "$period_start" --arg period_end "$period_end" --argjson upload "$upload" --argjson download "$download" \
+    '{period:$period,period_start_at:$period_start,period_end_at:$period_end,upload_bytes:$upload,download_bytes:$download,total_bytes:($upload+$download),closed_at:$closed_at}')
   jq --arg id "$node_id" --arg name "$node_name" --argjson entry "$entry" --argjson retention "$DEFAULT_HISTORY_RETENTION" \
     '.cycles[$id] = ((.cycles[$id] // {node_name:$name,entries:[]}) + {node_name:$name}) | .cycles[$id].entries = ((.cycles[$id].entries | map(select(.period != $entry.period))) + [$entry] | sort_by(.period) | .[-$retention:])' \
     "$history_file" >"$history_file.next"
   mv -f -- "$history_file.next" "$history_file"
+}
+
+settlement_period_label() {
+  local period_end=$1 end_epoch
+  end_epoch=$(date -u -d "$period_end" +%s 2>/dev/null) || return 1
+  (( end_epoch > 0 )) || return 1
+  # Label a cycle by the month containing its final billable second.  This
+  # keeps reset-day 1 intuitive (August traffic is "2026-08") and prevents a
+  # newly-created partial cycle from colliding with the next full cycle when
+  # a node resets on another day of the month.
+  date -u -d "@$((end_epoch - 1))" '+%Y-%m'
 }
 
 traffic_maintenance_no_lock() {
@@ -171,10 +237,10 @@ traffic_maintenance_no_lock() {
       [[ -n "$next_reset" ]] || break
       next_epoch=$(date -u -d "$next_reset" +%s 2>/dev/null || printf 0)
       (( next_epoch > 0 && next_epoch <= now_epoch )) || break
-      period=$(date -u -d "$last_reset" '+%Y-%m')
+      period=$(settlement_period_label "$next_reset")
       current_u=$(jq -r --arg id "$node_id" '.nodes[$id].current_upload_bytes // 0' "$traffic_tmp")
       current_d=$(jq -r --arg id "$node_id" '.nodes[$id].current_download_bytes // 0' "$traffic_tmp")
-      traffic_append_history "$history_tmp" "$node_id" "$name" "$period" "$current_u" "$current_d" "$(timestamp_iso)"
+      traffic_append_history "$history_tmp" "$node_id" "$name" "$period" "$current_u" "$current_d" "$(timestamp_iso)" "$last_reset" "$next_reset"
       local new_next
       new_next=$(calculate_next_reset_at "$next_reset" "$reset_day")
       jq --arg id "$node_id" --arg last "$next_reset" --arg next "$new_next" \

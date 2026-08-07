@@ -6,6 +6,6 @@
 
 ## sing-box
 
-sing-box 版本来自 `SagerNet/sing-box` 官方 Release API。资产名称按 `sing-box-<version>-linux-amd64.tar.gz` 或 `sing-box-<version>-linux-arm64.tar.gz` 解析，并要求同一 Release 的 SHA256 资产。替换前备份当前二进制和配置；新二进制检查当前配置、启动并健康检查失败时恢复旧版。
+sing-box 版本来自 `SagerNet/sing-box` 官方 Release API。资产名称按 `sing-box-<version>-linux-amd64.tar.gz` 或 `sing-box-<version>-linux-arm64.tar.gz` 解析，并要求 GitHub 资产 SHA256 digest 或同一 Release 的 SHA256 校验资产。替换前备份当前二进制和配置；新二进制检查当前配置，运行中的服务会重启并做健康检查，原本停止的服务保持停止，失败时恢复旧版。
 
 项目不执行 `curl | bash`，不接受随机下载站，也不把 manager 版本和 sing-box 版本混在一起。版本锁定只影响 sing-box 更新，不影响节点数据和 manager 更新。

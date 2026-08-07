@@ -47,7 +47,8 @@ case "${1:-menu}" in
     ;;
   --first-run)
     if (( $(node_count) == 0 )); then
-      node_add_flow
+      run_menu_action node_add_flow
+      (( ${MENU_ACTION_STATUS:-1} == 0 )) || die '首个节点创建未完成。'
     fi
     main_menu
     ;;

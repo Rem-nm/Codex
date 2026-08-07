@@ -103,25 +103,35 @@ manager_update_info() {
 manager_update_flow() {
   acquire_manager_lock
   manager_update_info
-  local json tag version asset_name checksum_name asset_url checksum_url archive checksum expected actual extract_root source_root old_program new_program
+  local json tag version asset_name checksum_name asset_url checksum_url asset_digest archive checksum expected actual extract_root source_root old_program new_program
   json=$(manager_release_json 2>/dev/null || true)
   tag=$(jq -r '.tag_name // empty' <<<"$json")
   [[ -n "$tag" ]] || { warn 'Rem-nm/Codex 暂无 manager Release 或查询失败，未执行任何下载。'; return 0; }
   version=${tag#v}
   asset_name="$MANAGER_RELEASE_ASSET"
-  checksum_name=$(jq -r '.assets[].name | select(test("(?i)(sha256|checksum)"))' <<<"$json" | head -n 1)
-  [[ -n "$checksum_name" ]] || { warn 'manager Release 没有 SHA256 校验资产，已停止更新。'; return 0; }
   asset_url=$(jq -er --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$json" 2>/dev/null) || { warn "manager Release 没有 $asset_name。"; return 0; }
-  checksum_url=$(jq -er --arg name "$checksum_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$json")
   assert_official_manager_release_url "$asset_url"
-  assert_official_manager_release_url "$checksum_url"
+  asset_digest=$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest // empty' <<<"$json")
+  if [[ "$asset_digest" =~ ^sha256:[A-Fa-f0-9]{64}$ ]]; then
+    checksum_name=''
+    checksum_url=''
+  else
+    checksum_name=$(jq -r '.assets[].name | select(test("(?i)(sha256|checksum)"))' <<<"$json" | head -n 1 || true)
+    [[ -n "$checksum_name" ]] || { warn 'manager Release 没有 SHA256 校验资产或 asset digest，已停止更新。'; return 0; }
+    checksum_url=$(jq -er --arg name "$checksum_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$json")
+    assert_official_manager_release_url "$checksum_url"
+  fi
   prompt_yes_no "从 Rem-nm/Codex 官方 Release 更新 manager 到 $version？" n || return 0
 
   archive="$RUNTIME_DIR/ss-manager-$version.tar.gz"
   checksum="$RUNTIME_DIR/ss-manager-$version.SHA256SUMS"
   curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 120 -- "$asset_url" -o "$archive"
-  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 30 -- "$checksum_url" -o "$checksum"
-  expected=$(awk -v file="$asset_name" '$2 == file || $2 == "*" file {print $1; exit}' "$checksum")
+  if [[ -n "$asset_digest" ]]; then
+    expected=${asset_digest#sha256:}
+  else
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 30 -- "$checksum_url" -o "$checksum"
+    expected=$(awk -v file="$asset_name" '$2 == file || $2 == "*" file {print $1; exit}' "$checksum")
+  fi
   [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || die 'manager Release SHA256 校验值无效。'
   actual=$(sha256sum -- "$archive" | awk '{print $1}')
   [[ "${actual,,}" == "${expected,,}" ]] || die 'manager 下载校验失败，未替换程序。'

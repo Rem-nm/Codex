@@ -171,6 +171,10 @@ install_singbox_service_unit() {
   if [[ -f "$SYSTEMD_DIR/$SING_BOX_SERVICE" ]] && ! singbox_service_unit_is_managed; then
     die "$SYSTEMD_DIR/$SING_BOX_SERVICE 已存在且不是本项目创建，拒绝静默覆盖。"
   fi
+  if [[ ! -f "$SYSTEMD_DIR/$SING_BOX_SERVICE" ]] && systemctl cat "$SING_BOX_SERVICE" >/dev/null 2>&1; then
+    warn "系统已有 $SING_BOX_SERVICE 单元，但它不在本项目路径下。"
+    prompt_yes_no '是否明确接管该 sing-box systemd 单元？' n || die '未接管已有 sing-box 单元，安装已安全停止。'
+  fi
   install -m 644 -- "$source" "$SYSTEMD_DIR/$SING_BOX_SERVICE"
   systemctl daemon-reload
   systemctl enable "$SING_BOX_SERVICE" >/dev/null

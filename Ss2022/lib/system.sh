@@ -50,14 +50,18 @@ curl
 gzip
 jq
 openssl
-iproute2
-procps
 python3
 qrencode
 tar
 util-linux
 coreutils
+findutils
 EOF
+  if [[ "$PACKAGE_MANAGER" == apt-get ]]; then
+    printf '%s\n' iproute2 procps
+  else
+    printf '%s\n' iproute iproute-tc procps-ng
+  fi
 }
 
 install_packages() {

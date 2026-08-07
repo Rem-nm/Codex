@@ -1,0 +1,18 @@
+# Runtime state and secrets must never enter the repository.
+/runtime/
+/tmp/
+*.secret
+*.key
+*.pem
+nodes.json
+traffic.json
+traffic-history.json
+tc-counters.json
+manager.json
+backups/
+
+# Local editor and test output.
+.DS_Store
+*.swp
+*.log
+coverage/

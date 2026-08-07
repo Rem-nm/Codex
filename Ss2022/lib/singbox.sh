@@ -49,6 +49,9 @@ install_singbox_from_release() {
   ensure_runtime_dirs
 
   local requested=${1:-latest}
+  local previous_version previous_managed
+  previous_version=$(manager_state_get sing_box_version '')
+  previous_managed=$(manager_state_get sing_box_binary_managed false)
   local release_json tag version archive_name checksum_name archive_url checksum_url archive_digest
   release_json=$(fetch_singbox_release_json "$requested")
   jq -e '.tag_name and (.assets | type == "array")' >/dev/null <<<"$release_json" || die "官方 Release 响应格式异常。"
@@ -86,7 +89,10 @@ install_singbox_from_release() {
   actual=$(sha256sum -- "$archive_file" | awk '{print $1}')
   [[ "${actual,,}" == "${expected,,}" ]] || die "sing-box 下载校验失败，已停止替换。"
 
-  tar -xzf "$archive_file" -C "$extract_dir"
+  if tar -tzf "$archive_file" | awk '/^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}'; then :; else
+    die 'sing-box 官方归档包含不安全路径，已停止解压。'
+  fi
+  tar -xzf "$archive_file" -C "$extract_dir" --no-same-owner
   local extracted
   extracted=$(find "$extract_dir" -type f -name sing-box -perm -u+x -print -quit)
   [[ -n "$extracted" ]] || die "官方归档中没有可执行 sing-box。"
@@ -113,10 +119,22 @@ install_singbox_from_release() {
     else
       rm -f -- "$SING_BOX_BINARY"
     fi
+    manager_state_set_json sing_box_version "$(jq -Rn --arg value "$previous_version" '$value')" >/dev/null 2>&1 || true
+    manager_state_set_json sing_box_binary_managed "$previous_managed" >/dev/null 2>&1 || true
     rm -rf -- "$extract_dir" "$archive_file" "$checksum_file" "$candidate" "$old_binary"
     die 'sing-box 版本状态写入失败，已恢复替换前的二进制。'
   fi
-  manager_state_set_json sing_box_binary_managed true
+  if ! manager_state_set_json sing_box_binary_managed true; then
+    if [[ -x "$old_binary" ]]; then
+      install -m 755 -- "$old_binary" "$SING_BOX_BINARY"
+    else
+      rm -f -- "$SING_BOX_BINARY"
+    fi
+    manager_state_set_json sing_box_version "$(jq -Rn --arg value "$previous_version" '$value')" >/dev/null 2>&1 || true
+    manager_state_set_json sing_box_binary_managed "$previous_managed" >/dev/null 2>&1 || true
+    rm -rf -- "$extract_dir" "$archive_file" "$checksum_file" "$candidate" "$old_binary"
+    die 'sing-box 管理状态写入失败，已恢复替换前的二进制。'
+  fi
   rm -rf -- "$extract_dir" "$archive_file" "$checksum_file" "$candidate" "$old_binary"
   success "已安装 sing-box $version（来源：SagerNet/sing-box 官方 Release）。"
 }

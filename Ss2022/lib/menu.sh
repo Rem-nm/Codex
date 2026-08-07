@@ -17,6 +17,7 @@ node_update_field_in_file() {
 
 node_delete_flow() {
   acquire_manager_lock
+  traffic_collect_no_lock
   local node_id node node_name port keep_history candidate_nodes candidate_traffic candidate_history
   node_id=$(select_node_id '请选择要删除的节点') || return 0
   node=$(node_by_id "$node_id")

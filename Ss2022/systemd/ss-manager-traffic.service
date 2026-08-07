@@ -1,0 +1,12 @@
+[Unit]
+Description=Ss2022 traffic accounting and quota maintenance
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+# Managed by Ss2022
+Type=oneshot
+ExecStart=/opt/ss-manager/ss-manager.sh --maintenance
+User=root
+Group=root
+NoNewPrivileges=false

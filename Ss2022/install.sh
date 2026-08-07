@@ -22,7 +22,7 @@ if [[ -n "$existing_rem" ]] && ! is_command_from_manager "$existing_rem"; then
 fi
 
 fresh_install=1
-if [[ -f "$MANAGER_STATE" || -f "$NODES_FILE" || -x "$SING_BOX_BINARY" || -d "$PROGRAM_DIR" ]]; then
+if [[ -f "$MANAGER_STATE" || -f "$NODES_FILE" || -x "$SING_BOX_BINARY" ]]; then
   fresh_install=0
   info '检测到已有安装数据，将执行幂等的修复/补齐流程，不会覆盖节点、密码或流量数据。'
 fi
@@ -56,12 +56,19 @@ copy_program() {
 }
 copy_program
 
+singbox_install_target=latest
+singbox_locked_version=$(manager_state_get sing_box_version_lock '')
+if [[ -n "$singbox_locked_version" && "$singbox_locked_version" != null ]]; then
+  singbox_install_target="$singbox_locked_version"
+  info "检测到 sing-box 版本锁定，将安装锁定版本 $singbox_install_target。"
+fi
+
 if [[ ! -x "$SING_BOX_BINARY" ]]; then
-  install_singbox_from_release latest
+  install_singbox_from_release "$singbox_install_target"
 elif [[ "$(manager_state_get sing_box_binary_managed false)" != true ]]; then
   warn "检测到已有 $SING_BOX_BINARY，但它不是本项目管理的程序。"
   prompt_yes_no '是否备份并替换为 SagerNet 官方 Release？' n || die '未接管现有 sing-box，安装已安全停止。'
-  install_singbox_from_release latest
+  install_singbox_from_release "$singbox_install_target"
 else
   info "保留现有本项目管理的 sing-box：$(singbox_binary_version || true)"
 fi

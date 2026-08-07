@@ -37,13 +37,16 @@ validate_candidate_nodes() {
   jq -e '([.nodes[] | (.name | ascii_downcase)] | length == (unique | length))' "$nodes_source" >/dev/null || die '候选节点名称必须唯一。'
   jq -e '([.nodes[].port] | length == (unique | length))' "$nodes_source" >/dev/null || die '候选节点端口必须唯一。'
 
-  local current_node current_id current_port
+  local current_node current_id current_port current_status
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     current_id=$(jq -er '.node_id' <<<"$node")
     current_port=$(jq -er '.port' <<<"$node")
-    if system_port_in_use "$current_port" && ! jq -e --arg id "$current_id" --argjson port "$current_port" 'any(.nodes[]; .node_id == $id and .port == $port)' "$NODES_FILE" >/dev/null; then
-      die "候选端口 $current_port 已被系统其他服务占用。"
+    if system_port_in_use "$current_port"; then
+      current_status=$(jq -r --arg id "$current_id" '.nodes[] | select(.node_id == $id) | .status' "$NODES_FILE")
+      if [[ "$current_status" != enabled ]]; then
+        die "候选端口 $current_port 已被系统其他服务占用。"
+      fi
     fi
   done < <(jq -c '.nodes[]' "$nodes_source")
 }
@@ -103,6 +106,7 @@ restore_runtime_and_state() {
     systemctl restart "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
   fi
   bandwidth_apply_nodes "$NODES_FILE" >/dev/null 2>&1 || true
+  traffic_reset_kernel_baselines "$NODES_FILE" >/dev/null 2>&1 || true
 }
 
 apply_state_transaction() {
@@ -177,6 +181,16 @@ apply_state_transaction() {
     if ! singbox_health_check "$old_nodes" >/dev/null 2>&1; then
       error '严重：流控回滚后旧配置健康检查失败，请立即检查服务。'
     fi
+    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
+    return 1
+  fi
+
+  # tc rules are recreated during every transaction, so their byte counters
+  # start from zero. Reset persisted baselines to prevent the next sample
+  # from comparing a new port/rule counter with an old one.
+  if ! traffic_reset_kernel_baselines "$candidate_nodes"; then
+    error '新的 tc 计数基线无法保存，正在恢复上一版本配置和规则。'
+    restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config"
     rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi

@@ -59,8 +59,12 @@ findutils
 EOF
   if [[ "$PACKAGE_MANAGER" == apt-get ]]; then
     printf '%s\n' iproute2 procps
-  else
+  elif [[ "$PACKAGE_MANAGER" == dnf ]]; then
     printf '%s\n' iproute iproute-tc procps-ng
+  else
+    # CentOS 7 commonly ships tc inside iproute rather than a separate
+    # iproute-tc package. Keep yum compatible with that layout.
+    printf '%s\n' iproute procps-ng
   fi
 }
 

@@ -149,8 +149,12 @@ manager_update_flow() {
   new_program="$RUNTIME_DIR/ss-manager-program-new.$$"
   cp -a -- "$PROGRAM_DIR" "$old_program"
   cp -a -- "$source_root" "$new_program"
-  rm -rf -- "$PROGRAM_DIR"
-  mv -- "$new_program" "$PROGRAM_DIR"
+  if ! rm -rf -- "$PROGRAM_DIR" || ! mv -- "$new_program" "$PROGRAM_DIR"; then
+    rm -rf -- "$PROGRAM_DIR"
+    mv -- "$old_program" "$PROGRAM_DIR" || die 'manager 更新切换失败，且旧程序恢复失败。'
+    rm -rf -- "$extract_root" "$archive" "$checksum" "$new_program"
+    die 'manager 更新切换失败，已恢复旧版本。'
+  fi
   if ! [[ -x "$PROGRAM_DIR/ss-manager.sh" ]]; then
     rm -rf -- "$PROGRAM_DIR"
     mv -- "$old_program" "$PROGRAM_DIR"

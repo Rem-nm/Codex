@@ -107,7 +107,15 @@ install_singbox_from_release() {
     [[ -x "$old_binary" ]] && install -m 755 -- "$old_binary" "$SING_BOX_BINARY"
     die "替换后 sing-box 配置检查失败，已恢复旧二进制。"
   fi
-  manager_state_set_json sing_box_version "$(jq -Rn --arg value "$version" '$value')"
+  if ! manager_state_set_json sing_box_version "$(jq -Rn --arg value "$version" '$value')"; then
+    if [[ -x "$old_binary" ]]; then
+      install -m 755 -- "$old_binary" "$SING_BOX_BINARY"
+    else
+      rm -f -- "$SING_BOX_BINARY"
+    fi
+    rm -rf -- "$extract_dir" "$archive_file" "$checksum_file" "$candidate" "$old_binary"
+    die 'sing-box 版本状态写入失败，已恢复替换前的二进制。'
+  fi
   manager_state_set_json sing_box_binary_managed true
   rm -rf -- "$extract_dir" "$archive_file" "$checksum_file" "$candidate" "$old_binary"
   success "已安装 sing-box $version（来源：SagerNet/sing-box 官方 Release）。"

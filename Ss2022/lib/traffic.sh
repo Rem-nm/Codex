@@ -122,6 +122,20 @@ traffic_collect_no_lock() {
   rm -f -- "$traffic_tmp" "$counters_tmp"
 }
 
+traffic_reset_kernel_baselines() {
+  local nodes_source=$1
+  local counters_tmp="$RUNTIME_DIR/counters.baseline.$$.json"
+  install -m 600 -- "$COUNTERS_FILE" "$counters_tmp"
+  jq --slurpfile nodes "$nodes_source" '
+    .nodes |= reduce ($nodes[0].nodes[]?.node_id) as $id (.;
+      .[$id] = ((.[$id] // {}) + {upload_kernel_bytes:0,download_kernel_bytes:0,updated_at:(now|todateiso8601)})
+    )
+  ' "$counters_tmp" >"$counters_tmp.next"
+  install -m 600 -- "$counters_tmp.next" "$counters_tmp"
+  atomic_json_write "$counters_tmp" "$COUNTERS_FILE" 600
+  rm -f -- "$counters_tmp" "$counters_tmp.next"
+}
+
 traffic_append_history() {
   local history_file=$1 node_id=$2 node_name=$3 period=$4 upload=$5 download=$6 closed_at=$7
   local entry

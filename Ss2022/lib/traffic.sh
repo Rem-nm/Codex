@@ -185,7 +185,7 @@ traffic_maintenance_no_lock() {
   done < <(jq -c '.nodes[]' "$NODES_FILE")
 
   if (( changed == 1 )); then
-    if ! apply_state_transaction "$nodes_tmp" "$traffic_tmp" "$history_tmp" 'traffic-maintenance'; then
+    if ! apply_state_transaction "$nodes_tmp" "$traffic_tmp" "$history_tmp" 'traffic-maintenance' 0; then
       warn "流量结算或配额停用未能提交，已保留上一个有效配置。"
     fi
   else

@@ -110,8 +110,27 @@ apply_state_transaction() {
   local candidate_traffic=$2
   local candidate_history=$3
   local reason=$4
+  local collect_traffic=${5:-1}
   ensure_runtime_dirs
   initialize_state_files
+  local merged_traffic=''
+  if [[ "$collect_traffic" == 1 ]]; then
+    traffic_collect_no_lock
+    merged_traffic="$RUNTIME_DIR/traffic.txn-merge.$$.json"
+    jq --slurpfile live "$TRAFFIC_FILE" '
+      .nodes |= with_entries(
+        .key as $id
+        | if ($live[0].nodes[$id] // null) == null then .
+          else
+            .value.current_upload_bytes = ($live[0].nodes[$id].current_upload_bytes // 0)
+            | .value.current_download_bytes = ($live[0].nodes[$id].current_download_bytes // 0)
+            | .value.total_upload_bytes = ($live[0].nodes[$id].total_upload_bytes // 0)
+            | .value.total_download_bytes = ($live[0].nodes[$id].total_download_bytes // 0)
+          end
+      )
+    ' "$candidate_traffic" >"$merged_traffic"
+    candidate_traffic="$merged_traffic"
+  fi
   validate_candidate_nodes "$candidate_nodes"
   jq -e '.schema_version == 1 and (.nodes | type == "object")' "$candidate_traffic" >/dev/null || die '候选流量数据库结构无效。'
   jq -e '.schema_version == 1 and (.cycles | type == "object")' "$candidate_history" >/dev/null || die '候选流量历史结构无效。'
@@ -124,7 +143,7 @@ apply_state_transaction() {
   generate_singbox_config "$candidate_nodes" "$candidate_config"
   if ! singbox_check_config "$candidate_config" >/dev/null 2>&1; then
     error '新配置未通过 sing-box 官方配置检查；未重启服务，也未修改节点数据库。'
-    rm -f -- "$candidate_config"
+    rm -f -- "$candidate_config" "$merged_traffic"
     return 1
   fi
 
@@ -139,7 +158,7 @@ apply_state_transaction() {
   if ! singbox_restart; then
     error 'sing-box 重启失败，正在恢复上一版本配置。'
     restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config"
-    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config"
+    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi
   if ! singbox_health_check "$candidate_nodes"; then
@@ -148,7 +167,7 @@ apply_state_transaction() {
     if ! singbox_health_check "$old_nodes" >/dev/null 2>&1; then
       error '严重：旧配置恢复后健康检查也失败，请立即检查 systemctl status sing-box。'
     fi
-    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config"
+    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi
 
@@ -158,7 +177,7 @@ apply_state_transaction() {
     if ! singbox_health_check "$old_nodes" >/dev/null 2>&1; then
       error '严重：流控回滚后旧配置健康检查失败，请立即检查服务。'
     fi
-    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config"
+    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi
 
@@ -167,7 +186,7 @@ apply_state_transaction() {
     || ! atomic_json_write "$candidate_history" "$HISTORY_FILE" 600; then
     error '节点数据库提交失败，正在回滚运行配置和数据。'
     restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config"
-    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config"
+    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi
 
@@ -177,12 +196,12 @@ apply_state_transaction() {
     if ! singbox_health_check "$old_nodes" >/dev/null 2>&1; then
       error '严重：最终回滚后的旧配置健康检查失败，请立即人工处理。'
     fi
-    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config"
+    rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
     return 1
   fi
 
   backup_prune
-  rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config"
+  rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"
   success "配置事务已提交，备份：$backup_path"
   return 0
 }
@@ -207,6 +226,7 @@ backup_restore_flow() {
   local selected="$BACKUP_DIR/${backups[$((choice-1))]}"
   [[ -f "$selected/nodes.json" && -f "$selected/traffic.json" && -f "$selected/traffic-history.json" ]] || die '备份缺少必要数据文件。'
   prompt_yes_no "确认恢复备份 ${backups[$((choice-1))]}？当前状态会先自动再备份" n || return 0
-  apply_state_transaction "$selected/nodes.json" "$selected/traffic.json" "$selected/traffic-history.json" "restore-${backups[$((choice-1))]}" || die '恢复失败，已自动回滚。'
+  traffic_collect_no_lock
+  apply_state_transaction "$selected/nodes.json" "$selected/traffic.json" "$selected/traffic-history.json" "restore-${backups[$((choice-1))]}" 0 || die '恢复失败，已自动回滚。'
   success '备份恢复完成。'
 }

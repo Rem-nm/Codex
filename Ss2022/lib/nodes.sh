@@ -270,10 +270,13 @@ select_node_id() {
 node_show_detail() {
   local node_id=$1 node
   node=$(node_by_id "$node_id") || die "节点不存在：$node_id"
-  local upload download total quota reset_day status
+  local upload download total total_upload total_download total_all quota reset_day status
   upload=$(traffic_value "$node_id" '.current_upload_bytes')
   download=$(traffic_value "$node_id" '.current_download_bytes')
   total=$((upload + download))
+  total_upload=$(traffic_value "$node_id" '.total_upload_bytes')
+  total_download=$(traffic_value "$node_id" '.total_download_bytes')
+  total_all=$((total_upload + total_download))
   quota=$(jq -er '.quota_bytes' <<<"$node")
   reset_day=$(jq -er '.reset_day' <<<"$node")
   status=$(jq -er '.status' <<<"$node")
@@ -281,6 +284,7 @@ node_show_detail() {
     "$(jq -er '.name' <<<"$node")" "$node_id" "$(jq -er '.address' <<<"$node")" "$(jq -er '.port' <<<"$node")" "$(jq -er '.method' <<<"$node")" "$(status_label "$status")"
   printf '本周期上传：%s\n本周期下载：%s\n本周期合计：%s\n' "$(format_bytes "$upload")" "$(format_bytes "$download")" "$(format_bytes "$total")"
   if (( quota == 0 )); then printf '月流量限额：无限\n'; else printf '月流量限额：%s\n剩余：%s\n' "$(format_bytes "$quota")" "$(format_bytes "$(( quota > total ? quota - total : 0 ))")"; fi
+  printf '累计上传：%s\n累计下载：%s\n累计合计：%s\n' "$(format_bytes "$total_upload")" "$(format_bytes "$total_download")" "$(format_bytes "$total_all")"
   printf '重置日：每月 %s 日\n上传限速：%s\n下载限速：%s\n下次重置：%s\n' "$reset_day" "$(format_mbps "$(jq -er '.upload_limit_mbps' <<<"$node")")" "$(format_mbps "$(jq -er '.download_limit_mbps' <<<"$node")")" "$(jq -er '.next_reset_at' <<<"$node")"
 }
 

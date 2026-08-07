@@ -23,7 +23,7 @@ singbox_update_info() {
 singbox_update_flow() {
   acquire_manager_lock
   singbox_update_info
-  local lock choice latest latest_version target old_binary old_config
+  local lock choice latest latest_version target old_binary old_config old_version
   lock=$(singbox_lock_value)
   latest=$(fetch_singbox_release_json latest 2>/dev/null || true)
   latest_version=$(jq -r '.tag_name // empty' <<<"$latest")
@@ -34,6 +34,7 @@ singbox_update_flow() {
     return 0
   fi
   prompt_yes_no "更新到官方版本 $target？更新前会备份当前二进制和配置" n || return 0
+  old_version=$(singbox_binary_version 2>/dev/null || true)
   old_binary="$RUNTIME_DIR/sing-box.update-old.$$"
   old_config="$RUNTIME_DIR/config.update-old.$$"
   [[ -x "$SING_BOX_BINARY" ]] && install -m 755 -- "$SING_BOX_BINARY" "$old_binary"
@@ -47,6 +48,7 @@ singbox_update_flow() {
     error '新版 sing-box 健康检查失败，正在恢复旧版。'
     [[ -x "$old_binary" ]] && install -m 755 -- "$old_binary" "$SING_BOX_BINARY"
     [[ -f "$old_config" ]] && install -m 600 -- "$old_config" "$SING_BOX_CONFIG"
+    [[ -n "$old_version" ]] && manager_state_set_json sing_box_version "$(jq -Rn --arg value "$old_version" '$value')"
     systemctl restart "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
     if singbox_health_check "$NODES_FILE" >/dev/null 2>&1; then
       warn '旧版 sing-box 已恢复并通过健康检查。'

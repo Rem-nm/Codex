@@ -167,6 +167,11 @@ traffic_maintenance_no_lock() {
         '.nodes[$id].current_upload_bytes=0 | .nodes[$id].current_download_bytes=0 | .nodes[$id].last_reset_at=$last | .nodes[$id].next_reset_at=$next | .nodes[$id].updated_at=(now|todateiso8601)' \
         "$traffic_tmp" >"$traffic_tmp.next"
       mv -f -- "$traffic_tmp.next" "$traffic_tmp"
+      jq --arg id "$node_id" --arg last "$next_reset" --arg next "$new_next" \
+        '.nodes |= map(if .node_id == $id then .last_reset_at=$last | .next_reset_at=$next | .updated_at=(now|todateiso8601) else . end)' \
+        "$nodes_tmp" >"$nodes_tmp.next"
+      mv -f -- "$nodes_tmp.next" "$nodes_tmp"
+      changed=1
       if [[ "$status" == disabled_quota ]]; then
         jq --arg id "$node_id" '.nodes[] |= if .node_id == $id then .status="enabled" | .status_reason="" | .updated_at=(now|todateiso8601) else . end' "$nodes_tmp" >"$nodes_tmp.next"
         mv -f -- "$nodes_tmp.next" "$nodes_tmp"
@@ -223,4 +228,21 @@ traffic_update_node_settings() {
     "$traffic_tmp" >"$traffic_tmp.next"
   mv -f -- "$traffic_tmp.next" "$traffic_tmp"
   printf '%s' "$traffic_tmp"
+}
+
+traffic_sync_nodes_schedule() {
+  local nodes_source=$1
+  local traffic_source=$2
+  local output_file=$3
+  jq --slurpfile traffic "$traffic_source" '
+    .nodes |= map(
+      .node_id as $id
+      | if ($traffic[0].nodes[$id] // null) == null then .
+        else
+          .last_reset_at = ($traffic[0].nodes[$id].last_reset_at // .last_reset_at)
+          | .next_reset_at = ($traffic[0].nodes[$id].next_reset_at // .next_reset_at)
+        end
+    )
+  ' "$nodes_source" >"$output_file"
+  chmod 600 -- "$output_file"
 }

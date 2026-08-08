@@ -99,6 +99,11 @@ grep -q '"$SCRIPT_DIR/VERSION" "$PROGRAM_DIR/VERSION"' "$ROOT/install.sh"
 grep -q 'source "$SCRIPT_DIR/lib/service.sh"' "$ROOT/install.sh"
 grep -q 'manager_state_set_json install_completed true' "$ROOT/ss-manager.sh"
 grep -q 'enable_manager_maintenance_service' "$ROOT/install.sh"
+grep -q 'candidate_dir=$(dirname -- "$SING_BOX_BINARY")' "$ROOT/lib/singbox.sh"
+if grep -q 'local candidate="$RUNTIME_DIR/sing-box-${version}-${HOST_ARCH}.candidate"' "$ROOT/lib/singbox.sh"; then
+  printf 'assertion failed: sing-box candidate must not execute from the runtime directory\n' >&2
+  exit 1
+fi
 
 for service_aware_file in install.sh lib/backup.sh lib/menu.sh lib/singbox.sh lib/update.sh; do
   if grep -q 'systemctl' "$ROOT/$service_aware_file"; then

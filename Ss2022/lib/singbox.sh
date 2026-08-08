@@ -77,7 +77,12 @@ install_singbox_from_release() {
   local archive_file="$RUNTIME_DIR/sing-box-${version}-${HOST_ARCH}.tar.gz"
   local checksum_file="$RUNTIME_DIR/sing-box-${version}-SHA256SUMS"
   local extract_dir="$RUNTIME_DIR/sing-box-${version}-${HOST_ARCH}-extract.$$"
-  local candidate="$RUNTIME_DIR/sing-box-${version}-${HOST_ARCH}.candidate"
+  # /run is commonly mounted noexec on hardened Debian hosts.  Keep the
+  # candidate next to the final binary so version/configuration probes run on
+  # the same executable filesystem as the installed service.
+  local candidate_dir
+  candidate_dir=$(dirname -- "$SING_BOX_BINARY")
+  local candidate="$candidate_dir/.sing-box-${version}-${HOST_ARCH}.candidate.$"
   rm -rf -- "$extract_dir"
   mkdir -p -- "$extract_dir"
   info "正在下载 sing-box $version（$HOST_ARCH）……"

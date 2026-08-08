@@ -89,6 +89,15 @@ tc_add_flower_rule eth0 egress ipv6 udp 20001 20 49123
   printf 'assertion failed: limited rule lacks police drop/pass\n' >&2
   exit 1
 }
+assert_equal 49123 "$(tc_family_pref 49123 ip)" 'IPv4 tc rules must retain the base priority'
+assert_equal 49124 "$(tc_family_pref 49123 ipv6)" 'IPv6 tc rules must use a distinct priority'
+
+split_tc_json=$(jq -nc '[
+  {protocol:"ip",pref:49123,kind:"flower",options:{dst_port:20001,actions:[{kind:"gact",stats:{bytes:100}}]}},
+  {protocol:"ipv6",pref:49124,kind:"flower",options:{dst_port:20001,actions:[{kind:"gact",stats:{bytes:300}}]}}
+]')
+tc() { printf '%s' "$split_tc_json"; }
+assert_equal 400 "$(tc_counter_json eth0 ingress 20001 49123)" 'traffic sampling must merge IPv4 and IPv6 tc priorities'
 
 grep -q 'installed_node_count=' "$ROOT/install.sh"
 if grep -q '\$(node_count)' "$ROOT/install.sh"; then
@@ -123,6 +132,13 @@ captured_method=$(printf '2\n' | choose_method 2>"$test_tmp/method-prompt.log")
 assert_equal '2022-blake3-aes-256-gcm' "$captured_method" 'interactive method prompts must not contaminate command-substitution results'
 selected_id=$(printf '1\n' | select_node_id '请选择节点' 2>"$test_tmp/select-prompt.log")
 assert_equal '0123456789abcdef0123456789abcdef' "$selected_id" 'node selection must return only the selected Node ID'
+saved_port_available=$(declare -f port_available)
+port_available() { return 0; }
+captured_port=$(printf '20002\n' | choose_port 2>"$test_tmp/port-prompt.log")
+eval "$saved_port_available"
+assert_equal '20002' "$captured_port" 'port entry must accept a direct port without a menu choice'
+captured_address=$(printf '198.51.100.10\n' | choose_address 2>"$test_tmp/address-prompt.log")
+assert_equal $'198.51.100.10\tipv4' "$captured_address" 'direct node addresses must not require a menu choice'
 same_port_candidate="$test_tmp/same-port.json"
 changed_port_candidate="$test_tmp/changed-port.json"
 jq . "$NODES_FILE" >"$same_port_candidate"

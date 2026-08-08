@@ -90,14 +90,19 @@ tc_counter_from_json() {
 
 tc_counter_json() {
   local interface=$1 direction=$2 port=$3 pref=$4
-  local output
+  local output family_pref value total=0
   if [[ "$direction" == ingress ]]; then
     output=$(tc -s -j filter show dev "$interface" ingress 2>/dev/null || true)
   else
     output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null || true)
   fi
   [[ -n "$output" ]] || { printf '0'; return 0; }
-  tc_counter_from_json "$output" "$pref" "$direction" "$port" 2>/dev/null || printf '0'
+  for family_pref in "$pref" "$(tc_family_pref "$pref" ipv6 2>/dev/null || printf '%s' "$pref")"; do
+    value=$(tc_counter_from_json "$output" "$family_pref" "$direction" "$port" 2>/dev/null || printf '0')
+    [[ "$value" =~ ^[0-9]+$ ]] || value=0
+    total=$((total + value))
+  done
+  printf '%s' "$total"
 }
 
 tc_node_counter() {

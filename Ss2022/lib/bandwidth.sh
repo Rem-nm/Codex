@@ -55,11 +55,13 @@ tc_family_pref() {
 }
 
 tc_pref_is_free() {
-  local pref=$1 interface
+  local pref=$1 interface family
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    if tc filter show dev "$interface" ingress pref "$pref" 2>/dev/null | grep -q .; then return 1; fi
-    if tc filter show dev "$interface" egress pref "$pref" 2>/dev/null | grep -q .; then return 1; fi
+    for family in ip ipv6; do
+      if tc filter show dev "$interface" ingress protocol "$family" pref "$pref" 2>/dev/null | grep -q .; then return 1; fi
+      if tc filter show dev "$interface" egress protocol "$family" pref "$pref" 2>/dev/null | grep -q .; then return 1; fi
+    done
   done < <(traffic_interfaces)
   return 0
 }
@@ -106,12 +108,13 @@ ensure_clsact() {
 }
 
 delete_manager_tc_filters() {
-  local pref=$1 interface family_pref
+  local pref=$1 interface family family_pref
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    for family_pref in "$pref" "$(tc_family_pref "$pref" ipv6)"; do
-      tc filter del dev "$interface" ingress pref "$family_pref" 2>/dev/null || true
-      tc filter del dev "$interface" egress pref "$family_pref" 2>/dev/null || true
+    for family in ip ipv6; do
+      family_pref=$(tc_family_pref "$pref" "$family") || continue
+      tc filter del dev "$interface" ingress protocol "$family" pref "$family_pref" 2>/dev/null || true
+      tc filter del dev "$interface" egress protocol "$family" pref "$family_pref" 2>/dev/null || true
     done
   done < <(bandwidth_known_interfaces)
 }
@@ -228,9 +231,10 @@ tc_rule_json_matches() {
         | select((((.pref // 0) | tonumber?) // -1) == $pref)
         | select(((.protocol // "") | tostring | ascii_downcase) == $family)
         | (.options // {}) as $options
-        | (($options.ip_proto // "") | tostring | ascii_downcase) as $actual_protocol
+        | ($options.keys // $options) as $keys
+        | (($keys.ip_proto // "") | tostring | ascii_downcase) as $actual_protocol
         | select($actual_protocol == $protocol or $actual_protocol == $protocol_number)
-        | select(((($options[$port_field] // 0) | tonumber?) // -1) == $port)
+        | select(((($keys[$port_field] // 0) | tonumber?) // -1) == $port)
         | select(any(($options.actions // [])[]; ((.kind // "") | tostring | ascii_downcase) == $expected_action))
       ] | length == 1
     ' <<<"$rules_json" >/dev/null
@@ -247,20 +251,20 @@ bandwidth_check_nodes() {
   }
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    if ! ingress_json=$(tc -j filter show dev "$interface" ingress pref "$pref" 2>/dev/null); then
+    if ! ingress_json=$(tc -j filter show dev "$interface" ingress protocol ip pref "$pref" 2>/dev/null); then
       error "无法读取 tc ingress 规则：接口 $interface"
       return 1
     fi
-    if ! egress_json=$(tc -j filter show dev "$interface" egress pref "$pref" 2>/dev/null); then
+    if ! egress_json=$(tc -j filter show dev "$interface" egress protocol ip pref "$pref" 2>/dev/null); then
       error "无法读取 tc egress 规则：接口 $interface"
       return 1
     fi
     local ingress_ipv6_json egress_ipv6_json
-    if ! ingress_ipv6_json=$(tc -j filter show dev "$interface" ingress pref "$ipv6_pref" 2>/dev/null); then
+    if ! ingress_ipv6_json=$(tc -j filter show dev "$interface" ingress protocol ipv6 pref "$ipv6_pref" 2>/dev/null); then
       error "无法读取 tc IPv6 ingress 规则：接口 $interface"
       return 1
     fi
-    if ! egress_ipv6_json=$(tc -j filter show dev "$interface" egress pref "$ipv6_pref" 2>/dev/null); then
+    if ! egress_ipv6_json=$(tc -j filter show dev "$interface" egress protocol ipv6 pref "$ipv6_pref" 2>/dev/null); then
       error "无法读取 tc IPv6 egress 规则：接口 $interface"
       return 1
     fi
@@ -316,11 +320,11 @@ bandwidth_status() {
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
     printf '\n接口：%s\n' "$interface"
-    tc -s filter show dev "$interface" ingress pref "$pref" 2>/dev/null || true
-    tc -s filter show dev "$interface" egress pref "$pref" 2>/dev/null || true
+    tc -s filter show dev "$interface" ingress protocol ip pref "$pref" 2>/dev/null || true
+    tc -s filter show dev "$interface" egress protocol ip pref "$pref" 2>/dev/null || true
     if [[ "$ipv6_pref" != "$pref" ]]; then
-      tc -s filter show dev "$interface" ingress pref "$ipv6_pref" 2>/dev/null || true
-      tc -s filter show dev "$interface" egress pref "$ipv6_pref" 2>/dev/null || true
+      tc -s filter show dev "$interface" ingress protocol ipv6 pref "$ipv6_pref" 2>/dev/null || true
+      tc -s filter show dev "$interface" egress protocol ipv6 pref "$ipv6_pref" 2>/dev/null || true
     fi
   done < <(traffic_interfaces)
 }

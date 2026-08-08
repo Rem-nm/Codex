@@ -77,7 +77,8 @@ tc_counter_from_json() {
     [ .[]
       | select((((.pref // 0) | tonumber?) // -1) == $pref)
       | (.options // {}) as $options
-      | select(((($options[$port_field] // 0) | tonumber?) // -1) == $port)
+      | ($options.keys // $options) as $keys
+      | select(((($keys[$port_field] // 0) | tonumber?) // -1) == $port)
       | ($options.actions // []) as $actions
       | select(($actions | length) == 0 or any($actions[]; (.kind // "") == "police" or (.kind // "") == "gact"))
       | if ($actions | length) > 0

@@ -53,14 +53,14 @@ assert_equal false "$(jq 'has("cycles") and (.cycles | has("node-a"))' <<<"$purg
 rm -f -- "$history_test"
 
 tc_json=$(jq -nc '[
-  {protocol:"ip",pref:49123,kind:"flower",options:{ip_proto:"tcp",dst_port:20001,actions:[{kind:"gact",stats:{bytes:100}}]}},
-  {protocol:"ip",pref:49123,kind:"flower",options:{ip_proto:"udp",dst_port:20001,actions:[{kind:"gact",stats:{bytes:200}}]}},
-  {protocol:"ipv6",pref:49123,kind:"flower",options:{ip_proto:6,dst_port:20001,actions:[{kind:"police",stats:{bytes:300}}]}},
-  {protocol:"ipv6",pref:49123,kind:"flower",options:{ip_proto:17,dst_port:20001,actions:[{kind:"police",stats:{bytes:400}}]}},
-  {protocol:"ip",pref:49123,kind:"flower",options:{ip_proto:"tcp",src_port:20001,actions:[{kind:"gact",stats:{bytes:500}}]}},
-  {protocol:"ipv6",pref:49123,kind:"flower",options:{ip_proto:"udp",src_port:20001,actions:[{kind:"gact",stats:{bytes:600}}]}},
-  {protocol:"ip",pref:49100,kind:"flower",options:{ip_proto:"tcp",dst_port:20001,actions:[{kind:"gact",stats:{bytes:99999}}]}},
-  {protocol:"ip",pref:49123,kind:"flower",options:{ip_proto:"tcp",dst_port:20002,actions:[{kind:"gact",stats:{bytes:99999}}]}}
+  {protocol:"ip",pref:49123,kind:"flower",options:{keys:{ip_proto:"tcp",dst_port:20001},actions:[{kind:"gact",stats:{bytes:100}}]}},
+  {protocol:"ip",pref:49123,kind:"flower",options:{keys:{ip_proto:"udp",dst_port:20001},actions:[{kind:"gact",stats:{bytes:200}}]}},
+  {protocol:"ipv6",pref:49123,kind:"flower",options:{keys:{ip_proto:6,dst_port:20001},actions:[{kind:"police",stats:{bytes:300}}]}},
+  {protocol:"ipv6",pref:49123,kind:"flower",options:{keys:{ip_proto:17,dst_port:20001},actions:[{kind:"police",stats:{bytes:400}}]}},
+  {protocol:"ip",pref:49123,kind:"flower",options:{keys:{ip_proto:"tcp",src_port:20001},actions:[{kind:"gact",stats:{bytes:500}}]}},
+  {protocol:"ipv6",pref:49123,kind:"flower",options:{keys:{ip_proto:"udp",src_port:20001},actions:[{kind:"gact",stats:{bytes:600}}]}},
+  {protocol:"ip",pref:49100,kind:"flower",options:{keys:{ip_proto:"tcp",dst_port:20001},actions:[{kind:"gact",stats:{bytes:99999}}]}},
+  {protocol:"ip",pref:49123,kind:"flower",options:{keys:{ip_proto:"tcp",dst_port:20002},actions:[{kind:"gact",stats:{bytes:99999}}]}}
 ]')
 
 upload=$(tc_counter_from_json "$tc_json" 49123 ingress 20001)
@@ -93,11 +93,22 @@ assert_equal 49123 "$(tc_family_pref 49123 ip)" 'IPv4 tc rules must retain the b
 assert_equal 49124 "$(tc_family_pref 49123 ipv6)" 'IPv6 tc rules must use a distinct priority'
 
 split_tc_json=$(jq -nc '[
-  {protocol:"ip",pref:49123,kind:"flower",options:{dst_port:20001,actions:[{kind:"gact",stats:{bytes:100}}]}},
-  {protocol:"ipv6",pref:49124,kind:"flower",options:{dst_port:20001,actions:[{kind:"gact",stats:{bytes:300}}]}}
+  {protocol:"ip",pref:49123,kind:"flower",options:{keys:{dst_port:20001},actions:[{kind:"gact",stats:{bytes:100}}]}},
+  {protocol:"ipv6",pref:49124,kind:"flower",options:{keys:{dst_port:20001},actions:[{kind:"gact",stats:{bytes:300}}]}}
 ]')
 tc() { printf '%s' "$split_tc_json"; }
 assert_equal 400 "$(tc_counter_json eth0 ingress 20001 49123)" 'traffic sampling must merge IPv4 and IPv6 tc priorities'
+tc_delete_log=''
+bandwidth_known_interfaces() { printf 'eth0\n'; }
+tc() {
+  tc_delete_log+="$(printf '%q ' "$@")"
+  tc_delete_log+=$'\n'
+}
+delete_manager_tc_filters 49123
+[[ "$tc_delete_log" == *'protocol ip pref 49123'* && "$tc_delete_log" == *'protocol ipv6 pref 49124'* ]] || {
+  printf 'assertion failed: tc cleanup must delete each protocol priority explicitly\n' >&2
+  exit 1
+}
 
 grep -q 'installed_node_count=' "$ROOT/install.sh"
 if grep -q '\$(node_count)' "$ROOT/install.sh"; then

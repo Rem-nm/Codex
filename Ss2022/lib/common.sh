@@ -184,7 +184,9 @@ read_nonempty() {
   local prompt=$1
   local value
   while true; do
-    printf '%s\n> ' "$prompt"
+    # Callers use command substitution to capture only the entered value.
+    # Keep interactive prompts off stdout so they cannot become part of it.
+    printf '%s\n> ' "$prompt" >&2
     IFS= read -r value || die "读取输入失败。"
     value=$(trim_spaces "$value")
     if [[ -n "$value" ]]; then
@@ -199,11 +201,11 @@ read_secret_confirmed() {
   local prompt=$1
   local first second
   while true; do
-    printf '%s\n> ' "$prompt"
+    printf '%s\n> ' "$prompt" >&2
     IFS= read -r -s first || die "读取输入失败。"
-    printf '\n请再次输入以确认：\n> '
+    printf '\n请再次输入以确认：\n> ' >&2
     IFS= read -r -s second || die "读取输入失败。"
-    printf '\n'
+    printf '\n' >&2
     [[ -n "$first" ]] || { warn "密钥不能为空。"; continue; }
     [[ "$first" == "$second" ]] || { warn "两次输入不一致。"; continue; }
     printf '%s' "$first"

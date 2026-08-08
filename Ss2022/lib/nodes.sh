@@ -75,36 +75,29 @@ port_available() {
 
 choose_port() {
   local exclude_id=${1:-}
-  local choice port attempt
+  local port attempt
   while true; do
-    printf '%s\n\n1. 自动随机（%s-%s）\n2. 手动输入\n' '请选择端口：' "$DEFAULT_PORT_MIN" "$DEFAULT_PORT_MAX" >&2
-    printf '> ' >&2
-    IFS= read -r choice || die "读取输入失败。"
-    case "$choice" in
-      1)
-        for ((attempt=1; attempt<=500; attempt++)); do
-          port=$(shuf -i "${DEFAULT_PORT_MIN}-${DEFAULT_PORT_MAX}" -n 1)
-          if port_available "$port" "$exclude_id"; then
-            printf '%s' "$port"
-            return 0
-          fi
-        done
-        die "在随机范围内没有找到同时可用的 TCP/UDP 端口。"
-        ;;
-      2)
-        printf '请输入 1-65535 的端口：\n> ' >&2
-        IFS= read -r port || die "读取输入失败。"
-        if ! validate_port "$port"; then
-          warn "端口必须是 1-65535 的整数。"
-        elif ! port_available "$port" "$exclude_id"; then
-          warn "端口 $port 的 TCP 或 UDP 已被占用，或与已有节点冲突；不会覆盖。"
-        else
+    printf '请输入端口（回车随机，范围 %s-%s）：\n> ' "$DEFAULT_PORT_MIN" "$DEFAULT_PORT_MAX" >&2
+    IFS= read -r port || die "读取输入失败。"
+    port=$(trim_spaces "$port")
+    if [[ -z "$port" ]]; then
+      for ((attempt=1; attempt<=500; attempt++)); do
+        port=$(shuf -i "${DEFAULT_PORT_MIN}-${DEFAULT_PORT_MAX}" -n 1)
+        if port_available "$port" "$exclude_id"; then
           printf '%s' "$port"
           return 0
         fi
-        ;;
-      *) warn "请选择 1 或 2。" ;;
-    esac
+      done
+      die "在随机范围内没有找到同时可用的 TCP/UDP 端口。"
+    fi
+    if ! validate_port "$port"; then
+      warn "端口必须是 1-65535 的整数；直接回车可随机选择。"
+    elif ! port_available "$port" "$exclude_id"; then
+      warn "端口 $port 的 TCP 或 UDP 已被占用，或与已有节点冲突；不会覆盖。"
+    else
+      printf '%s' "$port"
+      return 0
+    fi
   done
 }
 
@@ -124,49 +117,34 @@ choose_method() {
 }
 
 choose_address() {
-  local choice value detected
+  local value detected
   while true; do
-    printf '%s\n\n1. 自动检测公网 IPv4\n2. 自动检测公网 IPv6\n3. 手动输入 IP\n4. 输入域名\n' '请选择节点地址：' >&2
-    printf '> ' >&2
-    IFS= read -r choice || die "读取输入失败。"
-    case "$choice" in
-      1)
-        value=$(discover_public_ip ipv4 2>/dev/null || true)
-        [[ -n "$value" ]] || { warn "没有检测到公网 IPv4，请改用手动输入。"; continue; }
-        printf '%s\t%s' "$value" ipv4
-        return 0
-        ;;
-      2)
-        value=$(discover_public_ip ipv6 2>/dev/null || true)
-        if [[ -z "$value" ]]; then
-          warn "没有检测到公网 IPv6；请选择其他地址方式，或确认服务器/云安全组已配置 IPv6。"
-          continue
-        fi
-        printf '%s\t%s' "$value" ipv6
-        return 0
-        ;;
-      3)
-        printf '请输入 IPv4 或 IPv6：\n> ' >&2
-        IFS= read -r value || die "读取输入失败。"
-        detected=$(validate_address "$value" 2>/dev/null || true)
-        if [[ "$detected" == ipv4 || "$detected" == ipv6 ]]; then
-          printf '%s\t%s' "$value" "$detected"
-          return 0
-        fi
-        warn "不是有效的 IPv4/IPv6 地址。"
-        ;;
-      4)
-        printf '请输入域名（不含协议和端口）：\n> ' >&2
-        IFS= read -r value || die "读取输入失败。"
-        detected=$(validate_address "$value" 2>/dev/null || true)
-        if [[ "$detected" == domain ]]; then
-          printf '%s\t%s' "$value" domain
-          return 0
-        fi
-        warn "不是有效的域名。"
-        ;;
-      *) warn "请选择 1-4。" ;;
-    esac
+    printf '请输入节点地址（回车自动检测公网 IPv4；输入 ipv6 可自动检测公网 IPv6）：\n> ' >&2
+    IFS= read -r value || die "读取输入失败。"
+    value=$(trim_spaces "$value")
+    if [[ -z "$value" || "$value" == auto || "$value" == ipv4 ]]; then
+      detected=ipv4
+      value=$(discover_public_ip ipv4 2>/dev/null || true)
+      [[ -n "$value" ]] || { warn "没有检测到公网 IPv4，请直接输入 IP 或域名。"; continue; }
+      printf '%s\t%s' "$value" "$detected"
+      return 0
+    fi
+    if [[ "$value" == ipv6 || "$value" == auto6 ]]; then
+      detected=ipv6
+      value=$(discover_public_ip ipv6 2>/dev/null || true)
+      if [[ -z "$value" ]]; then
+        warn "没有检测到公网 IPv6；请直接输入 IPv6、IPv4 或域名。"
+        continue
+      fi
+      printf '%s\t%s' "$value" "$detected"
+      return 0
+    fi
+    detected=$(validate_address "$value" 2>/dev/null || true)
+    if [[ "$detected" == ipv4 || "$detected" == ipv6 || "$detected" == domain ]]; then
+      printf '%s\t%s' "$value" "$detected"
+      return 0
+    fi
+    warn "不是有效的 IPv4、IPv6 或域名。"
   done
 }
 

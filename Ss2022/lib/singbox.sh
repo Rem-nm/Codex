@@ -82,7 +82,7 @@ install_singbox_from_release() {
   # the same executable filesystem as the installed service.
   local candidate_dir
   candidate_dir=$(dirname -- "$SING_BOX_BINARY")
-  local candidate="$candidate_dir/.sing-box-${version}-${HOST_ARCH}.candidate.$"
+  local candidate="$candidate_dir/.sing-box-${version}-${HOST_ARCH}.candidate.${BASHPID}"
   rm -rf -- "$extract_dir"
   mkdir -p -- "$extract_dir"
   info "正在下载 sing-box $version（$HOST_ARCH）……"

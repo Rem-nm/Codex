@@ -77,8 +77,8 @@ choose_port() {
   local exclude_id=${1:-}
   local choice port attempt
   while true; do
-    printf '%s\n\n1. 自动随机（%s-%s）\n2. 手动输入\n' '请选择端口：' "$DEFAULT_PORT_MIN" "$DEFAULT_PORT_MAX"
-    printf '> '
+    printf '%s\n\n1. 自动随机（%s-%s）\n2. 手动输入\n' '请选择端口：' "$DEFAULT_PORT_MIN" "$DEFAULT_PORT_MAX" >&2
+    printf '> ' >&2
     IFS= read -r choice || die "读取输入失败。"
     case "$choice" in
       1)
@@ -92,7 +92,7 @@ choose_port() {
         die "在随机范围内没有找到同时可用的 TCP/UDP 端口。"
         ;;
       2)
-        printf '请输入 1-65535 的端口：\n> '
+        printf '请输入 1-65535 的端口：\n> ' >&2
         IFS= read -r port || die "读取输入失败。"
         if ! validate_port "$port"; then
           warn "端口必须是 1-65535 的整数。"
@@ -111,8 +111,8 @@ choose_port() {
 choose_method() {
   local choice
   while true; do
-    printf '%s\n\n1. 2022-blake3-aes-128-gcm\n2. 2022-blake3-aes-256-gcm（默认）\n' '请选择加密方式：'
-    printf '> '
+    printf '%s\n\n1. 2022-blake3-aes-128-gcm\n2. 2022-blake3-aes-256-gcm（默认）\n' '请选择加密方式：' >&2
+    printf '> ' >&2
     IFS= read -r choice || die "读取输入失败。"
     [[ -z "$choice" ]] && choice=2
     case "$choice" in
@@ -126,8 +126,8 @@ choose_method() {
 choose_address() {
   local choice value detected
   while true; do
-    printf '%s\n\n1. 自动检测公网 IPv4\n2. 自动检测公网 IPv6\n3. 手动输入 IP\n4. 输入域名\n' '请选择节点地址：'
-    printf '> '
+    printf '%s\n\n1. 自动检测公网 IPv4\n2. 自动检测公网 IPv6\n3. 手动输入 IP\n4. 输入域名\n' '请选择节点地址：' >&2
+    printf '> ' >&2
     IFS= read -r choice || die "读取输入失败。"
     case "$choice" in
       1)
@@ -146,7 +146,7 @@ choose_address() {
         return 0
         ;;
       3)
-        printf '请输入 IPv4 或 IPv6：\n> '
+        printf '请输入 IPv4 或 IPv6：\n> ' >&2
         IFS= read -r value || die "读取输入失败。"
         detected=$(validate_address "$value" 2>/dev/null || true)
         if [[ "$detected" == ipv4 || "$detected" == ipv6 ]]; then
@@ -156,7 +156,7 @@ choose_address() {
         warn "不是有效的 IPv4/IPv6 地址。"
         ;;
       4)
-        printf '请输入域名（不含协议和端口）：\n> '
+        printf '请输入域名（不含协议和端口）：\n> ' >&2
         IFS= read -r value || die "读取输入失败。"
         detected=$(validate_address "$value" 2>/dev/null || true)
         if [[ "$detected" == domain ]]; then
@@ -260,12 +260,14 @@ node_list_compact() {
 
 select_node_id() {
   local prompt=${1:-'请选择节点序号'}
-  node_list_compact
+  # This function is normally called through command substitution; the list
+  # and prompt are UI output, not the selected Node ID.
+  node_list_compact >&2
   local count index
   count=$(node_count)
   (( count > 0 )) || return 1
   while true; do
-    printf '%s（0 返回）\n> ' "$prompt"
+    printf '%s（0 返回）\n> ' "$prompt" >&2
     IFS= read -r index || die "读取输入失败。"
     [[ "$index" == 0 ]] && return 1
     if [[ "$index" =~ ^[0-9]+$ ]] && (( index >= 1 && index <= count )); then

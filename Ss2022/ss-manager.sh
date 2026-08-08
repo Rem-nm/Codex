@@ -52,6 +52,7 @@ case "${1:-menu}" in
       run_menu_action node_add_flow
       (( ${MENU_ACTION_STATUS:-1} == 0 )) || die '首个节点创建未完成。'
     fi
+    enable_manager_maintenance_service
     manager_state_set_json install_completed true
     main_menu
     ;;

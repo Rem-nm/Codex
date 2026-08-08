@@ -151,7 +151,6 @@ if ! singbox_restart || ! singbox_health_check "$NODES_FILE"; then
   die '安装/修复失败；安装前配置已恢复，未进入节点创建流程。'
 fi
 rm -f -- "$candidate" "$install_previous_config" "$install_previous_service"
-enable_manager_maintenance_service
 
 success "Ss2022 manager $MANAGER_VERSION 安装/修复完成。"
 printf '以后可在任意目录执行：rem\n'
@@ -162,5 +161,6 @@ install_completed=$(manager_state_get install_completed false)
 if (( installed_node_count == 0 )) && [[ "$install_completed" != true ]]; then
   exec "$PROGRAM_DIR/ss-manager.sh" --first-run
 fi
+enable_manager_maintenance_service
 manager_state_set_json install_completed true
 exec "$PROGRAM_DIR/ss-manager.sh" menu

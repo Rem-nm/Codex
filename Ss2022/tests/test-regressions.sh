@@ -132,6 +132,11 @@ captured_method=$(printf '2\n' | choose_method 2>"$test_tmp/method-prompt.log")
 assert_equal '2022-blake3-aes-256-gcm' "$captured_method" 'interactive method prompts must not contaminate command-substitution results'
 selected_id=$(printf '1\n' | select_node_id '请选择节点' 2>"$test_tmp/select-prompt.log")
 assert_equal '0123456789abcdef0123456789abcdef' "$selected_id" 'node selection must return only the selected Node ID'
+saved_port_available=$(declare -f port_available)
+port_available() { return 0; }
+captured_port=$(printf '20002\n' | choose_port 2>"$test_tmp/port-prompt.log")
+eval "$saved_port_available"
+assert_equal '20002' "$captured_port" 'port entry must accept a direct port without a menu choice'
 captured_address=$(printf '198.51.100.10\n' | choose_address 2>"$test_tmp/address-prompt.log")
 assert_equal $'198.51.100.10\tipv4' "$captured_address" 'direct node addresses must not require a menu choice'
 same_port_candidate="$test_tmp/same-port.json"

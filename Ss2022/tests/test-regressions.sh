@@ -117,6 +117,12 @@ trap 'rm -rf -- "$test_tmp"' EXIT
 NODES_FILE="$test_tmp/live-nodes.json"
 live_node=$(jq -nc '{node_id:"0123456789abcdef0123456789abcdef",name:"Tokyo",method:"2022-blake3-aes-256-gcm",password:"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",port:20001,address:"192.0.2.1",address_type:"ipv4",status:"enabled",status_reason:"",quota_bytes:0,reset_day:1,upload_limit_mbps:0,download_limit_mbps:0,created_at:"2026-01-01T00:00:00Z",updated_at:"2026-01-01T00:00:00Z",last_reset_at:"2026-01-01T00:00:00Z",next_reset_at:"2026-02-01T00:00:00Z"}')
 jq -n --argjson node "$live_node" '{schema_version:1,nodes:[$node]}' >"$NODES_FILE"
+captured_name=$(printf 'ss\n' | read_nonempty '请输入节点名称' 2>"$test_tmp/name-prompt.log")
+assert_equal 'ss' "$captured_name" 'interactive name prompts must not contaminate command-substitution results'
+captured_method=$(printf '2\n' | choose_method 2>"$test_tmp/method-prompt.log")
+assert_equal '2022-blake3-aes-256-gcm' "$captured_method" 'interactive method prompts must not contaminate command-substitution results'
+selected_id=$(printf '1\n' | select_node_id '请选择节点' 2>"$test_tmp/select-prompt.log")
+assert_equal '0123456789abcdef0123456789abcdef' "$selected_id" 'node selection must return only the selected Node ID'
 same_port_candidate="$test_tmp/same-port.json"
 changed_port_candidate="$test_tmp/changed-port.json"
 jq . "$NODES_FILE" >"$same_port_candidate"

@@ -41,6 +41,19 @@ bandwidth_pref() {
   printf '%s' "$value"
 }
 
+tc_family_pref() {
+  local pref=$1 family=$2
+  [[ "$pref" =~ ^[0-9]+$ ]] || return 1
+  case "$family" in
+    ip) printf '%s' "$pref" ;;
+    ipv6)
+      (( pref < 65535 )) || return 1
+      printf '%s' "$((pref + 1))"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 tc_pref_is_free() {
   local pref=$1 interface
   while IFS= read -r interface; do
@@ -59,7 +72,7 @@ ensure_bandwidth_pref() {
     return 0
   fi
   for pref in $(seq 49100 49200); do
-    if tc_pref_is_free "$pref"; then
+    if tc_pref_is_free "$pref" && tc_pref_is_free "$((pref + 1))"; then
       if ! (manager_state_set_json tc_pref "$pref"); then
         error '无法保存 tc 管理优先级。'
         return 1
@@ -84,11 +97,13 @@ ensure_clsact() {
 }
 
 delete_manager_tc_filters() {
-  local pref=$1 interface
+  local pref=$1 interface family_pref
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    tc filter del dev "$interface" ingress pref "$pref" 2>/dev/null || true
-    tc filter del dev "$interface" egress pref "$pref" 2>/dev/null || true
+    for family_pref in "$pref" "$(tc_family_pref "$pref" ipv6)"; do
+      tc filter del dev "$interface" ingress pref "$family_pref" 2>/dev/null || true
+      tc filter del dev "$interface" egress pref "$family_pref" 2>/dev/null || true
+    done
   done < <(bandwidth_known_interfaces)
 }
 
@@ -129,7 +144,7 @@ bandwidth_apply_nodes() {
 
   local pref
   pref=$(ensure_bandwidth_pref) || return 1
-  local interface node port upload_limit download_limit protocol family
+  local interface node port upload_limit download_limit protocol family family_pref
   delete_manager_tc_filters "$pref"
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
@@ -143,12 +158,13 @@ bandwidth_apply_nodes() {
       upload_limit=$(jq -r '.upload_limit_mbps // 0' <<<"$node")
       download_limit=$(jq -r '.download_limit_mbps // 0' <<<"$node")
       for family in ip ipv6; do
+        family_pref=$(tc_family_pref "$pref" "$family") || return 1
         for protocol in tcp udp; do
-          if ! tc_add_flower_rule "$interface" ingress "$family" "$protocol" "$port" "$upload_limit" "$pref"; then
+          if ! tc_add_flower_rule "$interface" ingress "$family" "$protocol" "$port" "$upload_limit" "$family_pref"; then
             error "tc 规则创建失败：接口 $interface，ingress，$family/$protocol，端口 $port"
             return 1
           fi
-          if ! tc_add_flower_rule "$interface" egress "$family" "$protocol" "$port" "$download_limit" "$pref"; then
+          if ! tc_add_flower_rule "$interface" egress "$family" "$protocol" "$port" "$download_limit" "$family_pref"; then
             error "tc 规则创建失败：接口 $interface，egress，$family/$protocol，端口 $port"
             return 1
           fi
@@ -204,8 +220,13 @@ tc_rule_json_matches() {
 
 bandwidth_check_nodes() {
   local nodes_source=$1 pref interface node port upload_limit download_limit
-  local ingress_json egress_json family protocol expected_action rules_json direction limit
+  local ingress_json egress_json family family_pref protocol expected_action rules_json direction limit
   pref=$(bandwidth_pref)
+  local ipv6_pref
+  ipv6_pref=$(tc_family_pref "$pref" ipv6) || {
+    error "无法为 IPv6 规则计算 tc 优先级：$pref"
+    return 1
+  }
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
     if ! ingress_json=$(tc -j filter show dev "$interface" ingress pref "$pref" 2>/dev/null); then
@@ -216,8 +237,19 @@ bandwidth_check_nodes() {
       error "无法读取 tc egress 规则：接口 $interface"
       return 1
     fi
+    local ingress_ipv6_json egress_ipv6_json
+    if ! ingress_ipv6_json=$(tc -j filter show dev "$interface" ingress pref "$ipv6_pref" 2>/dev/null); then
+      error "无法读取 tc IPv6 ingress 规则：接口 $interface"
+      return 1
+    fi
+    if ! egress_ipv6_json=$(tc -j filter show dev "$interface" egress pref "$ipv6_pref" 2>/dev/null); then
+      error "无法读取 tc IPv6 egress 规则：接口 $interface"
+      return 1
+    fi
     if ! jq -e 'type == "array"' >/dev/null <<<"$ingress_json" \
-      || ! jq -e 'type == "array"' >/dev/null <<<"$egress_json"; then
+      || ! jq -e 'type == "array"' >/dev/null <<<"$egress_json" \
+      || ! jq -e 'type == "array"' >/dev/null <<<"$ingress_ipv6_json" \
+      || ! jq -e 'type == "array"' >/dev/null <<<"$egress_ipv6_json"; then
       error "tc 返回了无效 JSON：接口 $interface"
       return 1
     fi
@@ -227,18 +259,20 @@ bandwidth_check_nodes() {
       upload_limit=$(jq -r '.upload_limit_mbps // 0' <<<"$node")
       download_limit=$(jq -r '.download_limit_mbps // 0' <<<"$node")
       for direction in ingress egress; do
-        if [[ "$direction" == ingress ]]; then
-          rules_json=$ingress_json
-          limit=$upload_limit
-        else
-          rules_json=$egress_json
-          limit=$download_limit
-        fi
+        if [[ "$direction" == ingress ]]; then limit=$upload_limit; else limit=$download_limit; fi
         expected_action=gact
         if [[ "$limit" != 0 && "$limit" != 0.0 ]]; then expected_action=police; fi
         for family in ip ipv6; do
+          family_pref=$(tc_family_pref "$pref" "$family") || return 1
+          if [[ "$direction" == ingress ]]; then
+            rules_json=$ingress_json
+            [[ "$family" == ipv6 ]] && rules_json=$ingress_ipv6_json
+          else
+            rules_json=$egress_json
+            [[ "$family" == ipv6 ]] && rules_json=$egress_ipv6_json
+          fi
           for protocol in tcp udp; do
-            if ! tc_rule_json_matches "$rules_json" "$pref" "$family" "$protocol" "$direction" "$port" "$expected_action"; then
+            if ! tc_rule_json_matches "$rules_json" "$family_pref" "$family" "$protocol" "$direction" "$port" "$expected_action"; then
               error "tc 规则缺失或重复：接口 $interface，$direction，$family/$protocol，端口 $port，动作 $expected_action"
               return 1
             fi
@@ -257,14 +291,19 @@ bandwidth_apply_and_check() {
 }
 
 bandwidth_status() {
-  local pref interface
+  local pref interface ipv6_pref
   pref=$(bandwidth_pref)
-  printf 'tc 管理优先级：%s\n' "$pref"
+  ipv6_pref=$(tc_family_pref "$pref" ipv6 2>/dev/null || printf '%s' "$pref")
+  printf 'tc 管理优先级：IPv4 %s，IPv6 %s\n' "$pref" "$ipv6_pref"
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
     printf '\n接口：%s\n' "$interface"
     tc -s filter show dev "$interface" ingress pref "$pref" 2>/dev/null || true
     tc -s filter show dev "$interface" egress pref "$pref" 2>/dev/null || true
+    if [[ "$ipv6_pref" != "$pref" ]]; then
+      tc -s filter show dev "$interface" ingress pref "$ipv6_pref" 2>/dev/null || true
+      tc -s filter show dev "$interface" egress pref "$ipv6_pref" 2>/dev/null || true
+    fi
   done < <(traffic_interfaces)
 }
 

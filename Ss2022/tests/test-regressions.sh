@@ -70,6 +70,12 @@ assert_equal 1100 "$download" 'traffic parser must use the source port for clien
 
 assert_true 'IPv4 TCP gact rule must be detected' tc_rule_json_matches "$tc_json" 49123 ip tcp ingress 20001 gact
 assert_true 'IPv6 TCP police rule must accept numeric ip_proto' tc_rule_json_matches "$tc_json" 49123 ipv6 tcp ingress 20001 police
+scoped_tc_json=$(jq -nc '[
+  {kind:"flower",options:{keys:{ip_proto:"tcp",dst_port:20001},actions:[{kind:"gact",stats:{bytes:100}}]}},
+  {kind:"flower",options:{keys:{ip_proto:"udp",dst_port:20001},actions:[{kind:"gact",stats:{bytes:200}}]}}
+]')
+assert_true 'a protocol/pref-scoped iproute2 6.1 response may omit both top-level fields' tc_rule_json_matches "$scoped_tc_json" 49123 ip tcp ingress 20001 gact
+assert_equal 1 "$(tc_rule_json_match_count "$scoped_tc_json" 49123 ip tcp ingress 20001 gact)" 'scoped tc validation must report the actual match count'
 if tc_rule_json_matches "$tc_json" 49123 ip udp ingress 20001 police; then
   printf 'assertion failed: action mismatch should be rejected\n' >&2
   exit 1

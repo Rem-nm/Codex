@@ -206,7 +206,7 @@ bandwidth_apply_nodes() {
   return 0
 }
 
-tc_rule_json_matches() {
+tc_rule_json_match_count() {
   local rules_json=$1 pref=$2 family=$3 protocol=$4 direction=$5 port=$6 expected_action=$7
   local port_field protocol_number
   case "$direction" in
@@ -219,7 +219,7 @@ tc_rule_json_matches() {
     udp) protocol_number=17 ;;
     *) return 1 ;;
   esac
-  jq -e \
+  jq -r \
     --argjson pref "$pref" \
     --arg family "$family" \
     --arg protocol "$protocol" \
@@ -228,21 +228,30 @@ tc_rule_json_matches() {
     --argjson port "$port" \
     --arg expected_action "$expected_action" '
       [ .[]
-        | select((((.pref // 0) | tonumber?) // -1) == $pref)
-        | select(((.protocol // "") | tostring | ascii_downcase) == $family)
+        # When `tc filter show` is already scoped by protocol and preference,
+        # iproute2 6.1 omits those matching top-level fields from its JSON.
+        # Validate them when present, but trust the scoped query when absent.
+        | select(if has("pref") then (((.pref | tonumber?) // -1) == $pref) else true end)
+        | select(if has("protocol") then ((.protocol | tostring | ascii_downcase) == $family) else true end)
         | (.options // {}) as $options
         | ($options.keys // $options) as $keys
         | (($keys.ip_proto // "") | tostring | ascii_downcase) as $actual_protocol
         | select($actual_protocol == $protocol or $actual_protocol == $protocol_number)
         | select(((($keys[$port_field] // 0) | tonumber?) // -1) == $port)
         | select(any(($options.actions // [])[]; ((.kind // "") | tostring | ascii_downcase) == $expected_action))
-      ] | length == 1
-    ' <<<"$rules_json" >/dev/null
+      ] | length
+    ' <<<"$rules_json"
+}
+
+tc_rule_json_matches() {
+  local match_count
+  match_count=$(tc_rule_json_match_count "$@") || return 1
+  [[ "$match_count" == 1 ]]
 }
 
 bandwidth_check_nodes() {
   local nodes_source=$1 pref interface node port upload_limit download_limit
-  local ingress_json egress_json family family_pref protocol expected_action rules_json direction limit
+  local ingress_json egress_json family family_pref protocol expected_action rules_json direction limit match_count
   pref=$(bandwidth_pref)
   local ipv6_pref
   ipv6_pref=$(tc_family_pref "$pref" ipv6) || {
@@ -294,8 +303,12 @@ bandwidth_check_nodes() {
             [[ "$family" == ipv6 ]] && rules_json=$egress_ipv6_json
           fi
           for protocol in tcp udp; do
-            if ! tc_rule_json_matches "$rules_json" "$family_pref" "$family" "$protocol" "$direction" "$port" "$expected_action"; then
-              error "tc 规则缺失或重复：接口 $interface，$direction，$family/$protocol，端口 $port，动作 $expected_action"
+            if ! match_count=$(tc_rule_json_match_count "$rules_json" "$family_pref" "$family" "$protocol" "$direction" "$port" "$expected_action"); then
+              error "无法解析 tc 规则 JSON：接口 $interface，$direction，$family/$protocol，端口 $port"
+              return 1
+            fi
+            if [[ "$match_count" != 1 ]]; then
+              error "tc 规则缺失或重复：接口 $interface，$direction，$family/$protocol，端口 $port，动作 $expected_action，匹配数 $match_count"
               return 1
             fi
           done

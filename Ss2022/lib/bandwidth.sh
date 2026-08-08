@@ -65,9 +65,18 @@ tc_pref_is_free() {
 }
 
 ensure_bandwidth_pref() {
-  local existing pref
+  local existing pref expected_ipv6 remembered_ipv6
   existing=$(manager_state_get tc_pref '')
   if [[ "$existing" =~ ^[0-9]+$ ]] && (( existing >= 100 && existing <= 65500 )); then
+    expected_ipv6=$(tc_family_pref "$existing" ipv6) || {
+      error "已有 tc 管理优先级无法分配 IPv6 优先级：$existing"
+      return 1
+    }
+    remembered_ipv6=$(manager_state_get tc_ipv6_pref '')
+    if [[ "$remembered_ipv6" != "$expected_ipv6" ]] && ! tc_pref_is_free "$expected_ipv6"; then
+      error "tc 优先级 $expected_ipv6 已被其他规则占用，无法安全添加 IPv6 流控规则。"
+      return 1
+    fi
     printf '%s' "$existing"
     return 0
   fi
@@ -144,7 +153,16 @@ bandwidth_apply_nodes() {
 
   local pref
   pref=$(ensure_bandwidth_pref) || return 1
-  local interface node port upload_limit download_limit protocol family family_pref
+  local family_pref
+  family_pref=$(tc_family_pref "$pref" ipv6) || {
+    error "无法为 IPv6 规则计算 tc 优先级：$pref"
+    return 1
+  }
+  if ! (manager_state_set_json tc_ipv6_pref "$family_pref"); then
+    error '无法保存 IPv6 tc 管理优先级。'
+    return 1
+  fi
+  local interface node port upload_limit download_limit protocol family
   delete_manager_tc_filters "$pref"
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue

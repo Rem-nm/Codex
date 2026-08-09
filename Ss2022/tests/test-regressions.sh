@@ -15,6 +15,13 @@ source "$ROOT/lib/nodes.sh"
 source "$ROOT/lib/links.sh"
 # shellcheck disable=SC1091
 source "$ROOT/lib/backup.sh"
+# shellcheck disable=SC1091
+source "$ROOT/lib/update.sh"
+
+# MSYS test runners on Windows cannot always chmod an existing temporary
+# directory. Production code still uses ensure_dir's strict install modes;
+# these unit tests only need isolated directory creation.
+ensure_dir() { mkdir -p -- "$1"; }
 
 assert_equal() {
   local expected=$1 actual=$2 message=$3
@@ -86,17 +93,46 @@ if tc_rule_json_matches "$duplicate_rule_json" 49123 ip tcp ingress 20001 gact; 
   exit 1
 fi
 
-captured_tc=''
-tc() { captured_tc=$(printf '%q ' "$@"); }
-tc_add_flower_rule eth0 ingress ip tcp 20001 0 49123
-[[ "$captured_tc" == *'action gact pass'* ]] || { printf 'assertion failed: unlimited rule lacks gact pass\n' >&2; exit 1; }
-tc_add_flower_rule eth0 egress ipv6 udp 20001 20 49123
-[[ "$captured_tc" == *'action police rate 20mbit'* && "$captured_tc" == *'conform-exceed drop/pass'* ]] || {
-  printf 'assertion failed: limited rule lacks police drop/pass\n' >&2
+captured_tc=$(
+  tc() { printf '%q ' "$@"; }
+  tc_add_flower_rule eth0 ingress ip tcp 20001 49123 gact 1000000001
+)
+[[ "$captured_tc" == *'pref 49123 protocol ip flower ip_proto tcp dst_port 20001 action gact index 1000000001'* ]] || {
+  printf 'assertion failed: flower rule must bind the owned shared action by index\n' >&2
+  exit 1
+}
+captured_tc=$(
+  tc_action_lookup() { return 1; }
+  tc() { printf '%q ' "$@"; }
+  tc_create_shared_action gact 1000000001 0123456789abcdef0123456789abcdef 0
+)
+[[ "$captured_tc" == *'actions add action gact pass index 1000000001 cookie 0123456789abcdef0123456789abcdef'* ]] || {
+  printf 'assertion failed: unlimited aggregate action lacks identity/cookie\n' >&2
+  exit 1
+}
+captured_tc=$(
+  tc_action_lookup() { return 1; }
+  tc() { printf '%q ' "$@"; }
+  tc_create_shared_action police 1000000002 fedcba9876543210fedcba9876543210 20
+)
+[[ "$captured_tc" == *'actions add action police rate 20mbit burst 64kb mtu 64kb conform-exceed drop/pass index 1000000002 cookie fedcba9876543210fedcba9876543210'* ]] || {
+  printf 'assertion failed: limited aggregate action lacks police drop/pass or ownership cookie\n' >&2
   exit 1
 }
 assert_equal 49123 "$(tc_family_pref 49123 ip)" 'IPv4 tc rules must retain the base priority'
 assert_equal 49124 "$(tc_family_pref 49123 ipv6)" 'IPv6 tc rules must use a distinct priority'
+
+action_json=$(jq -nc '[{actions:[{kind:"gact",index:1000000001,cookie:"0123456789abcdef0123456789abcdef",bind:4,stats:{bytes:12345}}]}]')
+assert_equal 12345 "$(tc_action_counter_from_json "$action_json" gact 1000000001 0123456789abcdef0123456789abcdef)" 'traffic must read one owned aggregate action counter'
+if tc_action_counter_from_json "$action_json" gact 1000000001 fedcba9876543210fedcba9876543210 >/dev/null 2>&1; then
+  printf 'assertion failed: an action with the wrong ownership cookie must be rejected\n' >&2
+  exit 1
+fi
+identity_ingress=$(bandwidth_action_identity 0123456789abcdef0123456789abcdef ingress)
+identity_ingress_again=$(bandwidth_action_identity 0123456789abcdef0123456789abcdef ingress)
+identity_egress=$(bandwidth_action_identity 0123456789abcdef0123456789abcdef egress)
+assert_equal "$identity_ingress" "$identity_ingress_again" 'tc action identity must be stable across rule rebuilds'
+[[ "$identity_ingress" != "$identity_egress" ]] || { printf 'assertion failed: upload and download actions need distinct identities\n' >&2; exit 1; }
 
 split_tc_json=$(jq -nc '[
   {protocol:"ip",pref:49123,kind:"flower",options:{keys:{dst_port:20001},actions:[{kind:"gact",stats:{bytes:100}}]}},
@@ -104,17 +140,10 @@ split_tc_json=$(jq -nc '[
 ]')
 tc() { printf '%s' "$split_tc_json"; }
 assert_equal 400 "$(tc_counter_json eth0 ingress 20001 49123)" 'traffic sampling must merge IPv4 and IPv6 tc priorities'
-tc_delete_log=''
-bandwidth_known_interfaces() { printf 'eth0\n'; }
-tc() {
-  tc_delete_log+="$(printf '%q ' "$@")"
-  tc_delete_log+=$'\n'
-}
-delete_manager_tc_filters 49123
-[[ "$tc_delete_log" == *'protocol ip pref 49123'* && "$tc_delete_log" == *'protocol ipv6 pref 49124'* ]] || {
-  printf 'assertion failed: tc cleanup must delete each protocol priority explicitly\n' >&2
+if (tc() { return 1; }; tc_counter_json eth0 ingress 20001 49123 >/dev/null 2>&1); then
+  printf 'assertion failed: a failed tc query must not be converted into a zero counter\n' >&2
   exit 1
-}
+fi
 
 grep -q 'installed_node_count=' "$ROOT/install.sh"
 if grep -q '\$(node_count)' "$ROOT/install.sh"; then
@@ -140,6 +169,63 @@ done
 
 test_tmp=$(mktemp -d)
 trap 'rm -rf -- "$test_tmp"' EXIT
+
+owned_plan="$test_tmp/bandwidth-plan.json"
+owned_delete_log="$test_tmp/owned-delete.log"
+jq -n '{schema_version:2,pref:49123,boot_id:"test",interfaces:["eth0"],actions:[{node_id:"0123456789abcdef0123456789abcdef",direction:"ingress",port:20001,kind:"gact",index:1000000001,cookie:"0123456789abcdef0123456789abcdef",limit_mbps:0}]}' >"$owned_plan"
+(
+  tc_action_lookup() {
+    jq -nc '{kind:"gact",index:1000000001,cookie:"0123456789abcdef0123456789abcdef",bind:4,stats:{bytes:0}}'
+  }
+  tc_filter_scoped_json() {
+    local _interface=$1 direction=$2 family=$3 _pref=$4
+    : "$_interface" "$_pref"
+    if [[ "$direction" != ingress ]]; then printf '[]'; return 0; fi
+    if [[ "$family" == ip ]]; then
+      jq -nc '[
+        {handle:"0x1",options:{keys:{ip_proto:"tcp",dst_port:20001},actions:[{kind:"gact",index:1000000001}]}},
+        {handle:"0x2",options:{keys:{ip_proto:"udp",dst_port:20001},actions:[{kind:"gact",index:1000000001}]}},
+        {handle:"0xff",options:{keys:{ip_proto:"tcp",dst_port:29999},actions:[{kind:"mirred",index:99}]}}
+      ]'
+    else
+      jq -nc '[
+        {handle:"0x3",options:{keys:{ip_proto:6,dst_port:20001},actions:[{kind:"gact",index:1000000001}]}},
+        {handle:"0x4",options:{keys:{ip_proto:17,dst_port:20001},actions:[{kind:"gact",index:1000000001}]}}
+      ]'
+    fi
+  }
+  tc_delete_owned_action() { printf 'owned-action %s %s %s\n' "$1" "$2" "$3" >>"$owned_delete_log"; }
+  tc() { printf '%q ' "$@" >>"$owned_delete_log"; printf '\n' >>"$owned_delete_log"; }
+  bandwidth_remove_plan "$owned_plan"
+)
+assert_equal 4 "$(grep -c '^filter del ' "$owned_delete_log")" 'owned cleanup must delete exactly the four manager filters'
+if grep '^filter del ' "$owned_delete_log" | grep -vq ' handle '; then
+  printf 'assertion failed: owned cleanup must address every filter by exact handle\n' >&2
+  exit 1
+fi
+if grep -q '0xff' "$owned_delete_log"; then
+  printf 'assertion failed: a foreign filter sharing the manager priority was deleted\n' >&2
+  exit 1
+fi
+grep -q '^owned-action gact 1000000001 0123456789abcdef0123456789abcdef$' "$owned_delete_log"
+if (
+  tc_action_lookup() { jq -nc '{kind:"gact",index:1000000001,cookie:"ffffffffffffffffffffffffffffffff",bind:4}'; }
+  bandwidth_remove_plan "$owned_plan" >/dev/null 2>&1
+); then
+  printf 'assertion failed: cleanup must stop when the action cookie does not prove ownership\n' >&2
+  exit 1
+fi
+corrupt_plan="$test_tmp/corrupt-bandwidth-plan.json"
+printf '%s\n' '{"schema_version":2,"actions":' >"$corrupt_plan"
+if (
+  bandwidth_plan_path() { printf '%s' "$corrupt_plan"; }
+  delete_manager_tc_filters 49123 "$test_tmp/unused-nodes.json" >/dev/null 2>&1
+); then
+  printf 'assertion failed: a corrupt tc ownership plan must stop cleanup\n' >&2
+  exit 1
+fi
+[[ -f "$corrupt_plan" ]] || { printf 'assertion failed: corrupt ownership evidence must be preserved for recovery\n' >&2; exit 1; }
+
 NODES_FILE="$test_tmp/live-nodes.json"
 live_node=$(jq -nc '{node_id:"0123456789abcdef0123456789abcdef",name:"Tokyo",method:"2022-blake3-aes-256-gcm",password:"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",port:20001,address:"192.0.2.1",address_type:"ipv4",status:"enabled",status_reason:"",quota_bytes:0,reset_day:1,upload_limit_mbps:0,download_limit_mbps:0,created_at:"2026-01-01T00:00:00Z",updated_at:"2026-01-01T00:00:00Z",last_reset_at:"2026-01-01T00:00:00Z",next_reset_at:"2026-02-01T00:00:00Z"}')
 jq -n --argjson node "$live_node" '{schema_version:1,nodes:[$node]}' >"$NODES_FILE"
@@ -167,6 +253,12 @@ if (validate_candidate_nodes "$changed_port_candidate" >/dev/null 2>&1); then
   printf 'assertion failed: changing to an occupied port should be rejected\n' >&2
   exit 1
 fi
+wrong_address_type_candidate="$test_tmp/wrong-address-type.json"
+jq '.nodes[0].address_type="ipv6"' "$same_port_candidate" >"$wrong_address_type_candidate"
+if (validate_candidate_nodes "$wrong_address_type_candidate" >/dev/null 2>&1); then
+  printf 'assertion failed: candidate address_type must match the actual address value\n' >&2
+  exit 1
+fi
 
 disabled_candidate="$test_tmp/disabled.json"
 enabling_candidate="$test_tmp/enabling.json"
@@ -179,6 +271,67 @@ if (validate_candidate_nodes "$enabling_candidate" >/dev/null 2>&1); then
   exit 1
 fi
 install -m 600 -- "$same_port_candidate" "$NODES_FILE"
+
+traffic_case="$test_tmp/traffic-atomic"
+mkdir -p -- "$traffic_case/runtime"
+install -m 600 -- "$NODES_FILE" "$traffic_case/nodes.json"
+jq -n '{schema_version:1,nodes:{"0123456789abcdef0123456789abcdef":{current_upload_bytes:10,current_download_bytes:20,total_upload_bytes:100,total_download_bytes:200,upload_kernel_bytes:100,download_kernel_bytes:200}}}' >"$traffic_case/traffic.json"
+install -m 600 -- "$traffic_case/traffic.json" "$traffic_case/traffic.before.json"
+(
+  RUNTIME_DIR="$traffic_case/runtime"
+  NODES_FILE="$traffic_case/nodes.json"
+  TRAFFIC_FILE="$traffic_case/traffic.json"
+  COUNTERS_FILE="$traffic_case/legacy-counters.json"
+  traffic_interfaces() { printf 'eth0\n'; }
+  traffic_ensure_tc_rules_no_lock() { return 0; }
+  tc_node_counter() {
+    if [[ "$3" == ingress ]]; then printf '150'; else return 1; fi
+  }
+  if traffic_collect_no_lock >/dev/null 2>&1; then
+    printf 'assertion failed: traffic collection must fail if either tc action counter cannot be read\n' >&2
+    exit 1
+  fi
+  cmp -s -- "$TRAFFIC_FILE" "$traffic_case/traffic.before.json" || {
+    printf 'assertion failed: a partial traffic sample changed the persisted totals/baselines\n' >&2
+    exit 1
+  }
+)
+printf '%s\n' '{"schema_version":1,"nodes":{}}' >"$traffic_case/legacy-counters.json"
+(
+  RUNTIME_DIR="$traffic_case/runtime"
+  NODES_FILE="$traffic_case/nodes.json"
+  TRAFFIC_FILE="$traffic_case/traffic.json"
+  COUNTERS_FILE="$traffic_case/legacy-counters.json"
+  traffic_interfaces() { printf 'eth0\n'; }
+  traffic_ensure_tc_rules_no_lock() { return 0; }
+  tc_node_counter() { if [[ "$3" == ingress ]]; then printf '150'; else printf '260'; fi; }
+  traffic_collect_no_lock
+  assert_equal 60 "$(jq -r '.nodes["0123456789abcdef0123456789abcdef"].current_upload_bytes' "$TRAFFIC_FILE")" 'upload delta and baseline must commit together'
+  assert_equal 80 "$(jq -r '.nodes["0123456789abcdef0123456789abcdef"].current_download_bytes' "$TRAFFIC_FILE")" 'download delta and baseline must commit together'
+  assert_equal 150 "$(jq -r '.nodes["0123456789abcdef0123456789abcdef"].upload_kernel_bytes' "$TRAFFIC_FILE")" 'new upload baseline must share traffic.json atomic commit'
+  assert_equal 260 "$(jq -r '.nodes["0123456789abcdef0123456789abcdef"].download_kernel_bytes' "$TRAFFIC_FILE")" 'new download baseline must share traffic.json atomic commit'
+  [[ ! -e "$COUNTERS_FILE" ]] || { printf 'assertion failed: successful migration must remove legacy tc-counters.json\n' >&2; exit 1; }
+)
+baseline_live="$traffic_case/baseline-live.json"
+baseline_candidate="$traffic_case/baseline-candidate.json"
+install -m 600 -- "$traffic_case/traffic.json" "$baseline_live"
+install -m 600 -- "$traffic_case/traffic.json" "$baseline_candidate"
+RUNTIME_DIR="$traffic_case/runtime" traffic_reset_kernel_baselines "$NODES_FILE" "$baseline_candidate"
+assert_equal 150 "$(jq -r '.nodes["0123456789abcdef0123456789abcdef"].upload_kernel_bytes' "$baseline_live")" 'resetting a transaction candidate must not mutate the live/backup source'
+assert_equal 0 "$(jq -r '.nodes["0123456789abcdef0123456789abcdef"].upload_kernel_bytes' "$baseline_candidate")" 'transaction candidate baselines must reset before commit'
+
+(
+  RUNTIME_DIR="$traffic_case/runtime"
+  NODES_FILE="$traffic_case/nodes.json"
+  TRAFFIC_FILE="$traffic_case/traffic.json"
+  COUNTERS_FILE="$traffic_case/legacy-counters.json"
+  traffic_interfaces() { return 0; }
+  traffic_ensure_tc_rules_no_lock() { printf 'unexpected rebuild\n' >&2; return 1; }
+  before=$(sha256sum -- "$TRAFFIC_FILE" | awk '{print $1}')
+  traffic_collect_no_lock >/dev/null 2>&1
+  after=$(sha256sum -- "$TRAFFIC_FILE" | awk '{print $1}')
+  assert_equal "$before" "$after" 'sampling without a default interface must leave traffic data untouched'
+)
 
 tc_rebuild_log="$test_tmp/tc-rebuild.log"
 bandwidth_plan_matches_current_boot() { return 0; }
@@ -206,9 +359,68 @@ if (transaction_runtime_health_check "$NODES_FILE" 0 >/dev/null 2>&1); then
   exit 1
 fi
 
+state_guard="$test_tmp/state-guard"
+mkdir -p -- "$state_guard/backups"
+printf '%s\n' '{"schema_version":1}' >"$state_guard/manager.json"
+printf '%s\n' '{"schema_version":1,"nodes":[]}' >"$state_guard/nodes.json"
+printf '%s\n' '{"schema_version":1,"nodes":{}}' >"$state_guard/traffic.json"
+if (
+  MANAGER_STATE="$state_guard/manager.json"
+  NODES_FILE="$state_guard/nodes.json"
+  TRAFFIC_FILE="$state_guard/traffic.json"
+  HISTORY_FILE="$state_guard/missing-history.json"
+  BACKUP_DIR="$state_guard/backups"
+  validate_installed_state_files >/dev/null 2>&1
+); then
+  printf 'assertion failed: repair must stop instead of recreating a missing authoritative state file\n' >&2
+  exit 1
+fi
+printf '%s\n' '{"schema_version":1,"cycles":[]}' >"$state_guard/bad-history.json"
+if (
+  MANAGER_STATE="$state_guard/manager.json"
+  NODES_FILE="$state_guard/nodes.json"
+  TRAFFIC_FILE="$state_guard/traffic.json"
+  HISTORY_FILE="$state_guard/bad-history.json"
+  BACKUP_DIR="$state_guard/backups"
+  validate_installed_state_files >/dev/null 2>&1
+); then
+  printf 'assertion failed: repair must reject structurally invalid authoritative state\n' >&2
+  exit 1
+fi
+
+service_case="$test_tmp/service-backup"
+mkdir -p -- "$service_case/definitions"
+printf 'old unit\n' >"$service_case/definitions/one"
+(
+  manager_update_service_names() { printf 'one\ntwo\n'; }
+  service_definition_path() { printf '%s/definitions/%s' "$service_case" "$1"; }
+  service_manager_reload() { :; }
+  manager_update_backup_service_files "$service_case/snapshot"
+  printf 'new unit\n' >"$service_case/definitions/one"
+  printf 'unexpected unit\n' >"$service_case/definitions/two"
+  manager_update_restore_service_files "$service_case/snapshot"
+)
+assert_equal 'old unit' "$(cat "$service_case/definitions/one")" 'manager rollback must restore the previous service definition'
+[[ ! -e "$service_case/definitions/two" ]] || { printf 'assertion failed: manager rollback must remove a service definition that was previously absent\n' >&2; exit 1; }
+
 grep -q 'run_menu_action node_add_flow' "$ROOT/lib/menu.sh"
 grep -q 'MENU_ACTION_STATUS' "$ROOT/ss-manager.sh"
 grep -q 'generate_singbox_config "$NODES_FILE" "$candidate"' "$ROOT/install.sh"
 grep -q 'backup_create_manual_flow' "$ROOT/lib/backup.sh"
+grep -q 'validate_installed_state_files' "$ROOT/install.sh"
+grep -q 'release_manager_lock' "$ROOT/install.sh"
+if grep -q 'load_json_or_default "$COUNTERS_FILE"' "$ROOT/lib/common.sh"; then
+  printf 'assertion failed: new installations must not recreate the legacy two-file traffic baseline\n' >&2
+  exit 1
+fi
+awk '/backup_create_snapshot "sing-box-update-\$target"/{getline; if ($0 !~ /backup_prune/) exit 1; found=1} END {exit !found}' "$ROOT/lib/update.sh"
+grep -q 'manager_update_finalize_switched_program' "$ROOT/lib/update.sh"
+grep -q 'manager_update_restore_service_files' "$ROOT/lib/update.sh"
+grep -q 'exit 75' "$ROOT/lib/update.sh"
+grep -q 'status == 75' "$ROOT/lib/menu.sh"
+grep -q 'exec "$PROGRAM_DIR/ss-manager.sh" menu' "$ROOT/lib/menu.sh"
+restore_line=$(grep -n 'restore_kernel_settings_on_uninstall' "$ROOT/lib/menu.sh" | tail -n 1 | cut -d: -f1)
+mode_two_line=$(grep -n 'if \[\[ "$mode" == 2 \]\]' "$ROOT/lib/menu.sh" | tail -n 1 | cut -d: -f1)
+(( restore_line < mode_two_line )) || { printf 'assertion failed: uninstall mode 2 deletes manager state before restoring kernel settings\n' >&2; exit 1; }
 
 printf 'regression tests passed\n'

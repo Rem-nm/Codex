@@ -24,7 +24,7 @@ traffic_new_entry() {
   now=$(timestamp_iso)
   next=$(calculate_next_reset_at "$now" "$reset_day")
   jq -n --arg now "$now" --arg next "$next" --argjson quota "$quota" --argjson reset_day "$reset_day" \
-    '{current_upload_bytes:0,current_download_bytes:0,total_upload_bytes:0,total_download_bytes:0,quota_bytes:$quota,reset_day:$reset_day,last_reset_at:$now,next_reset_at:$next,updated_at:$now}'
+    '{current_upload_bytes:0,current_download_bytes:0,total_upload_bytes:0,total_download_bytes:0,upload_kernel_bytes:0,download_kernel_bytes:0,quota_bytes:$quota,reset_day:$reset_day,last_reset_at:$now,next_reset_at:$next,updated_at:$now}'
 }
 
 traffic_candidate_add_node() {
@@ -93,32 +93,60 @@ tc_counter_json() {
   local interface=$1 direction=$2 port=$3 pref=$4
   local output family_pref value total=0
   if [[ "$direction" == ingress ]]; then
-    output=$(tc -s -j filter show dev "$interface" ingress 2>/dev/null || true)
+    output=$(tc -s -j filter show dev "$interface" ingress 2>/dev/null) || return 1
   else
-    output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null || true)
+    output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null) || return 1
   fi
-  [[ -n "$output" ]] || { printf '0'; return 0; }
-  for family_pref in "$pref" "$(tc_family_pref "$pref" ipv6 2>/dev/null || printf '%s' "$pref")"; do
-    value=$(tc_counter_from_json "$output" "$family_pref" "$direction" "$port" 2>/dev/null || printf '0')
-    [[ "$value" =~ ^[0-9]+$ ]] || value=0
+  [[ -n "$output" ]] || return 1
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$output" || return 1
+  local ipv6_pref
+  ipv6_pref=$(tc_family_pref "$pref" ipv6) || return 1
+  for family_pref in "$pref" "$ipv6_pref"; do
+    value=$(tc_counter_from_json "$output" "$family_pref" "$direction" "$port" 2>/dev/null) || return 1
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
     total=$((total + value))
   done
   printf '%s' "$total"
 }
 
+tc_action_counter_from_json() {
+  local output=$1 kind=$2 index=$3 cookie=$4
+  [[ "$kind" == gact || "$kind" == police ]] || return 1
+  [[ "$index" =~ ^[0-9]+$ ]] || return 1
+  [[ "$cookie" =~ ^[A-Fa-f0-9]{32}$ ]] || return 1
+  jq -er --arg kind "$kind" --argjson index "$index" --arg cookie "${cookie,,}" '
+    def norm_cookie:
+      tostring | ascii_downcase | sub("^0x"; "") | gsub("[:-]"; "");
+    [ .. | objects
+      | select((.kind? // "") == $kind)
+      | select((((.index? // -1) | tonumber?) // -1) == $index)
+      | select(((.cookie? // "") | norm_cookie) == $cookie)
+    ] as $matches
+    | if ($matches | length) != 1 then error("owned tc action missing or duplicated")
+      else (($matches[0].stats.bytes | tonumber?) // error("tc action bytes missing"))
+      end
+  ' <<<"$output"
+}
+
+tc_action_counter_json() {
+  local kind=$1 index=$2 cookie=$3 output
+  output=$(tc -s -j actions get action "$kind" index "$index" 2>/dev/null) || return 1
+  [[ -n "$output" ]] || return 1
+  jq -e . >/dev/null 2>&1 <<<"$output" || return 1
+  tc_action_counter_from_json "$output" "$kind" "$index" "$cookie"
+}
+
 tc_node_counter() {
-  local node_id=$1 port=$2 direction=$3
-  : "$node_id"
-  local interface value pref sum=0
-  pref=$(manager_state_get tc_pref '49100')
-  [[ "$pref" =~ ^[0-9]+$ ]] || pref=49100
-  while IFS= read -r interface; do
-    [[ -n "$interface" ]] || continue
-    value=$(tc_counter_json "$interface" "$direction" "$port" "$pref")
-    [[ "$value" =~ ^[0-9]+$ ]] || value=0
-    sum=$((sum + value))
-  done < <(traffic_interfaces)
-  printf '%s' "$sum"
+  local node_id=$1 port=$2 direction=$3 status=${4:-enabled}
+  [[ "$status" == enabled ]] || { printf '0'; return 0; }
+  local action kind index cookie action_port
+  action=$(bandwidth_plan_action "$node_id" "$direction") || return 1
+  kind=$(jq -er '.kind' <<<"$action") || return 1
+  index=$(jq -er '.index' <<<"$action") || return 1
+  cookie=$(jq -er '.cookie' <<<"$action") || return 1
+  action_port=$(jq -er '.port' <<<"$action") || return 1
+  [[ "$action_port" == "$port" ]] || return 1
+  tc_action_counter_json "$kind" "$index" "$cookie"
 }
 
 traffic_ensure_tc_rules_no_lock() {
@@ -151,50 +179,77 @@ traffic_ensure_tc_rules_no_lock() {
 
 traffic_collect_no_lock() {
   [[ -f "$TRAFFIC_FILE" ]] || return 0
+  local interface_count
+  interface_count=$(traffic_interfaces | awk 'NF {count++} END {print count+0}')
+  if (( interface_count == 0 )); then
+    warn '没有默认路由接口，本次流量采样未写入；接口恢复后会自动重建 tc 规则。'
+    return 0
+  fi
   traffic_ensure_tc_rules_no_lock || return 1
   local traffic_tmp="$RUNTIME_DIR/traffic.collect.$$.json"
-  local counters_tmp="$RUNTIME_DIR/counters.collect.$$.json"
   install -m 600 -- "$TRAFFIC_FILE" "$traffic_tmp"
-  install -m 600 -- "$COUNTERS_FILE" "$counters_tmp"
-  local node node_id port upload_now download_now upload_prev download_prev upload_delta download_delta
+  local node node_id port status upload_now download_now upload_prev download_prev upload_delta download_delta
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     node_id=$(jq -er '.node_id' <<<"$node")
     port=$(jq -er '.port' <<<"$node")
-    upload_now=$(tc_node_counter "$node_id" "$port" ingress)
-    download_now=$(tc_node_counter "$node_id" "$port" egress)
-    upload_prev=$(jq -r --arg id "$node_id" '.nodes[$id].upload_kernel_bytes // null' "$counters_tmp")
-    download_prev=$(jq -r --arg id "$node_id" '.nodes[$id].download_kernel_bytes // null' "$counters_tmp")
+    status=$(jq -er '.status' <<<"$node")
+    if ! upload_now=$(tc_node_counter "$node_id" "$port" ingress "$status"); then
+      error "读取节点 $node_id 上传 tc 计数失败；本次流量与基线均不写入。"
+      rm -f -- "$traffic_tmp" "$traffic_tmp.next"
+      return 1
+    fi
+    if ! download_now=$(tc_node_counter "$node_id" "$port" egress "$status"); then
+      error "读取节点 $node_id 下载 tc 计数失败；本次流量与基线均不写入。"
+      rm -f -- "$traffic_tmp" "$traffic_tmp.next"
+      return 1
+    fi
+    if [[ ! "$upload_now" =~ ^[0-9]+$ || ! "$download_now" =~ ^[0-9]+$ ]]; then
+      error "节点 $node_id 的 tc 计数不是非负整数；本次流量与基线均不写入。"
+      rm -f -- "$traffic_tmp" "$traffic_tmp.next"
+      return 1
+    fi
+    upload_prev=$(jq -r --arg id "$node_id" '.nodes[$id].upload_kernel_bytes // null' "$traffic_tmp")
+    download_prev=$(jq -r --arg id "$node_id" '.nodes[$id].download_kernel_bytes // null' "$traffic_tmp")
+    if [[ ! "$upload_prev" =~ ^[0-9]+$ && -f "$COUNTERS_FILE" ]]; then
+      upload_prev=$(jq -r --arg id "$node_id" '.nodes[$id].upload_kernel_bytes // null' "$COUNTERS_FILE" 2>/dev/null || printf 'null')
+    fi
+    if [[ ! "$download_prev" =~ ^[0-9]+$ && -f "$COUNTERS_FILE" ]]; then
+      download_prev=$(jq -r --arg id "$node_id" '.nodes[$id].download_kernel_bytes // null' "$COUNTERS_FILE" 2>/dev/null || printf 'null')
+    fi
     if [[ "$upload_prev" =~ ^[0-9]+$ && "$upload_now" -ge "$upload_prev" ]]; then upload_delta=$((upload_now - upload_prev)); else upload_delta=$upload_now; fi
     if [[ "$download_prev" =~ ^[0-9]+$ && "$download_now" -ge "$download_prev" ]]; then download_delta=$((download_now - download_prev)); else download_delta=$download_now; fi
-    if (( upload_delta > 0 || download_delta > 0 )); then
-      jq --arg id "$node_id" --argjson up "$upload_delta" --argjson down "$download_delta" \
-        '.nodes[$id].current_upload_bytes = ((.nodes[$id].current_upload_bytes // 0) + $up) | .nodes[$id].current_download_bytes = ((.nodes[$id].current_download_bytes // 0) + $down) | .nodes[$id].total_upload_bytes = ((.nodes[$id].total_upload_bytes // 0) + $up) | .nodes[$id].total_download_bytes = ((.nodes[$id].total_download_bytes // 0) + $down) | .nodes[$id].updated_at = (now | todateiso8601)' \
-        "$traffic_tmp" >"$traffic_tmp.next"
-      mv -f -- "$traffic_tmp.next" "$traffic_tmp"
-    fi
-    jq --arg id "$node_id" --argjson up "$upload_now" --argjson down "$download_now" \
-      '.nodes[$id] = ((.nodes[$id] // {}) + {upload_kernel_bytes:$up,download_kernel_bytes:$down,updated_at:(now|todateiso8601)})' \
-      "$counters_tmp" >"$counters_tmp.next"
-    mv -f -- "$counters_tmp.next" "$counters_tmp"
+    jq --arg id "$node_id" --argjson up_delta "$upload_delta" --argjson down_delta "$download_delta" --argjson up_now "$upload_now" --argjson down_now "$download_now" '
+      .nodes[$id] = ((.nodes[$id] // {})
+        | .current_upload_bytes = ((.current_upload_bytes // 0) + $up_delta)
+        | .current_download_bytes = ((.current_download_bytes // 0) + $down_delta)
+        | .total_upload_bytes = ((.total_upload_bytes // 0) + $up_delta)
+        | .total_download_bytes = ((.total_download_bytes // 0) + $down_delta)
+        | .upload_kernel_bytes = $up_now
+        | .download_kernel_bytes = $down_now
+        | .updated_at = (now | todateiso8601))
+    ' "$traffic_tmp" >"$traffic_tmp.next"
+    mv -f -- "$traffic_tmp.next" "$traffic_tmp"
   done < <(jq -c '.nodes[]' "$NODES_FILE")
   atomic_json_write "$traffic_tmp" "$TRAFFIC_FILE" 600
-  atomic_json_write "$counters_tmp" "$COUNTERS_FILE" 600
-  rm -f -- "$traffic_tmp" "$counters_tmp"
+  # Successful collection commits both totals and kernel baselines in one
+  # file. Remove the pre-1.0.4 baseline file only after that atomic commit.
+  rm -f -- "$COUNTERS_FILE"
+  rm -f -- "$traffic_tmp" "$traffic_tmp.next"
 }
 
 traffic_reset_kernel_baselines() {
-  local nodes_source=$1
-  local counters_tmp="$RUNTIME_DIR/counters.baseline.$$.json"
-  install -m 600 -- "$COUNTERS_FILE" "$counters_tmp"
+  local nodes_source=$1 traffic_source=${2:-$TRAFFIC_FILE}
+  local traffic_tmp="$RUNTIME_DIR/traffic.baseline.$$.json"
+  install -m 600 -- "$traffic_source" "$traffic_tmp"
   jq --slurpfile nodes "$nodes_source" '
     .nodes |= reduce ($nodes[0].nodes[]?.node_id) as $id (.;
       .[$id] = ((.[$id] // {}) + {upload_kernel_bytes:0,download_kernel_bytes:0,updated_at:(now|todateiso8601)})
     )
-  ' "$counters_tmp" >"$counters_tmp.next"
-  install -m 600 -- "$counters_tmp.next" "$counters_tmp"
-  atomic_json_write "$counters_tmp" "$COUNTERS_FILE" 600
-  rm -f -- "$counters_tmp" "$counters_tmp.next"
+  ' "$traffic_tmp" >"$traffic_tmp.next"
+  install -m 600 -- "$traffic_tmp.next" "$traffic_tmp"
+  atomic_json_write "$traffic_tmp" "$traffic_source" 600
+  rm -f -- "$traffic_tmp" "$traffic_tmp.next"
 }
 
 traffic_append_history() {

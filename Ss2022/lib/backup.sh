@@ -4,7 +4,7 @@
 validate_candidate_nodes() {
   local nodes_source=$1
   jq -e '.schema_version == 1 and (.nodes | type == "array")' "$nodes_source" >/dev/null || die "候选节点数据库结构无效。"
-  local node node_id name method password port address address_type status quota reset_day upload_limit download_limit
+  local node node_id name method password port address address_type detected_address_type status quota reset_day upload_limit download_limit
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     node_id=$(jq -er '.node_id' <<<"$node")
@@ -24,8 +24,9 @@ validate_candidate_nodes() {
     validate_method "$method" || die "候选节点加密方式无效：$method"
     validate_base64_key "$password" "$(method_key_bytes "$method")" || die "候选节点密钥格式/长度无效。"
     validate_port "$port" || die "候选节点端口无效：$port"
-    validate_address "$address" >/dev/null || die "候选节点地址无效：$address"
+    detected_address_type=$(validate_address "$address") || die "候选节点地址无效：$address"
     [[ "$address_type" == ipv4 || "$address_type" == ipv6 || "$address_type" == domain ]] || die "候选节点地址类型无效。"
+    [[ "$detected_address_type" == "$address_type" ]] || die "候选节点地址类型与地址不一致：$address"
     [[ "$status" == enabled || "$status" == disabled_manual || "$status" == disabled_quota || "$status" == disabled_error ]] || die "候选节点状态无效。"
     [[ "$quota" =~ ^[0-9]+$ ]] || die "候选节点配额无效。"
     validate_reset_day "$reset_day" || die "候选节点重置日无效。"
@@ -142,10 +143,9 @@ apply_state_transaction() {
   local collect_traffic=${5:-1}
   ensure_runtime_dirs
   initialize_state_files
-  local merged_traffic=''
+  local merged_traffic="$RUNTIME_DIR/traffic.txn-merge.$$.json"
   if [[ "$collect_traffic" == 1 ]]; then
     traffic_collect_no_lock
-    merged_traffic="$RUNTIME_DIR/traffic.txn-merge.$$.json"
     jq --slurpfile live "$TRAFFIC_FILE" '
       .nodes |= with_entries(
         .key as $id
@@ -158,8 +158,10 @@ apply_state_transaction() {
           end
       )
     ' "$candidate_traffic" >"$merged_traffic"
-    candidate_traffic="$merged_traffic"
+  else
+    install -m 600 -- "$candidate_traffic" "$merged_traffic"
   fi
+  candidate_traffic="$merged_traffic"
   validate_candidate_nodes "$candidate_nodes"
   jq -e '.schema_version == 1 and (.nodes | type == "object")' "$candidate_traffic" >/dev/null || die '候选流量数据库结构无效。'
   jq -e '.schema_version == 1 and (.cycles | type == "object")' "$candidate_history" >/dev/null || die '候选流量历史结构无效。'
@@ -215,7 +217,7 @@ apply_state_transaction() {
   # tc rules are recreated during every transaction, so their byte counters
   # start from zero. Reset persisted baselines to prevent the next sample
   # from comparing a new port/rule counter with an old one.
-  if ! (traffic_reset_kernel_baselines "$candidate_nodes"); then
+  if ! (traffic_reset_kernel_baselines "$candidate_nodes" "$candidate_traffic"); then
     error '新的 tc 计数基线无法保存，正在恢复上一版本配置和规则。'
     restore_runtime_and_state "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$service_was_active"
     rm -f -- "$candidate_config" "$old_nodes" "$old_traffic" "$old_history" "$old_config" "$merged_traffic"

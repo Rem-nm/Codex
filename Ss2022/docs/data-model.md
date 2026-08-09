@@ -41,6 +41,8 @@
   "current_download_bytes": 0,
   "total_upload_bytes": 0,
   "total_download_bytes": 0,
+  "upload_kernel_bytes": 0,
+  "download_kernel_bytes": 0,
   "quota_bytes": 0,
   "reset_day": 1,
   "last_reset_at": "UTC ISO-8601",
@@ -48,7 +50,7 @@
 }
 ```
 
-`tc-counters.json` 只保存内核计数器基线，不是用户流量数据；重建规则后会重新建立基线。
+`upload_kernel_bytes` 和 `download_kernel_bytes` 是当前 tc action 的采样基线。它们与流量累计值在同一个文件中原子提交，避免一份文件已更新、另一份尚未更新的窗口。1.0.4 首次成功采样会兼容读取并删除旧版 `tc-counters.json`。
 
 `traffic-history.json` 的每个结算条目包含 `period`、`period_start_at` 和 `period_end_at`。月份标签按结算边界前最后一秒计算，因此每月 1 日重置仍显示刚结束的月份，而非 1 日重置节点的首个短周期不会覆盖下一个完整周期。
 

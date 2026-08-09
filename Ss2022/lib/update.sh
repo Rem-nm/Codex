@@ -42,6 +42,7 @@ singbox_update_flow() {
   [[ -x "$SING_BOX_BINARY" ]] && install -m 755 -- "$SING_BOX_BINARY" "$old_binary"
   [[ -f "$SING_BOX_CONFIG" ]] && install -m 600 -- "$SING_BOX_CONFIG" "$old_config"
   backup_create_snapshot "sing-box-update-$target" >/dev/null
+  backup_prune
   if ! install_singbox_from_release "$target"; then
     rm -f -- "$old_binary" "$old_config"
     return 1
@@ -125,11 +126,83 @@ manager_update_info() {
   printf '当前 manager：%s\n可用官方版本：%s\n' "$MANAGER_VERSION" "${tag:-暂无可验证 Release}"
 }
 
+manager_update_service_names() {
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    printf '%s\n' "$SING_BOX_SERVICE" "$SYSTEMD_TRAFFIC_SERVICE" "$SYSTEMD_TRAFFIC_TIMER"
+  else
+    printf '%s\n' "$SING_BOX_SERVICE" "$OPENRC_TRAFFIC_SERVICE"
+  fi
+}
+
+manager_update_backup_service_files() {
+  local backup_dir=$1 name path index=0
+  ensure_dir "$backup_dir" 700
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    path=$(service_definition_path "$name") || return 1
+    if [[ -e "$path" || -L "$path" ]]; then
+      cp -a -- "$path" "$backup_dir/$index.present" || return 1
+    else
+      : >"$backup_dir/$index.absent"
+    fi
+    index=$((index + 1))
+  done < <(manager_update_service_names)
+}
+
+manager_update_restore_service_files() {
+  local backup_dir=$1 name path index=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    path=$(service_definition_path "$name") || return 1
+    rm -f -- "$path"
+    if [[ -e "$backup_dir/$index.present" || -L "$backup_dir/$index.present" ]]; then
+      cp -a -- "$backup_dir/$index.present" "$path" || return 1
+    elif [[ ! -f "$backup_dir/$index.absent" ]]; then
+      error "manager 更新服务备份不完整：$name"
+      return 1
+    fi
+    index=$((index + 1))
+  done < <(manager_update_service_names)
+  service_manager_reload
+}
+
+manager_update_install_service_files() {
+  local source destination mode
+  destination=$(service_definition_path "$SING_BOX_SERVICE") || return 1
+  if [[ -f "$destination" ]] && ! service_definition_is_managed "$SING_BOX_SERVICE"; then
+    error "$destination 已存在且不属于 Ss2022，拒绝在更新时覆盖。"
+    return 1
+  fi
+  if [[ ! -f "$destination" ]] && service_exists "$SING_BOX_SERVICE"; then
+    error "$SING_BOX_SERVICE 来自其他系统路径，拒绝在更新时接管。"
+    return 1
+  fi
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    source="$PROGRAM_DIR/systemd/sing-box.service"
+    mode=644
+  else
+    source="$PROGRAM_DIR/openrc/sing-box"
+    mode=755
+  fi
+  [[ -f "$source" ]] || { error "manager 更新包缺少服务模板：$source"; return 1; }
+  install -m "$mode" -- "$source" "$destination" || return 1
+  install_manager_maintenance_service_files
+}
+
+manager_update_finalize_switched_program() {
+  local version=$1 version_output
+  [[ -x "$PROGRAM_DIR/ss-manager.sh" ]] || return 1
+  version_output=$("$PROGRAM_DIR/ss-manager.sh" --version 2>/dev/null) || return 1
+  grep -Fxq "Ss2022 manager $version" <<<"$version_output" || return 1
+  manager_update_install_service_files || return 1
+  manager_state_set_json manager_version "$(jq -Rn --arg value "$version" '$value')"
+}
+
 manager_update_flow() {
   acquire_manager_lock
   assert_standard_destructive_paths
   manager_update_info
-  local json tag version asset_name checksum_name asset_url checksum_url asset_digest archive checksum expected actual extract_root source_entry source_root old_program new_program
+  local json tag version asset_name checksum_name asset_url checksum_url asset_digest archive checksum expected actual extract_root source_entry source_root old_program new_program service_backup state_backup invalid_program
   json=$(manager_release_json 2>/dev/null || true)
   tag=$(jq -r '.tag_name // empty' <<<"$json")
   [[ -n "$tag" ]] || { warn 'Rem-nm/Codex 暂无 manager Release 或查询失败，未执行任何下载。'; return 0; }
@@ -187,27 +260,39 @@ manager_update_flow() {
 
   old_program="${PROGRAM_DIR}.update-old.$$"
   new_program="${PROGRAM_DIR}.update-new.$$"
+  service_backup="$RUNTIME_DIR/manager-update-services.$$"
+  state_backup="$RUNTIME_DIR/manager-update-state.$$.json"
   [[ -d "$PROGRAM_DIR" && -x "$PROGRAM_DIR/ss-manager.sh" ]] || die '当前 manager 程序目录无效，拒绝更新。'
   [[ ! -e "$old_program" && ! -e "$new_program" ]] || die 'manager 更新暂存目录已存在，拒绝覆盖。'
+  manager_update_backup_service_files "$service_backup" || die '无法备份当前服务定义，未执行 manager 更新。'
+  install -m 600 -- "$MANAGER_STATE" "$state_backup" || die '无法备份 manager 状态，未执行更新。'
   cp -a -- "$source_root" "$new_program"
   if ! mv -- "$PROGRAM_DIR" "$old_program"; then
-    rm -rf -- "$extract_root" "$archive" "$checksum" "$new_program"
+    rm -rf -- "$extract_root" "$archive" "$checksum" "$new_program" "$service_backup" "$state_backup"
     die 'manager 更新无法保存当前程序，未执行切换。'
   fi
   if ! mv -- "$new_program" "$PROGRAM_DIR"; then
     mv -- "$old_program" "$PROGRAM_DIR" || die 'manager 更新切换失败，且旧程序恢复失败。'
-    rm -rf -- "$extract_root" "$archive" "$checksum" "$new_program"
+    rm -rf -- "$extract_root" "$archive" "$checksum" "$new_program" "$service_backup" "$state_backup"
     die 'manager 更新切换失败，已恢复旧版本。'
   fi
-  if ! [[ -x "$PROGRAM_DIR/ss-manager.sh" ]]; then
-    local invalid_program="${PROGRAM_DIR}.update-invalid.$$"
-    mv -- "$PROGRAM_DIR" "$invalid_program" || true
-    mv -- "$old_program" "$PROGRAM_DIR" || die 'manager 新入口无效，且旧程序恢复失败。'
-    rm -rf -- "$invalid_program"
-    die 'manager 更新后入口不存在，已恢复旧版本。'
+  if ! (manager_update_finalize_switched_program "$version"); then
+    error 'manager 新版本自检、服务定义或状态提交失败，正在恢复旧版本。'
+    invalid_program="${PROGRAM_DIR}.update-invalid.$$"
+    if ! mv -- "$PROGRAM_DIR" "$invalid_program" || ! mv -- "$old_program" "$PROGRAM_DIR"; then
+      die '严重：manager 更新失败且旧程序目录无法恢复，请立即人工处理。'
+    fi
+    install -m 600 -- "$state_backup" "$MANAGER_STATE" || error '旧 manager 状态恢复失败。'
+    if ! manager_update_restore_service_files "$service_backup"; then
+      error '旧服务定义恢复失败，请立即人工处理。'
+    fi
+    rm -rf -- "$invalid_program" "$extract_root" "$archive" "$checksum" "$new_program" "$service_backup" "$state_backup"
+    return 1
   fi
-  rm -rf -- "$old_program" "$extract_root" "$archive" "$checksum"
-  success "manager 已更新到 $version；节点数据与 sing-box 配置未被覆盖。"
+  rm -rf -- "$old_program" "$extract_root" "$archive" "$checksum" "$service_backup" "$state_backup"
+  success "manager 已更新到 $version；服务定义已同步，正在切换到新版本菜单。"
+  trap - ERR
+  exit 75
 }
 
 update_menu_flow() {

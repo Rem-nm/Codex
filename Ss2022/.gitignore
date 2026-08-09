@@ -8,8 +8,13 @@ nodes.json
 traffic.json
 traffic-history.json
 tc-counters.json
+interfaces.json
+bandwidth-plan.json
 manager.json
+config.json
 backups/
+state-transaction/
+install-transaction/
 
 # Local editor and test output.
 .DS_Store

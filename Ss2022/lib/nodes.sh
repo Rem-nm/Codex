@@ -7,7 +7,7 @@ node_count() {
 
 node_by_id() {
   local node_id=$1
-  jq -c --arg id "$node_id" '.nodes[] | select(.node_id == $id)' "$NODES_FILE"
+  jq -ce --arg id "$node_id" '[.nodes[] | select(.node_id == $id)] | if length == 1 then .[0] else empty end' "$NODES_FILE"
 }
 
 node_exists() {
@@ -25,18 +25,28 @@ node_name_exists() {
 unique_node_name() {
   local requested=$1
   local exclude_id=${2:-}
+  local exists_status=0
   validate_name "$requested" || return 1
-  if ! node_name_exists "$requested" "$exclude_id"; then
+  node_name_exists "$requested" "$exclude_id" || exists_status=$?
+  if (( exists_status == 1 )); then
     printf '%s' "$requested"
     return 0
   fi
-  local index=2 candidate
+  (( exists_status == 0 )) || return 1
+  local index=2 candidate suffix prefix_length
   while true; do
-    candidate="${requested}-${index}"
-    if ! node_name_exists "$candidate" "$exclude_id"; then
+    suffix="-${index}"
+    prefix_length=$((64 - ${#suffix}))
+    (( prefix_length > 0 )) || return 1
+    candidate="${requested:0:prefix_length}${suffix}"
+    validate_name "$candidate" || return 1
+    exists_status=0
+    node_name_exists "$candidate" "$exclude_id" || exists_status=$?
+    if (( exists_status == 1 )); then
       printf '%s' "$candidate"
       return 0
     fi
+    (( exists_status == 0 )) || return 1
     ((index++))
   done
 }
@@ -49,33 +59,48 @@ node_port_in_database() {
 }
 
 system_port_in_use() {
-  local port=$1
+  local port=$1 tcp_listeners udp_listeners
   local pattern="(^|:)${port}$"
-  ss -H -tan 2>/dev/null | awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' && return 0
-  ss -H -uan 2>/dev/null | awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' && return 0
+  tcp_listeners=$(ss -H -ltn 2>/dev/null) || return 2
+  udp_listeners=$(ss -H -lun 2>/dev/null) || return 2
+  awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' <<<"$tcp_listeners" && return 0
+  awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' <<<"$udp_listeners" && return 0
   return 1
 }
 
 port_available() {
   local port=$1
   local exclude_id=${2:-}
+  local database_status=0
   validate_port "$port" || return 1
-  ! node_port_in_database "$port" "$exclude_id" || return 1
-  if system_port_in_use "$port"; then
+  node_port_in_database "$port" "$exclude_id" || database_status=$?
+  (( database_status == 1 )) || {
+    (( database_status == 0 )) && return 1
+    return 2
+  }
+  local port_state=0
+  system_port_in_use "$port" || port_state=$?
+  (( port_state != 2 )) || return 2
+  if (( port_state == 0 )); then
     # While editing an enabled node, its unchanged live port is expected to
     # be occupied by sing-box.  Every other occupied port remains forbidden.
     [[ -n "$exclude_id" ]] || return 1
     local live_port live_status
-    live_port=$(jq -r --arg id "$exclude_id" '.nodes[] | select(.node_id == $id) | .port' "$NODES_FILE")
-    live_status=$(jq -r --arg id "$exclude_id" '.nodes[] | select(.node_id == $id) | .status' "$NODES_FILE")
+    live_port=$(jq -r --arg id "$exclude_id" '.nodes[] | select(.node_id == $id) | .port' "$NODES_FILE") || return 2
+    live_status=$(jq -r --arg id "$exclude_id" '.nodes[] | select(.node_id == $id) | .status' "$NODES_FILE") || return 2
     [[ "$live_status" == enabled && "$live_port" == "$port" ]] || return 1
+    singbox_is_active || return 1
+    singbox_owns_node_port "$port" || return 1
   fi
   return 0
 }
 
+# Called without an argument for new nodes and with an excluded Node ID while
+# editing; ShellCheck cannot see the latter across separately sourced modules.
+# shellcheck disable=SC2120
 choose_port() {
   local exclude_id=${1:-}
-  local port attempt
+  local port attempt availability_status
   while true; do
     printf '请输入端口（回车随机，范围 %s-%s）：\n> ' "$DEFAULT_PORT_MIN" "$DEFAULT_PORT_MAX" >&2
     IFS= read -r port || die "读取输入失败。"
@@ -86,17 +111,22 @@ choose_port() {
         if port_available "$port" "$exclude_id"; then
           printf '%s' "$port"
           return 0
+        else
+          availability_status=$?
+          (( availability_status != 2 )) || die '无法可靠查询系统 TCP/UDP 监听端口，已停止选择端口。'
         fi
       done
       die "在随机范围内没有找到同时可用的 TCP/UDP 端口。"
     fi
     if ! validate_port "$port"; then
       warn "端口必须是 1-65535 的整数；直接回车可随机选择。"
-    elif ! port_available "$port" "$exclude_id"; then
-      warn "端口 $port 的 TCP 或 UDP 已被占用，或与已有节点冲突；不会覆盖。"
-    else
+    elif port_available "$port" "$exclude_id"; then
       printf '%s' "$port"
       return 0
+    else
+      availability_status=$?
+      (( availability_status != 2 )) || die '无法可靠查询系统 TCP/UDP 监听端口，已停止选择端口。'
+      warn "端口 $port 的 TCP 或 UDP 已被占用，或与已有节点冲突；不会覆盖。"
     fi
   done
 }
@@ -119,10 +149,21 @@ choose_method() {
 choose_address() {
   local value detected
   while true; do
-    printf '请输入节点地址（回车自动检测公网 IPv4；输入 ipv6 可自动检测公网 IPv6）：\n> ' >&2
+    printf '请输入节点地址（回车自动检测，优先 IPv4、失败后 IPv6；也可直接输入 IP/域名）：\n> ' >&2
     IFS= read -r value || die "读取输入失败。"
     value=$(trim_spaces "$value")
-    if [[ -z "$value" || "$value" == auto || "$value" == ipv4 ]]; then
+    if [[ -z "$value" || "$value" == auto ]]; then
+      detected=ipv4
+      value=$(discover_public_ip ipv4 2>/dev/null || true)
+      if [[ -z "$value" ]]; then
+        detected=ipv6
+        value=$(discover_public_ip ipv6 2>/dev/null || true)
+      fi
+      [[ -n "$value" ]] || { warn "没有检测到公网 IPv4/IPv6，请直接输入 IP 或域名。"; continue; }
+      printf '%s\t%s' "$value" "$detected"
+      return 0
+    fi
+    if [[ "$value" == ipv4 ]]; then
       detected=ipv4
       value=$(discover_public_ip ipv4 2>/dev/null || true)
       [[ -n "$value" ]] || { warn "没有检测到公网 IPv4，请直接输入 IP 或域名。"; continue; }
@@ -149,27 +190,30 @@ choose_address() {
 }
 
 generate_node_id() {
-  local node_id
+  local node_id exists_status
   while true; do
-    node_id=$(openssl rand -hex 16)
-    if ! node_exists "$node_id"; then
+    node_id=$(openssl rand -hex 16) || return 1
+    exists_status=0
+    node_exists "$node_id" || exists_status=$?
+    if (( exists_status == 1 )); then
       printf '%s' "$node_id"
       return 0
     fi
+    (( exists_status == 0 )) || return 1
   done
 }
 
 node_new_record() {
   local name=$1 method=$2 port=$3 address=$4 address_type=$5 node_id=$6 password=$7
   local now reset_at next_reset
-  now=$(timestamp_iso)
-  reset_at=$(timestamp_iso)
-  next_reset=$(calculate_next_reset_at "$reset_at" "$DEFAULT_RESET_DAY")
-  jq -n \
+  now=$(timestamp_iso) || return 1
+  reset_at=$(timestamp_iso) || return 1
+  next_reset=$(calculate_next_reset_at "$reset_at" "$DEFAULT_RESET_DAY") || return 1
+  # Feed the key through stdin instead of exposing it in jq's argv.
+  printf '%s' "$password" | jq -Rs \
     --arg node_id "$node_id" \
     --arg name "$name" \
     --arg method "$method" \
-    --arg password "$password" \
     --arg address "$address" \
     --arg address_type "$address_type" \
     --arg now "$now" \
@@ -180,12 +224,12 @@ node_new_record() {
     --argjson reset_day "$DEFAULT_RESET_DAY" \
     --argjson upload_limit "$DEFAULT_UPLOAD_LIMIT_MBPS" \
     --argjson download_limit "$DEFAULT_DOWNLOAD_LIMIT_MBPS" \
-    '{node_id:$node_id,name:$name,method:$method,password:$password,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}'
+    '. as $password | {node_id:$node_id,name:$name,method:$method,password:$password,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}'
 }
 
 node_add_flow() {
   acquire_manager_lock
-  local requested name method port address_line address address_type node_id password record candidate traffic_candidate candidate_history
+  local requested name method port address_line address address_type node_id password record_file candidate traffic_candidate candidate_history
   requested=$(read_nonempty '请输入节点名称：')
   validate_name "$requested" || die "节点名称包含控制字符、路径字符或超过 64 个字符。"
   name=$(unique_node_name "$requested") || die "无法生成唯一节点名称。"
@@ -197,42 +241,57 @@ node_add_flow() {
   address_type=${address_line##*$'\t'}
   node_id=$(generate_node_id)
   password=$(generate_random_key "$(method_key_bytes "$method")")
-  record=$(node_new_record "$name" "$method" "$port" "$address" "$address_type" "$node_id" "$password")
-  candidate="$RUNTIME_DIR/nodes.candidate.$$.json"
-  jq --argjson record "$record" '.nodes += [$record]' "$NODES_FILE" >"$candidate"
-  traffic_candidate="$RUNTIME_DIR/traffic.add.$$.json"
-  candidate_history="$RUNTIME_DIR/history.add.$$.json"
-  traffic_candidate_add_node "$node_id" "$DEFAULT_QUOTA_BYTES" "$DEFAULT_RESET_DAY" >"$traffic_candidate"
-  install -m 600 -- "$HISTORY_FILE" "$candidate_history"
+  record_file=$(runtime_temp_file node-record) || die '无法创建节点记录暂存文件。'
+  node_new_record "$name" "$method" "$port" "$address" "$address_type" "$node_id" "$password" >"$record_file" \
+    || { rm -f -- "$record_file"; die '无法创建节点记录。'; }
+  chmod 600 -- "$record_file" || { rm -f -- "$record_file"; die '无法保护节点记录暂存文件。'; }
+  candidate=$(runtime_temp_file nodes.candidate) || { rm -f -- "$record_file"; die '无法创建节点候选暂存文件。'; }
+  jq --slurpfile record "$record_file" '.nodes += [$record[0]]' "$NODES_FILE" >"$candidate" \
+    || { rm -f -- "$record_file" "$candidate"; die '无法生成节点候选数据库。'; }
+  rm -f -- "$record_file" || { rm -f -- "$candidate"; die '无法清理节点密钥暂存文件。'; }
+  traffic_candidate=$(runtime_temp_file traffic.add) || { rm -f -- "$candidate"; die '无法创建流量候选暂存文件。'; }
+  candidate_history=$(runtime_temp_file history.add) || { rm -f -- "$candidate" "$traffic_candidate"; die '无法创建历史候选暂存文件。'; }
+  traffic_candidate_add_node "$node_id" "$DEFAULT_QUOTA_BYTES" "$DEFAULT_RESET_DAY" >"$traffic_candidate" \
+    || { rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"; die '无法生成新节点流量状态。'; }
+  install -m 600 -- "$HISTORY_FILE" "$candidate_history" \
+    || { rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"; die '无法复制流量历史候选状态。'; }
   apply_state_transaction "$candidate" "$traffic_candidate" "$candidate_history" "add-node-$node_id" || {
     rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"
     die "添加节点失败，当前运行配置和节点数据库已保持不变。"
   }
-  rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"
+  rm -f -- "$candidate" "$traffic_candidate" "$candidate_history" \
+    || warn '节点已经创建，但运行时候选文件清理失败。'
   success "节点创建成功。"
-  show_node_credentials "$node_id"
+  show_node_credentials "$node_id" || warn '节点已经创建，但凭据展示未完整完成；可稍后从菜单重新显示。'
 }
 
 node_list_compact() {
-  local index=1 node node_id name port status current_u current_d total
+  local index=1 node node_id name port status current_u current_d total node_lines
+  local quota quota_text upload_text download_text total_text status_text
   printf '\n%-4s %-20s %-8s %-12s %-12s %-12s %-12s %-10s\n' '序号' '名称' '端口' '上传' '下载' '合计' '限额' '状态'
   printf '%s\n' '--------------------------------------------------------------------------------'
+  node_lines=$(jq -c '.nodes[]' "$NODES_FILE") || return 1
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
-    node_id=$(jq -er '.node_id' <<<"$node")
-    name=$(jq -er '.name' <<<"$node")
-    port=$(jq -er '.port' <<<"$node")
-    status=$(jq -er '.status' <<<"$node")
-    current_u=$(traffic_value "$node_id" '.current_upload_bytes')
-    current_d=$(traffic_value "$node_id" '.current_download_bytes')
+    node_id=$(jq -er '.node_id' <<<"$node") || return 1
+    name=$(jq -er '.name' <<<"$node") || return 1
+    port=$(jq -er '.port' <<<"$node") || return 1
+    status=$(jq -er '.status' <<<"$node") || return 1
+    current_u=$(traffic_value "$node_id" '.current_upload_bytes') || return 1
+    current_d=$(traffic_value "$node_id" '.current_download_bytes') || return 1
     total=$((current_u + current_d))
-    local quota
-    quota=$(jq -er '.quota_bytes' <<<"$node")
-    local quota_text='无限'
-    (( quota > 0 )) && quota_text=$(format_bytes "$quota")
-    printf '%-4s %-20s %-8s %-12s %-12s %-12s %-12s %-10s\n' "$index" "$name" "$port" "$(format_bytes "$current_u")" "$(format_bytes "$current_d")" "$(format_bytes "$total")" "$quota_text" "$(status_label "$status")"
+    quota=$(jq -er '.quota_bytes' <<<"$node") || return 1
+    quota_text='无限'
+    if (( quota > 0 )); then
+      quota_text=$(format_bytes "$quota") || return 1
+    fi
+    upload_text=$(format_bytes "$current_u") || return 1
+    download_text=$(format_bytes "$current_d") || return 1
+    total_text=$(format_bytes "$total") || return 1
+    status_text=$(status_label "$status") || return 1
+    printf '%-4s %-20s %-8s %-12s %-12s %-12s %-12s %-10s\n' "$index" "$name" "$port" "$upload_text" "$download_text" "$total_text" "$quota_text" "$status_text"
     ((index++))
-  done < <(jq -c '.nodes[]' "$NODES_FILE")
+  done <<<"$node_lines"
   (( index > 1 )) || info '当前没有节点。'
 }
 
@@ -240,46 +299,79 @@ select_node_id() {
   local prompt=${1:-'请选择节点序号'}
   # This function is normally called through command substitution; the list
   # and prompt are UI output, not the selected Node ID.
-  node_list_compact >&2
+  node_list_compact >&2 || return 2
   local count index
-  count=$(node_count)
+  count=$(node_count) || return 2
   (( count > 0 )) || return 1
   while true; do
     printf '%s（0 返回）\n> ' "$prompt" >&2
-    IFS= read -r index || die "读取输入失败。"
+    IFS= read -r index || return 2
     [[ "$index" == 0 ]] && return 1
-    if [[ "$index" =~ ^[0-9]+$ ]] && (( index >= 1 && index <= count )); then
-      jq -er --argjson index "$index" '.nodes[$index-1].node_id' "$NODES_FILE"
+    if [[ "$index" =~ ^[1-9][0-9]*$ ]] && (( index >= 1 && index <= count )); then
+      jq -er --argjson index "$index" '.nodes[$index-1].node_id' "$NODES_FILE" || return 2
       return 0
     fi
     warn "请输入有效的节点序号。"
   done
 }
 
+select_node_for_flow() {
+  local output_variable=$1 prompt=$2 selected='' select_status=0
+  selected=$(select_node_id "$prompt") || select_status=$?
+  if (( select_status == 0 )); then
+    printf -v "$output_variable" '%s' "$selected"
+    return 0
+  fi
+  (( select_status == 1 )) && return 1
+  die '无法可靠读取或显示节点数据库，操作已停止。'
+}
+
 node_show_detail() {
   local node_id=$1 node
   node=$(node_by_id "$node_id") || die "节点不存在：$node_id"
-  local upload download total total_upload total_download total_all quota reset_day status
-  upload=$(traffic_value "$node_id" '.current_upload_bytes')
-  download=$(traffic_value "$node_id" '.current_download_bytes')
+  local upload download total total_upload total_download total_all quota reset_day status billable
+  local name address port method upload_limit download_limit next_reset status_text
+  local upload_text download_text total_text total_upload_text total_download_text total_all_text
+  upload=$(traffic_value "$node_id" '.current_upload_bytes') || die '无法读取节点上传流量。'
+  download=$(traffic_value "$node_id" '.current_download_bytes') || die '无法读取节点下载流量。'
   total=$((upload + download))
-  total_upload=$(traffic_value "$node_id" '.total_upload_bytes')
-  total_download=$(traffic_value "$node_id" '.total_download_bytes')
+  billable=$(quota_billable_bytes "$upload" "$download") || die '配额计数超出安全整数范围。'
+  total_upload=$(traffic_value "$node_id" '.total_upload_bytes') || die '无法读取节点累计上传流量。'
+  total_download=$(traffic_value "$node_id" '.total_download_bytes') || die '无法读取节点累计下载流量。'
   total_all=$((total_upload + total_download))
-  quota=$(jq -er '.quota_bytes' <<<"$node")
-  reset_day=$(jq -er '.reset_day' <<<"$node")
-  status=$(jq -er '.status' <<<"$node")
+  quota=$(jq -er '.quota_bytes' <<<"$node") || die '节点限额字段无效。'
+  reset_day=$(jq -er '.reset_day' <<<"$node") || die '节点重置日字段无效。'
+  status=$(jq -er '.status' <<<"$node") || die '节点状态字段无效。'
+  name=$(jq -er '.name' <<<"$node") || die '节点名称字段无效。'
+  address=$(jq -er '.address' <<<"$node") || die '节点地址字段无效。'
+  port=$(jq -er '.port' <<<"$node") || die '节点端口字段无效。'
+  method=$(jq -er '.method' <<<"$node") || die '节点加密方式字段无效。'
+  upload_limit=$(jq -er '.upload_limit_mbps' <<<"$node") || die '节点上传限速字段无效。'
+  download_limit=$(jq -er '.download_limit_mbps' <<<"$node") || die '节点下载限速字段无效。'
+  next_reset=$(jq -er '.next_reset_at' <<<"$node") || die '节点下次重置时间无效。'
+  status_text=$(status_label "$status") || die '无法格式化节点状态。'
+  upload_text=$(format_bytes "$upload") || die '无法格式化上传流量。'
+  download_text=$(format_bytes "$download") || die '无法格式化下载流量。'
+  total_text=$(format_bytes "$total") || die '无法格式化本周期流量。'
+  total_upload_text=$(format_bytes "$total_upload") || die '无法格式化累计上传流量。'
+  total_download_text=$(format_bytes "$total_download") || die '无法格式化累计下载流量。'
+  total_all_text=$(format_bytes "$total_all") || die '无法格式化累计流量。'
   printf '\n节点：%s\nNode ID：%s\n服务器地址：%s\n端口：%s（TCP + UDP）\n加密方式：%s\n状态：%s\n' \
-    "$(jq -er '.name' <<<"$node")" "$node_id" "$(jq -er '.address' <<<"$node")" "$(jq -er '.port' <<<"$node")" "$(jq -er '.method' <<<"$node")" "$(status_label "$status")"
-  printf '本周期上传：%s\n本周期下载：%s\n本周期合计：%s\n' "$(format_bytes "$upload")" "$(format_bytes "$download")" "$(format_bytes "$total")"
-  if (( quota == 0 )); then printf '月流量限额：无限\n'; else printf '月流量限额：%s\n剩余：%s\n' "$(format_bytes "$quota")" "$(format_bytes "$(( quota > total ? quota - total : 0 ))")"; fi
-  printf '累计上传：%s\n累计下载：%s\n累计合计：%s\n' "$(format_bytes "$total_upload")" "$(format_bytes "$total_download")" "$(format_bytes "$total_all")"
-  printf '重置日：每月 %s 日\n上传限速：%s\n下载限速：%s\n下次重置：%s\n' "$reset_day" "$(format_mbps "$(jq -er '.upload_limit_mbps' <<<"$node")")" "$(format_mbps "$(jq -er '.download_limit_mbps' <<<"$node")")" "$(jq -er '.next_reset_at' <<<"$node")"
+    "$name" "$node_id" "$address" "$port" "$method" "$status_text"
+  printf '本周期上传：%s\n本周期下载：%s\n本周期合计：%s\n' "$upload_text" "$download_text" "$total_text"
+  if (( quota == 0 )); then
+    printf '月流量限额：无限（自动停用默认按下载计费；上传为端口层观测值）\n'
+  else
+    printf '月流量限额：%s\n计费流量：%s（默认仅下载；降低但不能消除未认证流量影响）\n剩余：%s\n' \
+      "$(format_bytes "$quota")" "$(format_bytes "$billable")" "$(format_bytes "$(( quota > billable ? quota - billable : 0 ))")"
+  fi
+  printf '累计上传：%s\n累计下载：%s\n累计合计：%s\n' "$total_upload_text" "$total_download_text" "$total_all_text"
+  printf '重置日：每月 %s 日\n上传限速：%s\n下载限速：%s\n下次重置：%s\n' "$reset_day" "$(format_mbps "$upload_limit")" "$(format_mbps "$download_limit")" "$next_reset"
 }
 
 node_view_flow() {
   local node_id
-  node_id=$(select_node_id '请选择要查看的节点') || return 0
+  select_node_for_flow node_id '请选择要查看的节点' || return 0
   node_show_detail "$node_id"
   if prompt_yes_no '是否显示该节点的完整密钥、链接和二维码？' n; then
     show_node_credentials "$node_id"

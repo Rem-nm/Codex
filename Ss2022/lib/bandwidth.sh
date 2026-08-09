@@ -4,11 +4,163 @@
 DEFAULT_TC_PREF=49100
 TC_ACTION_INDEX_BASE=1000000000
 
+tc_active_families() {
+  local families family disable_ipv6
+  families=$(current_default_route_families) || return 1
+  while IFS= read -r family; do
+    case "$family" in
+      ip) printf '%s\n' ip ;;
+      ipv6)
+        [[ -s /proc/net/if_inet6 ]] || return 1
+        disable_ipv6=$(sysctl_read net.ipv6.conf.all.disable_ipv6) || return 1
+        [[ "$disable_ipv6" == 0 ]] || return 1
+        printf '%s\n' ipv6
+        ;;
+      *) return 1 ;;
+    esac
+  done <<<"$families"
+}
+
+tc_capability_signature() {
+  local kernel tc_version families
+  kernel=$(uname -r) || return 1
+  tc_version=$(tc -V 2>/dev/null | head -n 1) || return 1
+  families=$(tc_active_families | tr '\n' ',') || return 1
+  families=${families%,}
+  # Bump this probe contract whenever later runtime code starts depending on
+  # additional tc JSON fields or semantics, forcing existing installs to run
+  # the stronger dummy-interface preflight once.
+  printf 'ss2022-tc-probe-v5|%s|%s|%s' "$kernel" "$tc_version" "$families"
+}
+
+probe_tc_capabilities() {
+  require_cmd ip jq sha256sum tc uname
+  local interface="ssmprobe${BASHPID}"
+  interface=${interface:0:15}
+  local base=$((1900000000 + (BASHPID % 100000) * 2))
+  local gact_index police_index candidate_offset kind lookup_status index_free
+  for ((candidate_offset=0; candidate_offset<100; candidate_offset+=2)); do
+    gact_index=$((base + candidate_offset))
+    police_index=$((gact_index + 1))
+    index_free=1
+    for kind in gact police; do
+      if tc_action_lookup "$kind" "$gact_index" >/dev/null 2>&1; then index_free=0; else lookup_status=$?; (( lookup_status == 1 )) || return 1; fi
+      if tc_action_lookup "$kind" "$police_index" >/dev/null 2>&1; then index_free=0; else lookup_status=$?; (( lookup_status == 1 )) || return 1; fi
+    done
+    (( index_free == 1 )) && break
+  done
+  (( index_free == 1 )) || { error '无法找到空闲的临时 tc action index。'; return 1; }
+  local gact_cookie police_cookie output ingress_output egress_output signature match_count
+  gact_cookie=$(printf 'ss2022-capability-gact-%s' "$BASHPID" | sha256sum | awk '{print substr($1,1,32)}') || return 1
+  police_cookie=$(printf 'ss2022-capability-police-%s' "$BASHPID" | sha256sum | awk '{print substr($1,1,32)}') || return 1
+
+  if ip link show dev "$interface" >/dev/null 2>&1; then
+    error "tc 能力探测临时接口名称冲突：$interface"
+    return 1
+  fi
+  if ! ip link add "$interface" type dummy >/dev/null 2>&1; then
+    error '无法创建临时 dummy 接口；系统缺少 tc 所需的 CAP_NET_ADMIN 或 dummy 支持。'
+    return 1
+  fi
+  local probe_ok=1 family protocol family_pref expected_rules=0 bind_count handles handle_count handle family_lines
+  local -a families=()
+  family_lines=$(tc_active_families) || probe_ok=0
+  if (( probe_ok == 1 )); then
+    mapfile -t families <<<"$family_lines"
+  fi
+  (( ${#families[@]} >= 1 )) || probe_ok=0
+  ip link set dev "$interface" up >/dev/null 2>&1 || probe_ok=0
+  (( probe_ok == 0 )) || tc qdisc add dev "$interface" clsact >/dev/null 2>&1 || probe_ok=0
+  (( probe_ok == 0 )) || tc actions add action gact pass index "$gact_index" cookie "$gact_cookie" >/dev/null 2>&1 || probe_ok=0
+  (( probe_ok == 0 )) || tc actions add action police rate 1mbit burst 64kb mtu 64kb conform-exceed drop/pass index "$police_index" cookie "$police_cookie" >/dev/null 2>&1 || probe_ok=0
+  if (( probe_ok == 1 )); then
+    for family in "${families[@]}"; do
+      family_pref=$(tc_family_pref 65000 "$family") || { probe_ok=0; break; }
+      for protocol in tcp udp; do
+        tc filter add dev "$interface" ingress pref "$family_pref" protocol "$family" flower skip_hw ip_proto "$protocol" dst_port 9 action gact index "$gact_index" >/dev/null 2>&1 || { probe_ok=0; break 2; }
+        tc filter add dev "$interface" egress pref "$family_pref" protocol "$family" flower skip_hw ip_proto "$protocol" src_port 9 action police index "$police_index" >/dev/null 2>&1 || { probe_ok=0; break 2; }
+        expected_rules=$((expected_rules + 1))
+      done
+    done
+  fi
+  if (( probe_ok == 1 )); then
+    ingress_output=$(tc -s -j filter show dev "$interface" ingress 2>/dev/null) || probe_ok=0
+    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" 'type == "array" and length == $expected' >/dev/null 2>&1 <<<"$ingress_output" || probe_ok=0
+    egress_output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null) || probe_ok=0
+    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" 'type == "array" and length == $expected' >/dev/null 2>&1 <<<"$egress_output" || probe_ok=0
+    if (( probe_ok == 1 )); then
+      for family in "${families[@]}"; do
+        family_pref=$(tc_family_pref 65000 "$family") || { probe_ok=0; break; }
+        for protocol in tcp udp; do
+          match_count=$(tc_rule_json_match_count "$ingress_output" "$family_pref" "$family" "$protocol" ingress 9 gact "$gact_index") || { probe_ok=0; break 2; }
+          (( match_count == 1 )) || { probe_ok=0; break 2; }
+          handles=$(tc_rule_json_handles "$ingress_output" "$family_pref" "$family" "$protocol" ingress 9 gact "$gact_index") || { probe_ok=0; break 2; }
+          handle_count=$(awk 'NF {count++} END {print count+0}' <<<"$handles") || { probe_ok=0; break 2; }
+          (( handle_count == 1 )) || { probe_ok=0; break 2; }
+          handle=$(awk 'NF {print; exit}' <<<"$handles") || { probe_ok=0; break 2; }
+          [[ "$handle" =~ ^(0x)?[A-Fa-f0-9]+$ ]] || { probe_ok=0; break 2; }
+          match_count=$(tc_rule_json_match_count "$egress_output" "$family_pref" "$family" "$protocol" egress 9 police "$police_index") || { probe_ok=0; break 2; }
+          (( match_count == 1 )) || { probe_ok=0; break 2; }
+          handles=$(tc_rule_json_handles "$egress_output" "$family_pref" "$family" "$protocol" egress 9 police "$police_index") || { probe_ok=0; break 2; }
+          handle_count=$(awk 'NF {count++} END {print count+0}' <<<"$handles") || { probe_ok=0; break 2; }
+          (( handle_count == 1 )) || { probe_ok=0; break 2; }
+          handle=$(awk 'NF {print; exit}' <<<"$handles") || { probe_ok=0; break 2; }
+          [[ "$handle" =~ ^(0x)?[A-Fa-f0-9]+$ ]] || { probe_ok=0; break 2; }
+        done
+      done
+    fi
+    output=$(tc -s -j actions get action gact index "$gact_index" 2>/dev/null) || probe_ok=0
+    (( probe_ok == 0 )) || tc_action_counter_from_json "$output" gact "$gact_index" "$gact_cookie" >/dev/null 2>&1 || probe_ok=0
+    if (( probe_ok == 1 )); then
+      bind_count=$(tc_action_bind_count_from_json "$output" gact "$gact_index" "$gact_cookie") || probe_ok=0
+      (( probe_ok == 0 || bind_count == expected_rules )) || probe_ok=0
+    fi
+    output=$(tc -s -j actions get action police index "$police_index" 2>/dev/null) || probe_ok=0
+    (( probe_ok == 0 )) || tc_action_counter_from_json "$output" police "$police_index" "$police_cookie" >/dev/null 2>&1 || probe_ok=0
+    if (( probe_ok == 1 )); then
+      bind_count=$(tc_action_bind_count_from_json "$output" police "$police_index" "$police_cookie") || probe_ok=0
+      (( probe_ok == 0 || bind_count == expected_rules )) || probe_ok=0
+    fi
+  fi
+
+  if ! ip link del "$interface" >/dev/null 2>&1; then
+    warn "tc 能力探测临时接口清理失败：$interface"
+    probe_ok=0
+  fi
+  if ! tc_delete_owned_action gact "$gact_index" "$gact_cookie" >/dev/null 2>&1; then
+    warn "tc 能力探测 gact/$gact_index 无法在证明所有权后清理。"
+    probe_ok=0
+  fi
+  if ! tc_delete_owned_action police "$police_index" "$police_cookie" >/dev/null 2>&1; then
+    warn "tc 能力探测 police/$police_index 无法在证明所有权后清理。"
+    probe_ok=0
+  fi
+  if (( probe_ok != 1 )); then
+    error '当前内核/iproute2 不完整支持 clsact、flower、当前启用地址族的 TCP/UDP、共享 gact/police action、cookie、bind/handle 校验、可证明清理或 tc JSON 统计。'
+    return 1
+  fi
+  signature=$(tc_capability_signature) || return 1
+  manager_state_set_json tc_capabilities_verified true || return 1
+  manager_state_set_json tc_capability_signature "$(jq -Rn --arg value "$signature" '$value')" || return 1
+  success 'tc 流量统计与限速能力探测通过。'
+}
+
+ensure_tc_capabilities() {
+  local expected recorded verified
+  expected=$(tc_capability_signature) || return 1
+  recorded=$(manager_state_get tc_capability_signature '') || return 1
+  verified=$(manager_state_get tc_capabilities_verified false) || return 1
+  if [[ "$verified" == true && "$recorded" == "$expected" ]]; then
+    return 0
+  fi
+  probe_tc_capabilities
+}
+
 kernel_boot_id() {
   local boot_id=''
   [[ -r /proc/sys/kernel/random/boot_id ]] || return 1
   IFS= read -r boot_id </proc/sys/kernel/random/boot_id || return 1
-  [[ "$boot_id" =~ ^[A-Fa-f0-9-]{36}$ ]] || return 1
+  [[ "$boot_id" =~ ^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$ ]] || return 1
   printf '%s' "$boot_id"
 }
 
@@ -16,30 +168,53 @@ bandwidth_plan_path() { printf '%s/bandwidth-plan.json' "$DATA_DIR"; }
 
 bandwidth_plan_matches_current_boot() {
   local plan_file boot_id
-  plan_file=$(bandwidth_plan_path)
-  [[ -f "$plan_file" ]] || return 1
+  plan_file=$(bandwidth_plan_path) || return 1
+  [[ -f "$plan_file" && ! -L "$plan_file" ]] || return 1
   boot_id=$(kernel_boot_id) || boot_id=unknown
   jq -e --arg boot_id "$boot_id" '.schema_version == 2 and .boot_id == $boot_id and (.actions | type == "array")' "$plan_file" >/dev/null 2>&1
 }
 
+bandwidth_plan_matches_current_families() {
+  local plan_file families current planned
+  plan_file=$(bandwidth_plan_path) || return 2
+  [[ -f "$plan_file" && ! -L "$plan_file" ]] || return 1
+  families=$(tc_active_families) || return 2
+  current=$(printf '%s\n' "$families" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique | sort') || return 2
+  planned=$(jq -c '(.families // ["ip","ipv6"]) | unique | sort' "$plan_file" 2>/dev/null) || return 2
+  [[ "$current" == "$planned" ]]
+}
+
 bandwidth_plan_interfaces() {
   local plan_file
-  plan_file=$(bandwidth_plan_path)
+  plan_file=$(bandwidth_plan_path) || return 1
+  [[ ! -L "$plan_file" ]] || return 1
   [[ -f "$plan_file" ]] || return 0
-  jq -r '.interfaces[]?' "$plan_file" 2>/dev/null || true
+  jq -r '.interfaces[]?' "$plan_file" 2>/dev/null || return 1
+}
+
+bandwidth_plan_families() {
+  local plan_file=${1:-}
+  [[ -n "$plan_file" ]] || plan_file=$(bandwidth_plan_path) || return 1
+  [[ ! -L "$plan_file" ]] || return 1
+  if [[ -f "$plan_file" ]]; then
+    # Schema-2 plans created before family-aware probing always installed both.
+    jq -r '(.families // ["ip","ipv6"])[]' "$plan_file" 2>/dev/null || return 1
+  else
+    tc_active_families
+  fi
 }
 
 bandwidth_known_interfaces() {
-  {
-    traffic_interfaces
-    bandwidth_plan_interfaces
-  } | awk 'NF && !seen[$0]++'
+  local current planned
+  current=$(traffic_interfaces) || return 1
+  planned=$(bandwidth_plan_interfaces) || return 1
+  printf '%s\n%s\n' "$current" "$planned" | awk 'NF && !seen[$0]++'
 }
 
 bandwidth_plan_action() {
   local node_id=$1 direction=$2 plan_file
-  plan_file=$(bandwidth_plan_path)
-  [[ -f "$plan_file" ]] || return 1
+  plan_file=$(bandwidth_plan_path) || return 1
+  [[ -f "$plan_file" && ! -L "$plan_file" ]] || return 1
   jq -ce --arg id "$node_id" --arg direction "$direction" '
     [.actions[]? | select(.node_id == $id and .direction == $direction)]
     | if length == 1 then .[0] else empty end
@@ -48,7 +223,7 @@ bandwidth_plan_action() {
 
 bandwidth_pref() {
   local value
-  value=$(manager_state_get tc_pref "$DEFAULT_TC_PREF")
+  value=$(manager_state_get tc_pref "$DEFAULT_TC_PREF") || return 1
   [[ "$value" =~ ^[0-9]+$ ]] || value=$DEFAULT_TC_PREF
   printf '%s' "$value"
 }
@@ -67,13 +242,34 @@ tc_family_pref() {
 }
 
 tc_interface_exists() {
-  ip link show dev "$1" >/dev/null 2>&1
+  local interface=$1 output status=0
+  output=$(ip -j link show dev "$interface" 2>/dev/null) || status=$?
+  if (( status == 0 )); then
+    jq -e --arg interface "$interface" 'type == "array" and length == 1 and .[0].ifname == $interface' \
+      >/dev/null 2>&1 <<<"$output" || return 2
+    return 0
+  fi
+  # `ip link show dev missing` and an operational query failure both return
+  # non-zero.  A successful full enumeration distinguishes a genuinely absent
+  # interface; if it still appears, retain ownership evidence and fail closed.
+  output=$(ip -j link show 2>/dev/null) || return 2
+  jq -e 'type == "array" and all(.[]; (.ifname | type == "string"))' >/dev/null 2>&1 <<<"$output" || return 2
+  if jq -e --arg interface "$interface" 'any(.[]; .ifname == $interface)' >/dev/null 2>&1 <<<"$output"; then
+    return 2
+  fi
+  return 1
 }
 
 tc_filter_scoped_json() {
-  local interface=$1 direction=$2 family=$3 pref=$4 raw
-  tc_interface_exists "$interface" || { printf '[]'; return 0; }
-  if ! tc qdisc show dev "$interface" 2>/dev/null | grep -q 'clsact'; then
+  local interface=$1 direction=$2 family=$3 pref=$4 raw qdisc interface_status=0
+  tc_interface_exists "$interface" || interface_status=$?
+  case "$interface_status" in
+    0) ;;
+    1) printf '[]'; return 0 ;;
+    *) return 1 ;;
+  esac
+  qdisc=$(tc qdisc show dev "$interface" 2>/dev/null) || return 1
+  if ! grep -q 'clsact' <<<"$qdisc"; then
     printf '[]'
     return 0
   fi
@@ -87,22 +283,25 @@ tc_filter_scoped_json() {
 }
 
 tc_pref_is_free() {
-  local pref=$1 interface family direction rules
+  local pref=$1 interface family direction rules interfaces families
+  interfaces=$(traffic_interfaces) || return 1
+  families=$(tc_active_families) || return 1
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    for family in ip ipv6; do
+    while IFS= read -r family; do
+      [[ -n "$family" ]] || continue
       for direction in ingress egress; do
         rules=$(tc_filter_scoped_json "$interface" "$direction" "$family" "$pref") || return 1
         [[ "$(jq -r 'length' <<<"$rules")" == 0 ]] || return 1
       done
-    done
-  done < <(traffic_interfaces)
+    done <<<"$families"
+  done <<<"$interfaces"
   return 0
 }
 
 ensure_bandwidth_pref() {
   local existing pref ipv6_pref
-  existing=$(manager_state_get tc_pref '')
+  existing=$(manager_state_get tc_pref '') || return 1
   if [[ "$existing" =~ ^[0-9]+$ ]] && (( existing >= 100 && existing <= 65500 )) \
     && tc_pref_is_free "$existing" && tc_pref_is_free "$((existing + 1))"; then
     pref=$existing
@@ -118,8 +317,9 @@ ensure_bandwidth_pref() {
     [[ -n "$pref" ]] || { error '无法找到不占用现有 tc 过滤器的管理优先级。'; return 1; }
   fi
   ipv6_pref=$(tc_family_pref "$pref" ipv6) || return 1
-  manager_state_set_json tc_pref "$pref" || return 1
-  manager_state_set_json tc_ipv6_pref "$ipv6_pref" || return 1
+  jq --argjson pref "$pref" --argjson ipv6_pref "$ipv6_pref" \
+    '.tc_pref=$pref | .tc_ipv6_pref=$ipv6_pref' "$MANAGER_STATE" \
+    | atomic_json_from_stdin "$MANAGER_STATE" 600 || return 1
   printf '%s' "$pref"
 }
 
@@ -131,8 +331,12 @@ record_manager_clsact_interface() {
 }
 
 ensure_clsact() {
-  local interface=$1
-  if ! tc qdisc show dev "$interface" 2>/dev/null | grep -q 'clsact'; then
+  local interface=$1 qdisc
+  qdisc=$(tc qdisc show dev "$interface" 2>/dev/null) || {
+    error "无法可靠查询接口 $interface 的 qdisc，拒绝猜测 clsact 状态。"
+    return 1
+  }
+  if ! grep -q 'clsact' <<<"$qdisc"; then
     tc qdisc add dev "$interface" clsact || return 1
     if ! record_manager_clsact_interface "$interface"; then
       tc qdisc del dev "$interface" clsact >/dev/null 2>&1 || true
@@ -158,30 +362,31 @@ bandwidth_action_kind() {
 }
 
 bandwidth_build_actions() {
-  local nodes_source=$1 output_file=$2 node node_id port direction limit identity index cookie kind
-  jq -n '[]' >"$output_file"
+  local nodes_source=$1 output_file=$2 node node_id port direction limit identity index cookie kind node_lines
+  jq -n '[]' >"$output_file" || return 1
+  node_lines=$(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source") || return 1
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
-    node_id=$(jq -er '.node_id' <<<"$node")
-    port=$(jq -er '.port' <<<"$node")
+    node_id=$(jq -er '.node_id' <<<"$node") || return 1
+    port=$(jq -er '.port' <<<"$node") || return 1
     for direction in ingress egress; do
       if [[ "$direction" == ingress ]]; then
-        limit=$(jq -er '.upload_limit_mbps // 0' <<<"$node")
+        limit=$(jq -er '.upload_limit_mbps // 0' <<<"$node") || return 1
       else
-        limit=$(jq -er '.download_limit_mbps // 0' <<<"$node")
+        limit=$(jq -er '.download_limit_mbps // 0' <<<"$node") || return 1
       fi
       identity=$(bandwidth_action_identity "$node_id" "$direction") || return 1
       index=${identity%%$'\t'*}
       cookie=${identity#*$'\t'}
-      kind=$(bandwidth_action_kind "$limit")
+      kind=$(bandwidth_action_kind "$limit") || return 1
       jq --arg node_id "$node_id" --arg direction "$direction" --arg kind "$kind" --arg cookie "$cookie" \
         --argjson port "$port" --argjson index "$index" --argjson limit "$limit" \
         '. += [{node_id:$node_id,direction:$direction,port:$port,kind:$kind,index:$index,cookie:$cookie,limit_mbps:$limit}]' \
         "$output_file" >"$output_file.next" || return 1
-      mv -f -- "$output_file.next" "$output_file"
+      mv -f -- "$output_file.next" "$output_file" || return 1
     done
-  done < <(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source")
-  jq -e '([.[].index] | length) == ([.[].index] | unique | length) and all(.[]; (.cookie | test("^[a-f0-9]{32}$")))' "$output_file" >/dev/null
+  done <<<"$node_lines"
+  jq -e '([.[].index] | length) == ([.[].index] | unique | length) and all(.[]; (.cookie | test("^[a-f0-9]{32}$")))' "$output_file" >/dev/null || return 1
 }
 
 tc_action_entry_from_json() {
@@ -217,11 +422,24 @@ tc_action_cookie_matches() {
   ' >/dev/null <<<"$entry"
 }
 
+tc_action_bind_count_from_json() {
+  local output=$1 kind=$2 index=$3 cookie=$4 entry
+  entry=$(tc_action_entry_from_json "$output" "$kind" "$index") || return 1
+  tc_action_cookie_matches "$entry" "$cookie" || return 1
+  jq -er '(.bind | tonumber?) as $bind | if ($bind != null and $bind >= 0 and ($bind | floor) == $bind) then $bind else error("invalid bind count") end' \
+    <<<"$entry"
+}
+
 tc_delete_owned_action() {
-  local kind=$1 index=$2 cookie=$3 entry status
+  local kind=$1 index=$2 cookie=$3 entry status bind
   if entry=$(tc_action_lookup "$kind" "$index"); then
     tc_action_cookie_matches "$entry" "$cookie" || {
       error "tc action $kind/$index 已被其他程序占用，拒绝删除。"
+      return 1
+    }
+    bind=$(tc_action_bind_count_from_json "$entry" "$kind" "$index" "$cookie") || return 1
+    (( bind == 0 )) || {
+      error "tc action $kind/$index 仍有 $bind 个过滤器绑定，拒绝删除。"
       return 1
     }
   else
@@ -238,7 +456,7 @@ tc_create_shared_action() {
   for other_kind in gact police; do
     if entry=$(tc_action_lookup "$other_kind" "$index"); then
       if tc_action_cookie_matches "$entry" "$cookie"; then
-        tc actions delete action "$other_kind" index "$index" >/dev/null || return 1
+        tc_delete_owned_action "$other_kind" "$index" "$cookie" || return 1
       elif [[ "$other_kind" == "$kind" ]]; then
         error "tc action $kind/$index 已由其他程序使用，拒绝覆盖。"
         return 1
@@ -256,7 +474,8 @@ tc_create_shared_action() {
 }
 
 bandwidth_preflight_actions() {
-  local actions_file=$1 action kind index cookie entry status
+  local actions_file=$1 action kind index cookie entry status action_lines
+  action_lines=$(jq -c '.[]' "$actions_file") || return 1
   while IFS= read -r action; do
     [[ -n "$action" ]] || continue
     kind=$(jq -er '.kind' <<<"$action") || return 1
@@ -271,12 +490,12 @@ bandwidth_preflight_actions() {
       status=$?
       (( status == 1 )) || { error "无法预检 tc action $kind/$index。"; return 1; }
     fi
-  done < <(jq -c '.[]' "$actions_file")
+  done <<<"$action_lines"
 }
 
 tc_add_flower_rule() {
   local interface=$1 direction=$2 family=$3 protocol=$4 port=$5 pref=$6 kind=$7 index=$8
-  local -a args=(filter add dev "$interface" "$direction" pref "$pref" protocol "$family" flower ip_proto "$protocol")
+  local -a args=(filter add dev "$interface" "$direction" pref "$pref" protocol "$family" flower skip_hw ip_proto "$protocol")
   if [[ "$direction" == ingress ]]; then args+=(dst_port "$port"); else args+=(src_port "$port"); fi
   args+=(action "$kind" index "$index")
   tc "${args[@]}"
@@ -305,7 +524,9 @@ tc_rule_json_match_count() {
         | (($keys.ip_proto // "") | tostring | ascii_downcase) as $actual_protocol
         | select($actual_protocol == $protocol or $actual_protocol == $protocol_number)
         | select(((($keys[$port_field] // 0) | tonumber?) // -1) == $port)
-        | select(any(($options.actions // [])[];
+        | ($options.actions // []) as $actions
+        | select(($actions | length) == 1)
+        | select(any($actions[];
             (((.kind // "") | tostring | ascii_downcase) == $expected_action)
             and (($expected_index | length) == 0 or (((.index // -1) | tostring) == $expected_index))))
       ] | length
@@ -333,7 +554,9 @@ tc_rule_json_handles() {
       | (($keys.ip_proto // "") | tostring | ascii_downcase) as $actual_protocol
       | select($actual_protocol == $protocol or $actual_protocol == $protocol_number)
       | select(((($keys[$port_field] // 0) | tonumber?) // -1) == $port)
-      | select(any(($options.actions // [])[];
+      | ($options.actions // []) as $actions
+      | select(($actions | length) == 1)
+      | select(any($actions[];
           (((.kind // "") | tostring | ascii_downcase) == $expected_action)
           and ((((.index // -1) | tonumber?) // -1) == $expected_index)))
       | .handle // empty
@@ -355,27 +578,37 @@ tc_rule_owned_action_count() {
 
 bandwidth_legacy_filter_state() {
   local nodes_source=$1 pref=$2 interface family direction family_pref rules actual=0 matched=0 count node port limit kind protocol
+  local interfaces node_lines
+  validate_nodes_file_semantic "$nodes_source" || return 1
+  interfaces=$(bandwidth_known_interfaces) || return 1
+  node_lines=$(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source") || return 1
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
     for family in ip ipv6; do
       family_pref=$(tc_family_pref "$pref" "$family") || return 1
       for direction in ingress egress; do
         rules=$(tc_filter_scoped_json "$interface" "$direction" "$family" "$family_pref") || return 1
-        actual=$((actual + $(jq -r 'length' <<<"$rules")))
+        local rule_count
+        rule_count=$(jq -er 'length' <<<"$rules") || return 1
+        actual=$((actual + rule_count))
         while IFS= read -r node; do
           [[ -n "$node" ]] || continue
-          port=$(jq -er '.port' <<<"$node")
-          if [[ "$direction" == ingress ]]; then limit=$(jq -er '.upload_limit_mbps // 0' <<<"$node"); else limit=$(jq -er '.download_limit_mbps // 0' <<<"$node"); fi
-          kind=$(bandwidth_action_kind "$limit")
+          port=$(jq -er '.port' <<<"$node") || return 1
+          if [[ "$direction" == ingress ]]; then
+            limit=$(jq -er '.upload_limit_mbps // 0' <<<"$node") || return 1
+          else
+            limit=$(jq -er '.download_limit_mbps // 0' <<<"$node") || return 1
+          fi
+          kind=$(bandwidth_action_kind "$limit") || return 1
           for protocol in tcp udp; do
             count=$(tc_rule_json_match_count "$rules" "$family_pref" "$family" "$protocol" "$direction" "$port" "$kind") || return 1
             (( count <= 1 )) || { printf 'mixed'; return 0; }
             matched=$((matched + count))
           done
-        done < <(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source")
+        done <<<"$node_lines"
       done
     done
-  done < <(bandwidth_known_interfaces)
+  done <<<"$interfaces"
   if (( actual == 0 )); then printf 'empty'
   elif (( matched == 0 )); then printf 'foreign'
   elif (( actual == matched )); then printf 'managed'
@@ -384,76 +617,116 @@ bandwidth_legacy_filter_state() {
 }
 
 bandwidth_delete_legacy_filters() {
-  local pref=$1 interface family direction family_pref rules
+  local pref=$1 interface family direction family_pref rules interfaces
+  interfaces=$(bandwidth_known_interfaces) || return 1
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
     for family in ip ipv6; do
       family_pref=$(tc_family_pref "$pref" "$family") || return 1
       for direction in ingress egress; do
         rules=$(tc_filter_scoped_json "$interface" "$direction" "$family" "$family_pref") || return 1
-        if (( $(jq -r 'length' <<<"$rules") > 0 )); then
+        local rule_count
+        rule_count=$(jq -er 'length' <<<"$rules") || return 1
+        if (( rule_count > 0 )); then
           tc filter del dev "$interface" "$direction" protocol "$family" pref "$family_pref" >/dev/null || return 1
         fi
       done
     done
-  done < <(bandwidth_known_interfaces)
+  done <<<"$interfaces"
 }
 
 bandwidth_remove_plan() {
   local plan_file=$1 pref action entry status expected_bind bind interface family direction family_pref rules actions_json owned_count
-  local node_id port kind index cookie protocol handles handle
+  local node_id port kind index cookie protocol handles handle action_key action_lines interface_lines family_lines direction_action_lines
   local -a deletions=()
-  jq -e '.schema_version == 2 and (.pref | type == "number") and (.interfaces | type == "array") and (.actions | type == "array")' "$plan_file" >/dev/null || return 1
-  pref=$(jq -er '.pref' "$plan_file")
-  expected_bind=$(( $(jq -r '.interfaces | length' "$plan_file") * 4 ))
+  local -A observed_bind=()
+  [[ -f "$plan_file" && ! -L "$plan_file" ]] || return 1
+  validate_bandwidth_plan_semantic "$plan_file" || return 1
+  pref=$(jq -er '.pref' "$plan_file") || return 1
+  local interface_count family_count
+  interface_count=$(jq -er '.interfaces | length' "$plan_file") || return 1
+  action_lines=$(jq -c '.actions[]' "$plan_file") || return 1
+  interface_lines=$(jq -r '.interfaces[]?' "$plan_file") || return 1
+  family_lines=$(bandwidth_plan_families "$plan_file") || return 1
+  family_count=$(awk 'NF {count++} END {print count+0}' <<<"$family_lines") || return 1
+  (( family_count >= 1 )) || return 1
+  expected_bind=$((interface_count * family_count * 2))
   while IFS= read -r action; do
     [[ -n "$action" ]] || continue
-    kind=$(jq -er '.kind' <<<"$action")
-    index=$(jq -er '.index' <<<"$action")
-    cookie=$(jq -er '.cookie' <<<"$action")
+    kind=$(jq -er '.kind' <<<"$action") || return 1
+    index=$(jq -er '.index' <<<"$action") || return 1
+    cookie=$(jq -er '.cookie' <<<"$action") || return 1
+    action_key="$kind:$index"
+    observed_bind["$action_key"]=0
     if entry=$(tc_action_lookup "$kind" "$index"); then
       tc_action_cookie_matches "$entry" "$cookie" || { error "tc action $kind/$index 所有权不匹配，拒绝清理。"; return 1; }
-      bind=$(jq -er '(.bind | tonumber?) // error("missing bind count")' <<<"$entry") || return 1
+      bind=$(tc_action_bind_count_from_json "$entry" "$kind" "$index" "$cookie") || return 1
       (( bind <= expected_bind )) || { error "tc action $kind/$index 存在额外绑定，拒绝影响其他规则。"; return 1; }
     else
       status=$?
       (( status == 1 )) || return 1
     fi
-  done < <(jq -c '.actions[]' "$plan_file")
+  done <<<"$action_lines"
 
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    for family in ip ipv6; do
+    while IFS= read -r family; do
+      [[ -n "$family" ]] || continue
       family_pref=$(tc_family_pref "$pref" "$family") || return 1
       for direction in ingress egress; do
         rules=$(tc_filter_scoped_json "$interface" "$direction" "$family" "$family_pref") || return 1
         actions_json=$(jq -c --arg direction "$direction" '[.actions[] | select(.direction == $direction)]' "$plan_file") || return 1
+        direction_action_lines=$(jq -c --arg direction "$direction" '.actions[] | select(.direction == $direction)' "$plan_file") || return 1
         local matched_count=0
         while IFS= read -r action; do
           [[ -n "$action" ]] || continue
-          node_id=$(jq -er '.node_id' <<<"$action")
+          node_id=$(jq -er '.node_id' <<<"$action") || return 1
           : "$node_id"
-          port=$(jq -er '.port' <<<"$action")
-          kind=$(jq -er '.kind' <<<"$action")
-          index=$(jq -er '.index' <<<"$action")
+          port=$(jq -er '.port' <<<"$action") || return 1
+          kind=$(jq -er '.kind' <<<"$action") || return 1
+          index=$(jq -er '.index' <<<"$action") || return 1
           for protocol in tcp udp; do
             handles=$(tc_rule_json_handles "$rules" "$family_pref" "$family" "$protocol" "$direction" "$port" "$kind" "$index") || return 1
             local handle_count
-            handle_count=$(awk 'NF {count++} END {print count+0}' <<<"$handles")
+            handle_count=$(awk 'NF {count++} END {print count+0}' <<<"$handles") || return 1
             (( handle_count <= 1 )) || { error "检测到重复的 Ss2022 tc 规则，拒绝模糊清理。"; return 1; }
             if (( handle_count == 1 )); then
-              handle=$(awk 'NF {print; exit}' <<<"$handles")
+              handle=$(awk 'NF {print; exit}' <<<"$handles") || return 1
               [[ "$handle" =~ ^(0x)?[A-Fa-f0-9]+$ ]] || { error "tc filter handle 无效：$handle"; return 1; }
               deletions+=("$interface"$'\t'"$direction"$'\t'"$family"$'\t'"$family_pref"$'\t'"$handle")
               matched_count=$((matched_count + 1))
+              action_key="$kind:$index"
+              observed_bind["$action_key"]=$(( ${observed_bind["$action_key"]:-0} + 1 ))
             fi
           done
-        done < <(jq -c --arg direction "$direction" '.actions[] | select(.direction == $direction)' "$plan_file")
+        done <<<"$direction_action_lines"
         owned_count=$(tc_rule_owned_action_count "$rules" "$actions_json") || return 1
         (( owned_count == matched_count )) || { error "tc 优先级包含使用 Ss2022 action 的未知规则，拒绝删除。"; return 1; }
       done
-    done
-  done < <(jq -r '.interfaces[]?' "$plan_file")
+    done <<<"$family_lines"
+  done <<<"$interface_lines"
+
+  # Prove that every kernel binding of each owned action is one of the exact
+  # handles collected above.  A foreign binding outside our interfaces or
+  # priorities must stop cleanup before the first filter is deleted.
+  while IFS= read -r action; do
+    [[ -n "$action" ]] || continue
+    kind=$(jq -er '.kind' <<<"$action") || return 1
+    index=$(jq -er '.index' <<<"$action") || return 1
+    cookie=$(jq -er '.cookie' <<<"$action") || return 1
+    action_key="$kind:$index"
+    if entry=$(tc_action_lookup "$kind" "$index"); then
+      tc_action_cookie_matches "$entry" "$cookie" || return 1
+      bind=$(tc_action_bind_count_from_json "$entry" "$kind" "$index" "$cookie") || return 1
+      (( bind == ${observed_bind["$action_key"]:-0} )) || {
+        error "tc action $kind/$index 存在计划范围外或竞态新增的绑定，拒绝删除。"
+        return 1
+      }
+    else
+      status=$?
+      (( status == 1 && ${observed_bind["$action_key"]:-0} == 0 )) || return 1
+    fi
+  done <<<"$action_lines"
 
   local deletion
   for deletion in "${deletions[@]}"; do
@@ -462,20 +735,25 @@ bandwidth_remove_plan() {
   done
   while IFS= read -r action; do
     [[ -n "$action" ]] || continue
-    kind=$(jq -er '.kind' <<<"$action")
-    index=$(jq -er '.index' <<<"$action")
-    cookie=$(jq -er '.cookie' <<<"$action")
+    kind=$(jq -er '.kind' <<<"$action") || return 1
+    index=$(jq -er '.index' <<<"$action") || return 1
+    cookie=$(jq -er '.cookie' <<<"$action") || return 1
     tc_delete_owned_action "$kind" "$index" "$cookie" || return 1
-  done < <(jq -c '.actions[]' "$plan_file")
+  done <<<"$action_lines"
 }
 
 delete_manager_tc_filters() {
-  local pref=${1:-$(bandwidth_pref)} nodes_source=${2:-$NODES_FILE} plan_file state
-  plan_file=$(bandwidth_plan_path)
-  if [[ -f "$plan_file" ]]; then
+  local pref=${1:-} nodes_source=${2:-$NODES_FILE} plan_file state
+  [[ -n "$pref" ]] || pref=$(bandwidth_pref) || return 1
+  plan_file=$(bandwidth_plan_path) || return 1
+  if [[ -e "$plan_file" || -L "$plan_file" ]]; then
+    [[ -f "$plan_file" && ! -L "$plan_file" ]] || {
+      error "tc 规则计划不是常规文件或为符号链接：$plan_file。无法证明所有权，拒绝清理。"
+      return 1
+    }
     if jq -e '.schema_version == 2 and (.actions | type == "array")' "$plan_file" >/dev/null 2>&1; then
       bandwidth_remove_plan "$plan_file" || return 1
-      rm -f -- "$plan_file"
+      rm -f -- "$plan_file" || return 1
       return 0
     fi
     if jq -e '.schema_version == 1 and (.pref | type == "number")' "$plan_file" >/dev/null 2>&1; then
@@ -495,158 +773,227 @@ delete_manager_tc_filters() {
       ;;
     *) return 1 ;;
   esac
-  rm -f -- "$plan_file"
+  rm -f -- "$plan_file" || return 1
 }
 
 bandwidth_candidate_cleanup() {
-  local plan_file=$1
-  bandwidth_remove_plan "$plan_file" >/dev/null 2>&1 || warn '候选 tc 规则清理不完整，请通过 rem 查看 tc 状态。'
+  local plan_file=$1 live_plan
+  if bandwidth_remove_plan "$plan_file" >/dev/null 2>&1; then
+    live_plan=$(bandwidth_plan_path) || {
+      warn '候选 tc 规则已清理，但无法确定持久计划路径。'
+      return 1
+    }
+    rm -f -- "$live_plan" || {
+      warn '候选 tc 规则已清理，但持久计划文件删除失败。'
+      return 1
+    }
+  else
+    warn '候选 tc 规则清理不完整；持久计划证据已保留，请通过 rem 查看 tc 状态。'
+    return 1
+  fi
+}
+
+bandwidth_apply_candidate_abort() {
+  local plan_file=$1 actions_file=$2
+  bandwidth_candidate_cleanup "$plan_file" || true
+  rm -f -- "$actions_file" "$actions_file.next" "$plan_file" || true
+  return 0
 }
 
 bandwidth_apply_nodes() {
-  local nodes_source=$1 interfaces_count has_limit=0 node
-  delete_manager_tc_filters "$(bandwidth_pref)" "$NODES_FILE" || return 1
-  interfaces_count=$(traffic_interfaces | awk 'NF {count++} END {print count+0}')
+  local nodes_source=$1 interfaces_count has_limit=0 node node_lines interfaces families
+  local actions_file
+  actions_file=$(runtime_temp_file bandwidth-actions) || return 1
+  validate_nodes_file_semantic "$nodes_source" || { rm -f -- "$actions_file"; return 1; }
+  node_lines=$(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source") || { rm -f -- "$actions_file"; return 1; }
+  interfaces=$(traffic_interfaces) || { rm -f -- "$actions_file"; return 1; }
+  families=$(tc_active_families) || { rm -f -- "$actions_file"; return 1; }
+  interfaces_count=$(awk 'NF {count++} END {print count+0}' <<<"$interfaces") || { rm -f -- "$actions_file"; return 1; }
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
-    if [[ "$(jq -r '.upload_limit_mbps // 0' <<<"$node")" != 0 || "$(jq -r '.download_limit_mbps // 0' <<<"$node")" != 0 ]]; then
+    local node_upload node_download
+    node_upload=$(jq -er '.upload_limit_mbps // 0' <<<"$node") || { rm -f -- "$actions_file"; return 1; }
+    node_download=$(jq -er '.download_limit_mbps // 0' <<<"$node") || { rm -f -- "$actions_file"; return 1; }
+    if [[ "$node_upload" != 0 || "$node_download" != 0 ]]; then
       has_limit=1
       break
     fi
-  done < <(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source")
+  done <<<"$node_lines"
   if (( interfaces_count == 0 )); then
     if (( has_limit == 1 )); then
       error '没有默认路由接口，无法安全应用节点限速。'
+      rm -f -- "$actions_file"
       return 1
     fi
+    local current_pref
+    current_pref=$(bandwidth_pref) || { rm -f -- "$actions_file"; return 1; }
+    delete_manager_tc_filters "$current_pref" "$NODES_FILE" || { rm -f -- "$actions_file"; return 1; }
+    rm -f -- "$actions_file" || return 1
     warn '没有默认路由接口，已保留节点配置；流量统计/限速等待接口配置。'
     return 0
   fi
-
-  local pref ipv6_pref actions_file plan_candidate interfaces_json boot_id
-  pref=$(ensure_bandwidth_pref) || return 1
-  ipv6_pref=$(tc_family_pref "$pref" ipv6) || return 1
-  : "$ipv6_pref"
-  actions_file="$RUNTIME_DIR/bandwidth-actions.$$.json"
-  plan_candidate="$RUNTIME_DIR/bandwidth-plan.$$.json"
   bandwidth_build_actions "$nodes_source" "$actions_file" || { rm -f -- "$actions_file" "$actions_file.next"; return 1; }
-  interfaces_json=$(traffic_interfaces | jq -Rsc 'split("\n") | map(select(length > 0)) | unique') || return 1
-  boot_id=$(kernel_boot_id) || boot_id=unknown
-  jq -n --argjson pref "$pref" --arg boot_id "$boot_id" --arg updated_at "$(timestamp_iso)" --argjson interfaces "$interfaces_json" \
-    --slurpfile actions "$actions_file" \
-    '{schema_version:2,pref:$pref,boot_id:$boot_id,interfaces:$interfaces,actions:$actions[0],updated_at:$updated_at}' >"$plan_candidate" || return 1
+  bandwidth_preflight_actions "$actions_file" || { rm -f -- "$actions_file" "$actions_file.next"; return 1; }
+  local current_pref
+  current_pref=$(bandwidth_pref) || { rm -f -- "$actions_file" "$actions_file.next"; return 1; }
+  delete_manager_tc_filters "$current_pref" "$NODES_FILE" \
+    || { rm -f -- "$actions_file" "$actions_file.next"; return 1; }
 
-  if ! bandwidth_preflight_actions "$actions_file"; then
-    rm -f -- "$actions_file" "$actions_file.next" "$plan_candidate"
+  local pref ipv6_pref plan_candidate interfaces_json families_json boot_id action_lines family_lines
+  local live_plan_path updated_at
+  pref=$(ensure_bandwidth_pref) || { rm -f -- "$actions_file"; return 1; }
+  ipv6_pref=$(tc_family_pref "$pref" ipv6) || { rm -f -- "$actions_file"; return 1; }
+  : "$ipv6_pref"
+  plan_candidate=$(runtime_temp_file bandwidth-plan) || { rm -f -- "$actions_file" "$actions_file.next"; return 1; }
+  interfaces_json=$(printf '%s\n' "$interfaces" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique') \
+    || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+  families_json=$(printf '%s\n' "$families" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique') \
+    || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+  jq -e 'length >= 1 and all(.[]; . == "ip" or . == "ipv6")' >/dev/null <<<"$families_json" \
+    || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+  boot_id=$(kernel_boot_id) || boot_id=unknown
+  updated_at=$(timestamp_iso) || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+  jq -n --argjson pref "$pref" --arg boot_id "$boot_id" --arg updated_at "$updated_at" --argjson interfaces "$interfaces_json" --argjson families "$families_json" \
+    --slurpfile actions "$actions_file" \
+    '{schema_version:2,pref:$pref,boot_id:$boot_id,interfaces:$interfaces,families:$families,actions:$actions[0],updated_at:$updated_at}' >"$plan_candidate" || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+  validate_bandwidth_plan_semantic "$plan_candidate" || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+
+  action_lines=$(jq -c '.[]' "$actions_file") || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+  family_lines=$(jq -r '.families[]' "$plan_candidate") || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+  # Persist ownership evidence before the first kernel mutation.  After a
+  # SIGKILL or power loss, startup recovery can then identify and remove even
+  # a partially-created action/filter set without guessing.
+  live_plan_path=$(bandwidth_plan_path) || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+  atomic_json_write "$plan_candidate" "$live_plan_path" 600 || {
+    rm -f -- "$actions_file" "$plan_candidate"
     return 1
-  fi
+  }
 
   local interface action kind index cookie limit port direction family family_pref protocol
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    ensure_clsact "$interface" || { error "无法在接口 $interface 上准备 clsact。"; rm -f -- "$actions_file" "$plan_candidate"; return 1; }
-  done < <(traffic_interfaces)
+    ensure_clsact "$interface" || {
+      error "无法在接口 $interface 上准备 clsact。"
+      bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"
+      return 1
+    }
+  done <<<"$interfaces"
   while IFS= read -r action; do
     [[ -n "$action" ]] || continue
-    kind=$(jq -er '.kind' <<<"$action")
-    index=$(jq -er '.index' <<<"$action")
-    cookie=$(jq -er '.cookie' <<<"$action")
-    limit=$(jq -er '.limit_mbps' <<<"$action")
+    kind=$(jq -er '.kind' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+    index=$(jq -er '.index' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+    cookie=$(jq -er '.cookie' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+    limit=$(jq -er '.limit_mbps' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
     if ! tc_create_shared_action "$kind" "$index" "$cookie" "$limit"; then
       error "无法创建聚合 tc action：$kind/$index"
-      bandwidth_candidate_cleanup "$plan_candidate"
-      rm -f -- "$actions_file" "$plan_candidate"
+      bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"
       return 1
     fi
-  done < <(jq -c '.[]' "$actions_file")
+  done <<<"$action_lines"
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
     while IFS= read -r action; do
       [[ -n "$action" ]] || continue
-      port=$(jq -er '.port' <<<"$action")
-      direction=$(jq -er '.direction' <<<"$action")
-      kind=$(jq -er '.kind' <<<"$action")
-      index=$(jq -er '.index' <<<"$action")
-      for family in ip ipv6; do
-        family_pref=$(tc_family_pref "$pref" "$family") || return 1
+      port=$(jq -er '.port' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+      direction=$(jq -er '.direction' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+      kind=$(jq -er '.kind' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+      index=$(jq -er '.index' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+      while IFS= read -r family; do
+        [[ -n "$family" ]] || continue
+        family_pref=$(tc_family_pref "$pref" "$family") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
         for protocol in tcp udp; do
           if ! tc_add_flower_rule "$interface" "$direction" "$family" "$protocol" "$port" "$family_pref" "$kind" "$index"; then
             error "tc 规则创建失败：接口 $interface，$direction，$family/$protocol，端口 $port"
-            bandwidth_candidate_cleanup "$plan_candidate"
-            rm -f -- "$actions_file" "$plan_candidate"
+            bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"
             return 1
           fi
         done
-      done
-    done < <(jq -c '.[]' "$actions_file")
-  done < <(traffic_interfaces)
-  atomic_json_write "$plan_candidate" "$(bandwidth_plan_path)" 600 || {
-    bandwidth_candidate_cleanup "$plan_candidate"
-    rm -f -- "$actions_file" "$plan_candidate"
-    return 1
-  }
-  rm -f -- "$actions_file" "$actions_file.next" "$plan_candidate"
+      done <<<"$family_lines"
+    done <<<"$action_lines"
+  done <<<"$interfaces"
+  rm -f -- "$actions_file" "$actions_file.next" "$plan_candidate" \
+    || warn 'tc 规则已经发布，但运行时候选文件清理失败。'
 }
 
 bandwidth_check_nodes() {
-  local nodes_source=$1 interfaces_count has_limit=0 node plan_file expected_actions current_interfaces plan_interfaces
-  interfaces_count=$(traffic_interfaces | awk 'NF {count++} END {print count+0}')
+  local nodes_source=$1 interfaces_count has_limit=0 node plan_file expected_actions node_lines interfaces families action_lines
+  local current_interfaces plan_interfaces current_families plan_families family_count
+  validate_nodes_file_semantic "$nodes_source" || return 1
+  node_lines=$(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source") || return 1
+  interfaces=$(traffic_interfaces) || return 1
+  families=$(tc_active_families) || return 1
+  interfaces_count=$(awk 'NF {count++} END {print count+0}' <<<"$interfaces") || return 1
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
-    if [[ "$(jq -r '.upload_limit_mbps // 0' <<<"$node")" != 0 || "$(jq -r '.download_limit_mbps // 0' <<<"$node")" != 0 ]]; then has_limit=1; break; fi
-  done < <(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source")
+    local node_upload node_download
+    node_upload=$(jq -er '.upload_limit_mbps // 0' <<<"$node") || return 1
+    node_download=$(jq -er '.download_limit_mbps // 0' <<<"$node") || return 1
+    if [[ "$node_upload" != 0 || "$node_download" != 0 ]]; then has_limit=1; break; fi
+  done <<<"$node_lines"
   if (( interfaces_count == 0 )); then (( has_limit == 0 )); return; fi
-  plan_file=$(bandwidth_plan_path)
+  plan_file=$(bandwidth_plan_path) || return 1
   bandwidth_plan_matches_current_boot || return 1
-  expected_actions="$RUNTIME_DIR/bandwidth-check-actions.$$.json"
+  expected_actions=$(runtime_temp_file bandwidth-check-actions) || return 1
   bandwidth_build_actions "$nodes_source" "$expected_actions" || { rm -f -- "$expected_actions"; return 1; }
   jq -e --slurpfile expected "$expected_actions" '(.actions | sort_by(.node_id,.direction)) == ($expected[0] | sort_by(.node_id,.direction))' "$plan_file" >/dev/null || {
     rm -f -- "$expected_actions"
     return 1
   }
-  current_interfaces=$(traffic_interfaces | jq -Rsc 'split("\n") | map(select(length > 0)) | unique | sort') || return 1
-  plan_interfaces=$(jq -c '.interfaces | unique | sort' "$plan_file") || return 1
+  current_interfaces=$(printf '%s\n' "$interfaces" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique | sort') \
+    || { rm -f -- "$expected_actions"; return 1; }
+  plan_interfaces=$(jq -c '.interfaces | unique | sort' "$plan_file") \
+    || { rm -f -- "$expected_actions"; return 1; }
   [[ "$current_interfaces" == "$plan_interfaces" ]] || { rm -f -- "$expected_actions"; return 1; }
+  current_families=$(printf '%s\n' "$families" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique | sort') || { rm -f -- "$expected_actions"; return 1; }
+  plan_families=$(jq -c '(.families // ["ip","ipv6"]) | unique | sort' "$plan_file") || { rm -f -- "$expected_actions"; return 1; }
+  [[ "$current_families" == "$plan_families" ]] || { rm -f -- "$expected_actions"; return 1; }
+  family_count=$(jq -r 'length' <<<"$plan_families") || { rm -f -- "$expected_actions"; return 1; }
+  (( family_count >= 1 )) || { rm -f -- "$expected_actions"; return 1; }
 
-  local action kind index cookie entry status expected_bind bind
-  expected_bind=$((interfaces_count * 4))
+  local action kind index cookie entry expected_bind bind
+  expected_bind=$((interfaces_count * family_count * 2))
+  action_lines=$(jq -c '.[]' "$expected_actions") || { rm -f -- "$expected_actions"; return 1; }
   while IFS= read -r action; do
     [[ -n "$action" ]] || continue
-    kind=$(jq -er '.kind' <<<"$action")
-    index=$(jq -er '.index' <<<"$action")
-    cookie=$(jq -er '.cookie' <<<"$action")
+    kind=$(jq -er '.kind' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
+    index=$(jq -er '.index' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
+    cookie=$(jq -er '.cookie' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
     if ! entry=$(tc_action_lookup "$kind" "$index"); then rm -f -- "$expected_actions"; return 1; fi
     tc_action_cookie_matches "$entry" "$cookie" || { rm -f -- "$expected_actions"; return 1; }
-    bind=$(jq -er '(.bind | tonumber?) // error("missing bind count")' <<<"$entry") || { rm -f -- "$expected_actions"; return 1; }
+    bind=$(tc_action_bind_count_from_json "$entry" "$kind" "$index" "$cookie") || { rm -f -- "$expected_actions"; return 1; }
     (( bind == expected_bind )) || { rm -f -- "$expected_actions"; return 1; }
-  done < <(jq -c '.[]' "$expected_actions")
+  done <<<"$action_lines"
 
   local pref interface family family_pref direction rules actions_json owned_count expected_owned port protocol match_count
-  pref=$(jq -er '.pref' "$plan_file")
+  local plan_family_lines direction_action_lines
+  pref=$(jq -er '.pref' "$plan_file") || { rm -f -- "$expected_actions"; return 1; }
+  plan_family_lines=$(jq -r '.[]' <<<"$plan_families") || { rm -f -- "$expected_actions"; return 1; }
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    for family in ip ipv6; do
-      family_pref=$(tc_family_pref "$pref" "$family") || return 1
+    while IFS= read -r family; do
+      [[ -n "$family" ]] || continue
+      family_pref=$(tc_family_pref "$pref" "$family") || { rm -f -- "$expected_actions"; return 1; }
       for direction in ingress egress; do
         rules=$(tc_filter_scoped_json "$interface" "$direction" "$family" "$family_pref") || { rm -f -- "$expected_actions"; return 1; }
-        actions_json=$(jq -c --arg direction "$direction" '[.[] | select(.direction == $direction)]' "$expected_actions") || return 1
-        expected_owned=$(jq -r 'length * 2' <<<"$actions_json")
-        owned_count=$(tc_rule_owned_action_count "$rules" "$actions_json") || return 1
+        actions_json=$(jq -c --arg direction "$direction" '[.[] | select(.direction == $direction)]' "$expected_actions") || { rm -f -- "$expected_actions"; return 1; }
+        direction_action_lines=$(jq -c '.[]' <<<"$actions_json") || { rm -f -- "$expected_actions"; return 1; }
+        expected_owned=$(jq -r 'length * 2' <<<"$actions_json") || { rm -f -- "$expected_actions"; return 1; }
+        owned_count=$(tc_rule_owned_action_count "$rules" "$actions_json") || { rm -f -- "$expected_actions"; return 1; }
         [[ "$owned_count" == "$expected_owned" ]] || { rm -f -- "$expected_actions"; return 1; }
         while IFS= read -r action; do
           [[ -n "$action" ]] || continue
-          port=$(jq -er '.port' <<<"$action")
-          kind=$(jq -er '.kind' <<<"$action")
-          index=$(jq -er '.index' <<<"$action")
+          port=$(jq -er '.port' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
+          kind=$(jq -er '.kind' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
+          index=$(jq -er '.index' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
           for protocol in tcp udp; do
-            match_count=$(tc_rule_json_match_count "$rules" "$family_pref" "$family" "$protocol" "$direction" "$port" "$kind" "$index") || return 1
+            match_count=$(tc_rule_json_match_count "$rules" "$family_pref" "$family" "$protocol" "$direction" "$port" "$kind" "$index") || { rm -f -- "$expected_actions"; return 1; }
             [[ "$match_count" == 1 ]] || { rm -f -- "$expected_actions"; return 1; }
           done
-        done < <(jq -c '.[]' <<<"$actions_json")
+        done <<<"$direction_action_lines"
       done
-    done
-  done < <(traffic_interfaces)
-  rm -f -- "$expected_actions" "$expected_actions.next"
+    done <<<"$plan_family_lines"
+  done <<<"$interfaces"
+  rm -f -- "$expected_actions" "$expected_actions.next" || return 1
 }
 
 bandwidth_apply_and_check() {
@@ -656,10 +1003,14 @@ bandwidth_apply_and_check() {
 }
 
 bandwidth_status() {
-  local pref interface ipv6_pref plan_file action kind index
-  pref=$(bandwidth_pref)
+  local pref interface ipv6_pref plan_file action kind index interfaces action_lines
+  pref=$(bandwidth_pref) || return 1
   ipv6_pref=$(tc_family_pref "$pref" ipv6 2>/dev/null || printf '%s' "$pref")
   printf 'tc 管理优先级：IPv4 %s，IPv6 %s\n' "$pref" "$ipv6_pref"
+  interfaces=$(traffic_interfaces) || {
+    error '无法读取流量接口状态。'
+    return 1
+  }
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
     printf '\n接口：%s\n' "$interface"
@@ -667,39 +1018,68 @@ bandwidth_status() {
     tc -s filter show dev "$interface" egress protocol ip pref "$pref" 2>/dev/null || true
     tc -s filter show dev "$interface" ingress protocol ipv6 pref "$ipv6_pref" 2>/dev/null || true
     tc -s filter show dev "$interface" egress protocol ipv6 pref "$ipv6_pref" 2>/dev/null || true
-  done < <(traffic_interfaces)
-  plan_file=$(bandwidth_plan_path)
-  if [[ -f "$plan_file" ]]; then
+  done <<<"$interfaces"
+  plan_file=$(bandwidth_plan_path) || return 1
+  if [[ -e "$plan_file" || -L "$plan_file" ]]; then
+    [[ -f "$plan_file" && ! -L "$plan_file" ]] || {
+      error 'tc 计划不是常规文件或为符号链接，拒绝展示不可信内容。'
+      return 1
+    }
+    action_lines=$(jq -c '.actions[]?' "$plan_file") || return 1
     printf '\n聚合 action：\n'
     while IFS= read -r action; do
-      kind=$(jq -er '.kind' <<<"$action")
-      index=$(jq -er '.index' <<<"$action")
+      [[ -n "$action" ]] || continue
+      kind=$(jq -er '.kind' <<<"$action") || return 1
+      index=$(jq -er '.index' <<<"$action") || return 1
       tc -s actions get action "$kind" index "$index" 2>/dev/null || true
-    done < <(jq -c '.actions[]?' "$plan_file")
+    done <<<"$action_lines"
   fi
 }
 
 bandwidth_remove_manager_clsact() {
-  local interfaces interface ingress egress remaining='[]'
-  interfaces=$(jq -c '.tc_clsact_interfaces // [] | if type == "array" then . else [] end' "$MANAGER_STATE" 2>/dev/null || printf '[]')
+  local interfaces interface ingress egress remaining='[]' query_ok interface_lines interface_status
+  interfaces=$(jq -ce '.tc_clsact_interfaces // [] | if type == "array" then . else error("invalid clsact interface state") end' "$MANAGER_STATE" 2>/dev/null) || {
+    error '无法读取本项目创建的 clsact 接口记录，拒绝删除任何 clsact。'
+    return 1
+  }
+  interface_lines=$(jq -r '.[]' <<<"$interfaces") || return 1
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
-    tc_interface_exists "$interface" || continue
-    ingress=$(tc -j filter show dev "$interface" ingress 2>/dev/null || printf '[]')
-    egress=$(tc -j filter show dev "$interface" egress 2>/dev/null || printf '[]')
-    if jq -e 'type == "array" and length == 0' >/dev/null <<<"$ingress" \
-      && jq -e 'type == "array" and length == 0' >/dev/null <<<"$egress"; then
-      tc qdisc del dev "$interface" clsact >/dev/null 2>&1 || true
+    interface_status=0
+    tc_interface_exists "$interface" || interface_status=$?
+    if (( interface_status == 1 )); then
+      continue
+    elif (( interface_status == 2 )); then
+      warn "无法可靠查询接口 $interface 是否存在，已保留其 clsact 所有权记录。"
+      remaining=$(jq -nc --argjson current "$remaining" --arg interface "$interface" '$current + [$interface] | unique') || return 1
+      continue
+    fi
+    query_ok=1
+    ingress=$(tc -j filter show dev "$interface" ingress 2>/dev/null) || query_ok=0
+    egress=$(tc -j filter show dev "$interface" egress 2>/dev/null) || query_ok=0
+    if (( query_ok == 0 )) || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$ingress" \
+      || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$egress"; then
+      warn "无法可靠查询接口 $interface 的全部 clsact 过滤器，已保留该 qdisc。"
+      remaining=$(jq -nc --argjson current "$remaining" --arg interface "$interface" '$current + [$interface] | unique') || return 1
+    elif jq -e 'length == 0' >/dev/null <<<"$ingress" \
+      && jq -e 'length == 0' >/dev/null <<<"$egress"; then
+      if ! tc qdisc del dev "$interface" clsact >/dev/null 2>&1; then
+        warn "接口 $interface 的空 clsact 删除失败，已保留所有权记录。"
+        remaining=$(jq -nc --argjson current "$remaining" --arg interface "$interface" '$current + [$interface] | unique') || return 1
+      fi
     else
       warn "接口 $interface 的 clsact 仍有其他规则，已保留。"
-      remaining=$(jq -nc --argjson current "$remaining" --arg interface "$interface" '$current + [$interface] | unique')
+      remaining=$(jq -nc --argjson current "$remaining" --arg interface "$interface" '$current + [$interface] | unique') || return 1
     fi
-  done < <(jq -r '.[]' <<<"$interfaces")
-  [[ -f "$MANAGER_STATE" ]] && manager_state_set_json tc_clsact_interfaces "$remaining" >/dev/null 2>&1 || true
+  done <<<"$interface_lines"
+  manager_state_set_json tc_clsact_interfaces "$remaining" >/dev/null || return 1
 }
 
 bandwidth_remove_manager_rules() {
-  delete_manager_tc_filters "$(bandwidth_pref)" "$NODES_FILE" || return 1
-  bandwidth_remove_manager_clsact
-  rm -f -- "$(bandwidth_plan_path)"
+  local pref plan_file
+  pref=$(bandwidth_pref) || return 1
+  delete_manager_tc_filters "$pref" "$NODES_FILE" || return 1
+  bandwidth_remove_manager_clsact || return 1
+  plan_file=$(bandwidth_plan_path) || return 1
+  rm -f -- "$plan_file" || return 1
 }

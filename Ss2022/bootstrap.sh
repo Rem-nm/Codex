@@ -28,6 +28,18 @@ case "$arch" in
   *) fail "不支持的 CPU 架构：$arch。仅支持 amd64 与 arm64。" ;;
 esac
 
+# Validate immutable inputs before even the Alpine bootstrap dependency step.
+commit=${SS_MANAGER_COMMIT:-}
+archive_sha256=${SS_MANAGER_ARCHIVE_SHA256:-}
+case "$commit" in
+  *[!0-9A-Fa-f]*|'') fail '必须设置 40 位 SS_MANAGER_COMMIT；拒绝以 root 跟随可变分支。' ;;
+esac
+[ "${#commit}" -eq 40 ] || fail 'SS_MANAGER_COMMIT 必须是完整的 40 位 Git 提交 SHA。'
+case "$archive_sha256" in
+  *[!0-9A-Fa-f]*|'') fail '必须设置 64 位 SS_MANAGER_ARCHIVE_SHA256。' ;;
+esac
+[ "${#archive_sha256}" -eq 64 ] || fail 'SS_MANAGER_ARCHIVE_SHA256 必须是 64 位 SHA256。'
+
 if [ "${ID:-}" = alpine ]; then
   # A minimal Alpine image normally has BusyBox wget but not Bash/curl/tar.
   apk add --no-cache bash ca-certificates curl tar >/dev/null \
@@ -36,24 +48,22 @@ fi
 
 command -v bash >/dev/null 2>&1 || fail '系统缺少 Bash。'
 command -v tar >/dev/null 2>&1 || fail '系统缺少 tar。'
-
-ref=${SS_MANAGER_REF:-codex/ss2022-manager}
-case "$ref" in
-  ''|/*|*..*|*[!A-Za-z0-9._/-]*) fail 'SS_MANAGER_REF 包含不安全字符。' ;;
-esac
+command -v sha256sum >/dev/null 2>&1 || fail '系统缺少 sha256sum。'
 
 tmp_dir=$(mktemp -d) || fail '无法创建临时目录。'
 archive="$tmp_dir/Codex.tar.gz"
 archive_list="$tmp_dir/archive.list"
 cleanup() {
-  [ -n "${tmp_dir:-}" ] && [ "$tmp_dir" != / ] && rm -rf -- "$tmp_dir"
+  if [ -n "${tmp_dir:-}" ] && [ "$tmp_dir" != / ]; then
+    rm -rf -- "$tmp_dir" || true
+  fi
 }
 trap cleanup 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-archive_url="https://github.com/Rem-nm/Codex/archive/refs/heads/$ref.tar.gz"
+archive_url="https://github.com/Rem-nm/Codex/archive/$commit.tar.gz"
 if command -v curl >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
     --max-time 120 --output "$archive" -- "$archive_url" \
@@ -65,11 +75,19 @@ else
   fail '系统缺少 curl 或 wget。'
 fi
 
+actual_sha256=$(sha256sum "$archive" | awk '{print $1}') \
+  || fail '无法计算项目归档 SHA256。'
+[ "$(printf '%s' "$actual_sha256" | tr 'A-F' 'a-f')" = "$(printf '%s' "$archive_sha256" | tr 'A-F' 'a-f')" ] \
+  || fail '项目归档 SHA256 不匹配；拒绝执行任何项目脚本。'
+
 tar -tzf "$archive" >"$archive_list" || fail '项目归档无法读取。'
 if ! awk '/^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' "$archive_list"; then
   fail '项目归档包含不安全路径，已停止解压。'
 fi
-tar -xzf "$archive" -C "$tmp_dir" --strip-components=1
+if tar -tvzf "$archive" | awk 'substr($1,1,1) != "-" && substr($1,1,1) != "d" {bad=1} END {exit bad}'; then :; else
+  fail '项目归档包含链接、设备或其他非普通条目，已停止解压。'
+fi
+tar -xzf "$archive" -C "$tmp_dir" --strip-components=1 --no-same-owner --no-same-permissions
 
 [ -f "$tmp_dir/Ss2022/install.sh" ] || fail '项目归档缺少 Ss2022/install.sh。'
 [ -f "$tmp_dir/Ss2022/lib/common.sh" ] || fail '项目归档缺少必要模块。'

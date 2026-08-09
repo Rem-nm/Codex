@@ -9,4 +9,5 @@ Type=oneshot
 ExecStart=/opt/ss-manager/ss-manager.sh --maintenance
 User=root
 Group=root
-NoNewPrivileges=false
+UMask=0077
+NoNewPrivileges=true

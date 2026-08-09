@@ -5,7 +5,6 @@ Description=Run Ss2022 traffic accounting every minute
 # Managed by Ss2022
 OnBootSec=1min
 OnUnitActiveSec=60s
-Persistent=true
 Unit=ss-manager-traffic.service
 
 [Install]

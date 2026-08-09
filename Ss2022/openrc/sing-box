@@ -1,4 +1,5 @@
 #!/sbin/openrc-run
+# shellcheck shell=sh
 # Managed by Ss2022
 # shellcheck disable=SC2034
 

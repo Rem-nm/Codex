@@ -8,6 +8,7 @@ Wants=network-online.target
 # Managed by Ss2022
 Type=simple
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+UMask=0077
 Restart=on-failure
 RestartSec=2s
 LimitNOFILE=1048576

@@ -25,16 +25,53 @@ assert_equal '/etc/systemd/system/sing-box.service' "$(service_definition_path s
 assert_equal 'ss-manager-traffic.timer' "$(service_systemd_unit_name ss-manager-traffic.timer)" 'systemd timer suffix must be preserved'
 captured_service_call=''
 systemctl() { captured_service_call=$(printf '%s ' "$@"); }
+# Later test stubs intentionally replace the sourced service_start function.
+# shellcheck disable=SC2218
 service_start sing-box
 assert_equal 'start sing-box.service ' "$captured_service_call" 'systemd start command'
 service_enable ss-manager-traffic.timer
 assert_equal 'enable ss-manager-traffic.timer ' "$captured_service_call" 'systemd timer enable command'
+
+# systemd queries are tri-state: a confirmed absence/inactive state is 1,
+# while an empty response caused by a broken manager/DBus connection is 2.
+systemctl() {
+  [[ "${1:-}" == show && "${2:-}" == --property=LoadState && "${3:-}" == sing-box.service && $# == 3 ]] || return 64
+  printf 'LoadState=loaded\n'
+}
+service_exists sing-box || {
+  printf 'assertion failed: loaded systemd service was not detected\n' >&2
+  exit 1
+}
+systemctl() { [[ "$1" == show ]] && printf 'LoadState=not-found\n'; return 1; }
+service_presence_status=0
+service_exists sing-box || service_presence_status=$?
+assert_equal 1 "$service_presence_status" 'systemd not-found must prove absence'
+systemctl() {
+  case "$1" in
+    is-active) printf 'unknown\n'; return 3 ;;
+    show) printf 'LoadState=loaded\n' ;;
+  esac
+}
+service_active_status=0
+service_is_active sing-box || service_active_status=$?
+assert_equal 2 "$service_active_status" 'unknown active state for a loaded unit must stay unknown'
+systemctl() { return 1; }
+service_presence_status=0
+service_exists sing-box || service_presence_status=$?
+assert_equal 2 "$service_presence_status" 'empty failed systemd presence query must stay unknown'
+service_enabled_status=0
+service_is_enabled sing-box || service_enabled_status=$?
+assert_equal 2 "$service_enabled_status" 'empty failed systemd enablement query must stay unknown'
+service_active_status=0
+service_is_active sing-box || service_active_status=$?
+assert_equal 2 "$service_active_status" 'empty failed systemd active query must stay unknown'
 
 INIT_SYSTEM=openrc
 assert_equal '/etc/init.d/sing-box' "$(service_definition_path sing-box.service)" 'OpenRC must strip the systemd suffix'
 assert_equal 'ss-manager-traffic' "$(service_openrc_name ss-manager-traffic.timer)" 'OpenRC maintenance service name'
 rc-service() { captured_service_call=$(printf '%s ' "$@"); }
 rc-update() { captured_service_call=$(printf '%s ' "$@"); }
+# shellcheck disable=SC2218
 service_start sing-box.service
 assert_equal 'sing-box start ' "$captured_service_call" 'OpenRC start command'
 service_enable ss-manager-traffic
@@ -73,6 +110,7 @@ grep -q -- '--output "$archive" -- "$asset_url"' "$ROOT/lib/update.sh"
 grep -q -- '--output "$archive" -- "$archive_url"' "$ROOT/bootstrap.sh"
 grep -q '^trap cleanup 0$' "$ROOT/bootstrap.sh"
 
-assert_equal 2 "$(grep -c 'install -m "$install_service_mode"' "$ROOT/install.sh")" 'OpenRC service backup and restore must preserve executable mode'
+grep -q 'cp -a -- "$path" "$preparing/$name.present"' "$ROOT/lib/backup.sh"
+grep -q 'cp -a -- "$present" "$path"' "$ROOT/lib/backup.sh"
 
 printf 'platform support tests passed\n'

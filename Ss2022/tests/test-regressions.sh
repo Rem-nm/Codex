@@ -6,6 +6,10 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT/lib/common.sh"
 # shellcheck disable=SC1091
+source "$ROOT/lib/system.sh"
+# shellcheck disable=SC1091
+source "$ROOT/lib/singbox.sh"
+# shellcheck disable=SC1091
 source "$ROOT/lib/traffic.sh"
 # shellcheck disable=SC1091
 source "$ROOT/lib/bandwidth.sh"
@@ -37,6 +41,14 @@ assert_true() {
   "$@" || { printf 'assertion failed: %s\n' "$message" >&2; exit 1; }
 }
 
+(
+  MANAGER_STATE=$(mktemp)
+  printf '%s\n' '{}' >"$MANAGER_STATE"
+  assert_equal '' "$(manager_state_get missing '')" 'an explicit empty manager-state fallback must remain empty'
+  assert_equal 'null' "$(manager_state_get missing)" 'an omitted manager-state fallback must remain JSON null text'
+  rm -f -- "$MANAGER_STATE"
+)
+
 node=$(jq -nc '{node_id:"0123456789abcdef0123456789abcdef",name:"Tokyo HK",method:"2022-blake3-aes-256-gcm",password:"AB+/==",port:20001,address:"2001:db8::1",address_type:"ipv6",status:"enabled"}')
 uri=$(node_sip002_uri "$node")
 assert_equal 'ss://2022-blake3-aes-256-gcm:AB%2B%2F%3D%3D@[2001:db8::1]:20001#Tokyo%20HK' "$uri" 'AEAD-2022 SIP002 userinfo must be percent-encoded, not Base64URL encoded'
@@ -44,6 +56,67 @@ assert_equal 'ss://2022-blake3-aes-256-gcm:AB%2B%2F%3D%3D@[2001:db8::1]:20001#To
 base64_node=$(node_base64_uri "$node")
 decoded_uri=$(printf '%s' "$base64_node" | base64 -d)
 assert_equal "$uri" "$decoded_uri" 'Base64 node information must decode to the canonical SIP002 URI'
+
+single_asset_release=$(jq -nc '{assets:[{name:"package.tar.gz",browser_download_url:"https://github.com/example/project/releases/download/v1/package.tar.gz",digest:"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}')
+assert_equal 'https://github.com/example/project/releases/download/v1/package.tar.gz' "$(release_asset_url "$single_asset_release" package.tar.gz)" 'release asset lookup must accept exactly one matching asset'
+duplicate_asset_release=$(jq -c '.assets += [.assets[0]]' <<<"$single_asset_release")
+if release_asset_url "$duplicate_asset_release" package.tar.gz >/dev/null 2>&1; then
+  printf 'assertion failed: release asset lookup must reject duplicate names\n' >&2
+  exit 1
+fi
+checksum_release=$(jq -nc '{assets:[{name:"SHA256SUMS"},{name:"package.tar.gz"}]}')
+assert_equal 'SHA256SUMS' "$(release_checksum_asset_name "$checksum_release")" 'checksum fallback must require one unambiguous checksum asset'
+ambiguous_checksum_release=$(jq -c '.assets += [{name:"checksums.txt"}]' <<<"$checksum_release")
+if release_checksum_asset_name "$ambiguous_checksum_release" >/dev/null 2>&1; then
+  printf 'assertion failed: ambiguous checksum assets must be rejected\n' >&2
+  exit 1
+fi
+checksum_fixture=$(mktemp)
+printf '%s  %s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'package.tar.gz' >"$checksum_fixture"
+assert_equal 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "$(checksum_file_digest_for_asset "$checksum_fixture" package.tar.gz)" 'one exact checksum entry must be accepted'
+printf '%s  %s\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' 'package.tar.gz' >>"$checksum_fixture"
+if checksum_file_digest_for_asset "$checksum_fixture" package.tar.gz >/dev/null 2>&1; then
+  printf 'assertion failed: duplicate checksum entries must be rejected\n' >&2
+  exit 1
+fi
+rm -f -- "$checksum_fixture"
+
+manager_package_fixture=$(mktemp -d)
+for required_file in \
+  ss-manager.sh VERSION config/defaults.conf \
+  lib/common.sh lib/system.sh lib/service.sh lib/singbox.sh lib/traffic.sh \
+  lib/bandwidth.sh lib/backup.sh lib/nodes.sh lib/links.sh lib/update.sh lib/menu.sh \
+  systemd/sing-box.service systemd/ss-manager-traffic.service systemd/ss-manager-traffic.timer \
+  openrc/sing-box openrc/ss-manager-traffic openrc/ss-manager-traffic-loop.sh; do
+  mkdir -p -- "$manager_package_fixture/$(dirname -- "$required_file")"
+  : >"$manager_package_fixture/$required_file"
+done
+assert_true 'a complete manager runtime package must pass structure validation' manager_update_validate_package_structure "$manager_package_fixture"
+rm -f -- "$manager_package_fixture/lib/menu.sh"
+if manager_update_validate_package_structure "$manager_package_fixture" >/dev/null 2>&1; then
+  printf 'assertion failed: a manager package missing a runtime module must be rejected\n' >&2
+  exit 1
+fi
+rm -rf -- "$manager_package_fixture"
+
+(
+  binary_identity_fixture=$(mktemp -d)
+  SING_BOX_BINARY="$binary_identity_fixture/sing-box"
+  MANAGER_STATE="$binary_identity_fixture/manager.json"
+  printf '%s\n' '#!/bin/sh' "printf 'sing-box version 1.2.3\\n'" >"$SING_BOX_BINARY"
+  chmod 755 -- "$SING_BOX_BINARY"
+  binary_digest=$(singbox_binary_digest)
+  jq -n '{sing_box_binary_managed:true,sing_box_version:"1.2.3"}' >"$MANAGER_STATE"
+  assert_true 'legacy managed binary state must migrate after its version is verified' ensure_managed_singbox_binary_identity
+  assert_equal "$binary_digest" "$(jq -r '.sing_box_binary_sha256' "$MANAGER_STATE")" 'binary identity migration stored the wrong digest'
+  assert_true 'matching sing-box version and digest must prove managed binary identity' validate_managed_singbox_binary_identity
+  printf '%s\n' '# externally replaced content' >>"$SING_BOX_BINARY"
+  if validate_managed_singbox_binary_identity >/dev/null 2>&1; then
+    printf 'assertion failed: same-version sing-box content replacement must fail identity validation\n' >&2
+    exit 1
+  fi
+  rm -rf -- "$binary_identity_fixture"
+)
 
 assert_equal '2026-07' "$(settlement_period_label '2026-08-01T00:00:00Z')" 'a reset on day 1 must label the month whose traffic just closed'
 assert_equal '2026-08' "$(settlement_period_label '2026-08-15T00:00:00Z')" 'an initial partial reset-day cycle must keep its closing month'
@@ -97,7 +170,7 @@ captured_tc=$(
   tc() { printf '%q ' "$@"; }
   tc_add_flower_rule eth0 ingress ip tcp 20001 49123 gact 1000000001
 )
-[[ "$captured_tc" == *'pref 49123 protocol ip flower ip_proto tcp dst_port 20001 action gact index 1000000001'* ]] || {
+[[ "$captured_tc" == *'pref 49123 protocol ip flower skip_hw ip_proto tcp dst_port 20001 action gact index 1000000001'* ]] || {
   printf 'assertion failed: flower rule must bind the owned shared action by index\n' >&2
   exit 1
 }
@@ -150,9 +223,10 @@ if grep -q '\$(node_count)' "$ROOT/install.sh"; then
   printf 'assertion failed: install.sh still calls an unloaded node_count function\n' >&2
   exit 1
 fi
-grep -q '"$SCRIPT_DIR/VERSION" "$PROGRAM_DIR/VERSION"' "$ROOT/install.sh"
+grep -q '"$SCRIPT_DIR/VERSION" "$target/VERSION"' "$ROOT/install.sh"
 grep -q 'source "$SCRIPT_DIR/lib/service.sh"' "$ROOT/install.sh"
 grep -q 'manager_state_set_json install_completed true' "$ROOT/ss-manager.sh"
+grep -q '已补齐首节点提交后中断的流量维护服务启用步骤' "$ROOT/ss-manager.sh"
 grep -q 'enable_manager_maintenance_service' "$ROOT/install.sh"
 grep -q 'candidate_dir=$(dirname -- "$SING_BOX_BINARY")' "$ROOT/lib/singbox.sh"
 if grep -q 'local candidate="$RUNTIME_DIR/sing-box-${version}-${HOST_ARCH}.candidate"' "$ROOT/lib/singbox.sh"; then
@@ -172,7 +246,7 @@ trap 'rm -rf -- "$test_tmp"' EXIT
 
 owned_plan="$test_tmp/bandwidth-plan.json"
 owned_delete_log="$test_tmp/owned-delete.log"
-jq -n '{schema_version:2,pref:49123,boot_id:"test",interfaces:["eth0"],actions:[{node_id:"0123456789abcdef0123456789abcdef",direction:"ingress",port:20001,kind:"gact",index:1000000001,cookie:"0123456789abcdef0123456789abcdef",limit_mbps:0}]}' >"$owned_plan"
+jq -n '{schema_version:2,pref:49123,boot_id:"00000000-0000-0000-0000-000000000001",interfaces:["eth0"],updated_at:"2026-01-01T00:00:00Z",actions:[{node_id:"0123456789abcdef0123456789abcdef",direction:"ingress",port:20001,kind:"gact",index:1000000001,cookie:"0123456789abcdef0123456789abcdef",limit_mbps:0}]}' >"$owned_plan"
 (
   tc_action_lookup() {
     jq -nc '{kind:"gact",index:1000000001,cookie:"0123456789abcdef0123456789abcdef",bind:4,stats:{bytes:0}}'
@@ -227,14 +301,29 @@ fi
 [[ -f "$corrupt_plan" ]] || { printf 'assertion failed: corrupt ownership evidence must be preserved for recovery\n' >&2; exit 1; }
 
 NODES_FILE="$test_tmp/live-nodes.json"
+TRAFFIC_FILE="$test_tmp/live-traffic.json"
 live_node=$(jq -nc '{node_id:"0123456789abcdef0123456789abcdef",name:"Tokyo",method:"2022-blake3-aes-256-gcm",password:"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",port:20001,address:"192.0.2.1",address_type:"ipv4",status:"enabled",status_reason:"",quota_bytes:0,reset_day:1,upload_limit_mbps:0,download_limit_mbps:0,created_at:"2026-01-01T00:00:00Z",updated_at:"2026-01-01T00:00:00Z",last_reset_at:"2026-01-01T00:00:00Z",next_reset_at:"2026-02-01T00:00:00Z"}')
 jq -n --argjson node "$live_node" '{schema_version:1,nodes:[$node]}' >"$NODES_FILE"
+jq -n '{schema_version:1,nodes:{"0123456789abcdef0123456789abcdef":{current_upload_bytes:0,current_download_bytes:0,total_upload_bytes:0,total_download_bytes:0}}}' >"$TRAFFIC_FILE"
 captured_name=$(printf 'ss\n' | read_nonempty '请输入节点名称' 2>"$test_tmp/name-prompt.log")
 assert_equal 'ss' "$captured_name" 'interactive name prompts must not contaminate command-substitution results'
 captured_method=$(printf '2\n' | choose_method 2>"$test_tmp/method-prompt.log")
 assert_equal '2022-blake3-aes-256-gcm' "$captured_method" 'interactive method prompts must not contaminate command-substitution results'
 selected_id=$(printf '1\n' | select_node_id '请选择节点' 2>"$test_tmp/select-prompt.log")
 assert_equal '0123456789abcdef0123456789abcdef' "$selected_id" 'node selection must return only the selected Node ID'
+cp -- "$NODES_FILE" "$NODES_FILE.valid"
+printf '{invalid\n' >"$NODES_FILE"
+selection_status=0
+select_node_id '请选择节点' >/dev/null 2>&1 || selection_status=$?
+assert_equal 2 "$selection_status" 'node selection must distinguish a database error from user cancellation'
+port_status=0
+port_available 20002 >/dev/null 2>&1 || port_status=$?
+assert_equal 2 "$port_status" 'port selection must fail closed when the node database cannot be queried'
+if unique_node_name Tokyo >/dev/null 2>&1; then
+  printf 'assertion failed: unique-name generation must not treat a database error as an available name\n' >&2
+  exit 1
+fi
+mv -f -- "$NODES_FILE.valid" "$NODES_FILE"
 saved_port_available=$(declare -f port_available)
 port_available() { return 0; }
 captured_port=$(printf '20002\n' | choose_port 2>"$test_tmp/port-prompt.log")
@@ -247,6 +336,8 @@ changed_port_candidate="$test_tmp/changed-port.json"
 jq . "$NODES_FILE" >"$same_port_candidate"
 jq '.nodes[0].port=20002' "$NODES_FILE" >"$changed_port_candidate"
 system_port_in_use() { return 0; }
+singbox_is_active() { return 0; }
+singbox_owns_node_port() { return 0; }
 assert_true 'the running node may retain its own occupied port' validate_candidate_nodes "$same_port_candidate"
 assert_true 'the running node may select its unchanged occupied port' port_available 20001 0123456789abcdef0123456789abcdef
 if (validate_candidate_nodes "$changed_port_candidate" >/dev/null 2>&1); then
@@ -275,7 +366,10 @@ install -m 600 -- "$same_port_candidate" "$NODES_FILE"
 traffic_case="$test_tmp/traffic-atomic"
 mkdir -p -- "$traffic_case/runtime"
 install -m 600 -- "$NODES_FILE" "$traffic_case/nodes.json"
-jq -n '{schema_version:1,nodes:{"0123456789abcdef0123456789abcdef":{current_upload_bytes:10,current_download_bytes:20,total_upload_bytes:100,total_download_bytes:200,upload_kernel_bytes:100,download_kernel_bytes:200}}}' >"$traffic_case/traffic.json"
+jq -n '{schema_version:1,nodes:{"0123456789abcdef0123456789abcdef":{
+  current_upload_bytes:10,current_download_bytes:20,total_upload_bytes:100,total_download_bytes:200,
+  upload_kernel_bytes:100,download_kernel_bytes:200,quota_bytes:0,reset_day:1,
+  last_reset_at:"2026-01-01T00:00:00Z",next_reset_at:"2026-02-01T00:00:00Z",updated_at:"2026-01-01T00:00:00Z"}}}' >"$traffic_case/traffic.json"
 install -m 600 -- "$traffic_case/traffic.json" "$traffic_case/traffic.before.json"
 (
   RUNTIME_DIR="$traffic_case/runtime"
@@ -316,6 +410,8 @@ baseline_live="$traffic_case/baseline-live.json"
 baseline_candidate="$traffic_case/baseline-candidate.json"
 install -m 600 -- "$traffic_case/traffic.json" "$baseline_live"
 install -m 600 -- "$traffic_case/traffic.json" "$baseline_candidate"
+# A later stub deliberately replaces this sourced function for a separate test.
+# shellcheck disable=SC2218
 RUNTIME_DIR="$traffic_case/runtime" traffic_reset_kernel_baselines "$NODES_FILE" "$baseline_candidate"
 assert_equal 150 "$(jq -r '.nodes["0123456789abcdef0123456789abcdef"].upload_kernel_bytes' "$baseline_live")" 'resetting a transaction candidate must not mutate the live/backup source'
 assert_equal 0 "$(jq -r '.nodes["0123456789abcdef0123456789abcdef"].upload_kernel_bytes' "$baseline_candidate")" 'transaction candidate baselines must reset before commit'
@@ -335,21 +431,43 @@ assert_equal 0 "$(jq -r '.nodes["0123456789abcdef0123456789abcdef"].upload_kerne
 
 tc_rebuild_log="$test_tmp/tc-rebuild.log"
 bandwidth_plan_matches_current_boot() { return 0; }
+bandwidth_plan_matches_current_families() { return 0; }
 bandwidth_check_nodes() { return 1; }
+traffic_interfaces_match_current_routes() { return 0; }
+traffic_collect_actions_no_rule_check() { printf 'collect ' >>"$tc_rebuild_log"; }
 bandwidth_apply_and_check() { printf 'apply ' >>"$tc_rebuild_log"; }
 traffic_reset_kernel_baselines() { printf 'reset ' >>"$tc_rebuild_log"; }
 assert_true 'missing tc rules must be rebuilt before traffic sampling' traffic_ensure_tc_rules_no_lock 2>/dev/null
-assert_equal 'apply reset ' "$(cat "$tc_rebuild_log")" 'tc rebuild must reset persisted kernel baselines'
+assert_equal 'collect apply reset ' "$(cat "$tc_rebuild_log")" 'tc rebuild must save action counters before resetting baselines'
+
+: >"$tc_rebuild_log"
+bandwidth_plan_matches_current_boot() { return 0; }
+traffic_interfaces_match_current_routes() { return 1; }
+detect_traffic_interfaces() { printf 'refresh ' >>"$tc_rebuild_log"; }
+INSTALL_TRANSACTION_RUNTIME_ACTIVE=1
+assert_true 'a same-boot route change must preserve readable action counters before refresh' traffic_ensure_tc_rules_no_lock 2>/dev/null
+INSTALL_TRANSACTION_RUNTIME_ACTIVE=0
+assert_equal 'collect refresh apply reset ' "$(cat "$tc_rebuild_log")" 'route refresh discarded readable pre-refresh action counters'
+
+: >"$tc_rebuild_log"
+traffic_interfaces_match_current_routes() { return 0; }
+bandwidth_plan_matches_current_families() { return 1; }
+INSTALL_TRANSACTION_RUNTIME_ACTIVE=1
+assert_true 'a same-boot route-family change must preserve counters and use the refresh transaction' traffic_ensure_tc_rules_no_lock 2>/dev/null
+INSTALL_TRANSACTION_RUNTIME_ACTIVE=0
+assert_equal 'collect refresh apply reset ' "$(cat "$tc_rebuild_log")" 'route-family refresh bypassed the transactional counter-preserving path'
 
 : >"$tc_rebuild_log"
 bandwidth_plan_matches_current_boot() { return 1; }
 bandwidth_check_nodes() { return 0; }
-detect_traffic_interfaces() { printf 'refresh ' >>"$tc_rebuild_log"; }
+INSTALL_TRANSACTION_RUNTIME_ACTIVE=1
 assert_true 'a new kernel boot must refresh interfaces and rebuild tc rules' traffic_ensure_tc_rules_no_lock 2>/dev/null
+INSTALL_TRANSACTION_RUNTIME_ACTIVE=0
 assert_equal 'refresh apply reset ' "$(cat "$tc_rebuild_log")" 'reboot recovery must refresh interfaces before rebuilding rules'
 
 runtime_health_log="$test_tmp/runtime-health.log"
 singbox_is_active() { return 1; }
+singbox_confirm_inactive() { ! singbox_is_active; }
 singbox_check_config() { printf 'check ' >>"$runtime_health_log"; }
 assert_true 'a transaction must accept a valid config while preserving an intentionally stopped service' transaction_runtime_health_check "$NODES_FILE" 0
 assert_equal 'check ' "$(cat "$runtime_health_log")" 'stopped-state health must use the official config check'
@@ -413,7 +531,12 @@ if grep -q 'load_json_or_default "$COUNTERS_FILE"' "$ROOT/lib/common.sh"; then
   printf 'assertion failed: new installations must not recreate the legacy two-file traffic baseline\n' >&2
   exit 1
 fi
-awk '/backup_create_snapshot "sing-box-update-\$target"/{getline; if ($0 !~ /backup_prune/) exit 1; found=1} END {exit !found}' "$ROOT/lib/update.sh"
+singbox_commit_line=$(grep -n 'singbox_update_transaction_commit' "$ROOT/lib/update.sh" | tail -n 1 | cut -d: -f1)
+singbox_prune_line=$(grep -n "backup_prune || warn 'sing-box 更新已经提交" "$ROOT/lib/update.sh" | cut -d: -f1)
+[[ -n "$singbox_commit_line" && -n "$singbox_prune_line" && "$singbox_prune_line" -gt "$singbox_commit_line" ]] || {
+  printf 'assertion failed: sing-box backup pruning must run only after the update transaction commits\n' >&2
+  exit 1
+}
 grep -q 'manager_update_finalize_switched_program' "$ROOT/lib/update.sh"
 grep -q 'manager_update_restore_service_files' "$ROOT/lib/update.sh"
 grep -q 'exit 75' "$ROOT/lib/update.sh"

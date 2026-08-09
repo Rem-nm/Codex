@@ -19,6 +19,13 @@ run_menu_action() {
   # Consumed by ss-manager.sh during the mandatory first-node flow.
   # shellcheck disable=SC2034
   MENU_ACTION_STATUS=$status
+  # A successful self-update exits its isolated action with 75. Replace the
+  # old long-lived menu process so all subsequently executed functions come
+  # from the newly installed manager version.
+  if (( status == 75 )); then
+    exec "$PROGRAM_DIR/ss-manager.sh" menu
+    die 'manager 已更新，但新版本菜单无法启动。'
+  fi
   if (( status != 0 )); then
     warn "本次操作未完成（退出码 $status）；主菜单仍可继续使用。"
   fi
@@ -379,9 +386,49 @@ system_bbr_action() {
 
 system_tfo_action() {
   acquire_manager_lock
-  configure_tcp_fast_open_kernel
-  if [[ -x "$SING_BOX_BINARY" ]]; then singbox_config_supports_tfo || true; fi
-  apply_state_transaction "$NODES_FILE" "$TRAFFIC_FILE" "$HISTORY_FILE" 'system-tfo-update' || die 'TFO 配置变更未提交，已回滚。'
+  local state_backup="$RUNTIME_DIR/manager.tfo-previous.$$.json"
+  local sysctl_backup="$RUNTIME_DIR/sysctl.tfo-previous.$$"
+  local sysctl_file='/etc/sysctl.d/99-ss-manager.conf'
+  local sysctl_file_state=absent kernel_previous status
+  install -m 600 -- "$MANAGER_STATE" "$state_backup"
+  kernel_previous=$(sysctl_read net.ipv4.tcp_fastopen)
+  if [[ -f "$sysctl_file" ]]; then
+    if grep -q '^# Managed by Ss2022$' "$sysctl_file"; then
+      sysctl_file_state=managed
+      install -m 600 -- "$sysctl_file" "$sysctl_backup"
+    else
+      sysctl_file_state=foreign
+    fi
+  fi
+
+  # Run the mutation in a child with errexit enabled so every failure returns
+  # here and can restore manager.json, the persistent sysctl file and the live
+  # kernel value as one unit.
+  set +e
+  (
+    set -Eeuo pipefail
+    configure_tcp_fast_open_kernel
+    if [[ -x "$SING_BOX_BINARY" ]]; then singbox_config_supports_tfo || true; fi
+    apply_state_transaction "$NODES_FILE" "$TRAFFIC_FILE" "$HISTORY_FILE" 'system-tfo-update'
+  )
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    install -m 600 -- "$state_backup" "$MANAGER_STATE" || error 'TFO 回滚时 manager 状态恢复失败。'
+    case "$sysctl_file_state" in
+      managed) install -m 644 -- "$sysctl_backup" "$sysctl_file" || error 'TFO 回滚时 sysctl 文件恢复失败。' ;;
+      absent)
+        if [[ -f "$sysctl_file" ]] && grep -q '^# Managed by Ss2022$' "$sysctl_file"; then rm -f -- "$sysctl_file"; fi
+        ;;
+      foreign) ;;
+    esac
+    if [[ "$kernel_previous" =~ ^[0-9]+$ ]]; then
+      sysctl -w "net.ipv4.tcp_fastopen=$kernel_previous" >/dev/null 2>&1 || error 'TFO 回滚时实时内核值恢复失败。'
+    fi
+    rm -f -- "$state_backup" "$sysctl_backup"
+    die 'TFO 配置变更未提交；manager 状态、持久化文件和内核值已回滚。'
+  fi
+  rm -f -- "$state_backup" "$sysctl_backup"
 }
 
 system_refresh_interfaces_action() {
@@ -430,12 +477,14 @@ uninstall_flow() {
     service_remove_managed_definition "$SING_BOX_SERVICE"
     if [[ "$(manager_state_get sing_box_binary_managed false)" == true ]]; then rm -f -- "$SING_BOX_BINARY"; fi
     rm -f -- "$SING_BOX_CONFIG"
+    # Both destructive modes remove the state that records the original
+    # kernel values, so restore them before deleting manager.json.
+    restore_kernel_settings_on_uninstall
     if [[ "$mode" == 2 ]]; then
       rm -f -- "$MANAGER_STATE" "$NODES_FILE" "$TRAFFIC_FILE" "$HISTORY_FILE" "$COUNTERS_FILE" "$INTERFACES_FILE" "$DATA_DIR/bandwidth-plan.json"
       find "$CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name backups -exec rm -rf -- {} + 2>/dev/null || true
       rm -rf -- "$DATA_DIR"
     else
-      restore_kernel_settings_on_uninstall
       rm -rf -- "$CONFIG_DIR" "$DATA_DIR"
     fi
   fi

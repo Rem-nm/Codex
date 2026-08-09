@@ -42,6 +42,11 @@ ensure_dir "$PROGRAM_DIR" 700
 ensure_dir "$CONFIG_DIR" 700
 ensure_dir "$DATA_DIR" 700
 ensure_dir "$BACKUP_DIR" 700
+acquire_manager_lock
+
+if (( fresh_install == 0 )); then
+  validate_installed_state_files
+fi
 
 if [[ ! -f "$MANAGER_STATE" ]]; then
   jq -n \
@@ -159,8 +164,10 @@ printf '本项目不会自动修改服务器防火墙、云安全组或现有安
 installed_node_count=$(jq -er '.nodes | length' "$NODES_FILE") || die '无法读取节点数据库，未进入节点创建流程。'
 install_completed=$(manager_state_get install_completed false)
 if (( installed_node_count == 0 )) && [[ "$install_completed" != true ]]; then
+  release_manager_lock
   exec "$PROGRAM_DIR/ss-manager.sh" --first-run
 fi
 enable_manager_maintenance_service
 manager_state_set_json install_completed true
+release_manager_lock
 exec "$PROGRAM_DIR/ss-manager.sh" menu

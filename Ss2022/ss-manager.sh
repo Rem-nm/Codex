@@ -31,6 +31,7 @@ source "$SCRIPT_DIR/lib/menu.sh"
 require_root
 detect_host
 ensure_runtime_dirs
+validate_installed_state_files
 initialize_state_files
 
 case "${1:-menu}" in

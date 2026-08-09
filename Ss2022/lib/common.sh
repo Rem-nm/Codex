@@ -20,7 +20,7 @@ if [[ -r "$VERSION_FILE" ]]; then
   IFS= read -r MANAGER_VERSION <"$VERSION_FILE" || true
   MANAGER_VERSION=${MANAGER_VERSION//$'\r'/}
 fi
-MANAGER_VERSION="${MANAGER_VERSION:-1.0.3}"
+MANAGER_VERSION="${MANAGER_VERSION:-1.0.4}"
 [[ "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
   printf 'Invalid manager VERSION: %s\n' "$MANAGER_VERSION" >&2
   exit 1
@@ -111,6 +111,15 @@ acquire_manager_lock() {
   if ! flock -n 9; then
     die "已有 ss-manager 操作正在执行，请稍后重试。"
   fi
+  MANAGER_LOCK_HELD=1
+}
+
+release_manager_lock() {
+  if [[ "${MANAGER_LOCK_HELD:-0}" == 1 ]]; then
+    flock -u 9 >/dev/null 2>&1 || true
+    exec 9>&-
+    MANAGER_LOCK_HELD=0
+  fi
 }
 
 load_json_or_default() {
@@ -128,8 +137,23 @@ initialize_state_files() {
   load_json_or_default "$NODES_FILE" '{"schema_version":1,"nodes":[]}'
   load_json_or_default "$TRAFFIC_FILE" '{"schema_version":1,"nodes":{}}'
   load_json_or_default "$HISTORY_FILE" '{"schema_version":1,"cycles":{}}'
-  load_json_or_default "$COUNTERS_FILE" '{"schema_version":1,"nodes":{}}'
   load_json_or_default "$INTERFACES_FILE" '{"schema_version":1,"interfaces":[]}'
+}
+
+validate_installed_state_files() {
+  local path
+  for path in "$MANAGER_STATE" "$NODES_FILE" "$TRAFFIC_FILE" "$HISTORY_FILE"; do
+    [[ -f "$path" ]] || die "已有安装缺少必要状态文件：$path。为避免清空节点或流量，修复已停止；请先从 $BACKUP_DIR 恢复。"
+    jq -e . "$path" >/dev/null 2>&1 || die "JSON 数据损坏：$path。请使用备份恢复。"
+  done
+  jq -e 'type == "object" and .schema_version == 1' "$MANAGER_STATE" >/dev/null 2>&1 \
+    || die 'manager.json 结构无效；请先使用备份恢复。'
+  jq -e '.schema_version == 1 and (.nodes | type == "array")' "$NODES_FILE" >/dev/null 2>&1 \
+    || die 'nodes.json 结构无效；请先使用备份恢复。'
+  jq -e '.schema_version == 1 and (.nodes | type == "object")' "$TRAFFIC_FILE" >/dev/null 2>&1 \
+    || die 'traffic.json 结构无效；请先使用备份恢复。'
+  jq -e '.schema_version == 1 and (.cycles | type == "object")' "$HISTORY_FILE" >/dev/null 2>&1 \
+    || die 'traffic-history.json 结构无效；请先使用备份恢复。'
 }
 
 atomic_json_write() {
@@ -138,26 +162,26 @@ atomic_json_write() {
   local mode=${3:-600}
   local destination_dir
   destination_dir=$(dirname -- "$destination")
-  ensure_dir "$destination_dir" 700
+  ensure_dir "$destination_dir" 700 || return 1
   jq -e . "$source_file" >/dev/null 2>&1 || die "拒绝写入无效 JSON：$source_file"
   local temporary="${destination}.tmp.$$.$RANDOM"
-  install -m "$mode" -- "$source_file" "$temporary"
-  chmod "$mode" -- "$temporary"
-  mv -f -- "$temporary" "$destination"
+  install -m "$mode" -- "$source_file" "$temporary" || { rm -f -- "$temporary"; return 1; }
+  chmod "$mode" -- "$temporary" || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$destination" || { rm -f -- "$temporary"; return 1; }
 }
 
 atomic_json_from_stdin() {
   local destination=$1
   local mode=${2:-600}
   local temporary="${destination}.tmp.$$.$RANDOM"
-  ensure_dir "$(dirname -- "$destination")" 700
-  cat >"$temporary"
+  ensure_dir "$(dirname -- "$destination")" 700 || return 1
+  cat >"$temporary" || { rm -f -- "$temporary"; return 1; }
   jq -e . "$temporary" >/dev/null 2>&1 || {
     rm -f -- "$temporary"
     die "拒绝写入无效 JSON：$destination"
   }
-  chmod "$mode" -- "$temporary"
-  mv -f -- "$temporary" "$destination"
+  chmod "$mode" -- "$temporary" || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$destination" || { rm -f -- "$temporary"; return 1; }
 }
 
 json_value() {

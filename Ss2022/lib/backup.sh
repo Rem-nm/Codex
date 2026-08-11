@@ -706,6 +706,15 @@ recover_incomplete_install_transaction() {
     return 0
   fi
   warn '检测到上次安装/修复未完成，正在恢复安装前的程序、状态、服务、内核设置和二进制。'
+  # A failed sing-box download from older manager versions may have filled
+  # the small /run tmpfs.  Free only our exact stale artifacts before the
+  # rollback reloads systemd; otherwise systemd can reject daemon-reload for
+  # being below its safety buffer and the transaction cannot recover.
+  if [[ -d "$RUNTIME_DIR" && ! -L "$RUNTIME_DIR" ]] \
+    && declare -F singbox_cleanup_stale_runtime_artifacts >/dev/null 2>&1; then
+    singbox_cleanup_stale_runtime_artifacts \
+      || die '无法在安装事务恢复前清理 sing-box 运行时暂存文件；证据保留在安装事务目录。'
+  fi
   install_transaction_restore || die "安装事务恢复失败；证据保留在 $INSTALL_TRANSACTION_DIR，请勿继续安装。"
   install_transaction_clear || die "安装前状态已恢复，但无法清理安装事务日志：$INSTALL_TRANSACTION_DIR"
   success '未完成的安装/修复已完整回滚。'

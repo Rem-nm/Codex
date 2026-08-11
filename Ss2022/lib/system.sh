@@ -195,7 +195,16 @@ install_packages() {
       }
       ;;
     apk)
-      apk add --no-cache "${packages[@]}"
+      local -a missing_packages=()
+      local package_name
+      for package_name in "${packages[@]}"; do
+        apk info -e "$package_name" >/dev/null 2>&1 || missing_packages+=("$package_name")
+      done
+      if ((${#missing_packages[@]} > 0)); then
+        apk add --no-cache "${missing_packages[@]}"
+      else
+        info '所需 Alpine 依赖已存在，跳过 APK 更新；保留现有依赖和项目数据。'
+      fi
       if ! command -v sysctl >/dev/null 2>&1; then
         apk add --no-cache procps-ng \
           || apk add --no-cache procps \

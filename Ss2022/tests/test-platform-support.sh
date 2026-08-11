@@ -108,6 +108,7 @@ grep -qx iproute2 <<<"$apk_packages"
 grep -qx openrc <<<"$apk_packages"
 grep -q 'apk add --no-cache procps-ng' "$ROOT/lib/system.sh"
 grep -q 'apk add --no-cache procps' "$ROOT/lib/system.sh"
+grep -q 'apk info -e' "$ROOT/lib/system.sh"
 
 (
   HOST_OS_ID=debian
@@ -144,6 +145,7 @@ fi
 grep -q -- '--output "$archive_file" -- "$archive_url"' "$ROOT/lib/singbox.sh"
 grep -q -- '--output "$archive" -- "$asset_url"' "$ROOT/lib/update.sh"
 grep -q -- '--output "$archive" -- "$archive_url"' "$ROOT/bootstrap.sh"
+grep -q 'apk info -e ca-certificates' "$ROOT/bootstrap.sh"
 grep -q '^trap cleanup 0$' "$ROOT/bootstrap.sh"
 grep -q 'set +e' "$ROOT/bootstrap.sh"
 grep -q '安装脚本退出（退出码' "$ROOT/bootstrap.sh"

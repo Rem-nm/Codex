@@ -53,6 +53,7 @@ command -v sha256sum >/dev/null 2>&1 || fail '系统缺少 sha256sum。'
 tmp_dir=$(mktemp -d) || fail '无法创建临时目录。'
 archive="$tmp_dir/Codex.tar.gz"
 archive_list="$tmp_dir/archive.list"
+# shellcheck disable=SC2317 # invoked indirectly by the EXIT trap
 cleanup() {
   if [ -n "${tmp_dir:-}" ] && [ "$tmp_dir" != / ]; then
     rm -rf -- "$tmp_dir" || true
@@ -98,11 +99,24 @@ tar -xzf "$archive" -C "$tmp_dir" --strip-components=1 --no-same-owner --no-same
 # takeover question.  Reattach the child to the controlling terminal for the
 # interactive case; keep stdin unchanged for callers that deliberately run in
 # a non-interactive environment without a tty.
+status=0
 if [ -r /dev/tty ] && [ -w /dev/tty ] && exec 3<>/dev/tty 2>/dev/null; then
+  # Do not let the bootstrap shell's `set -e` discard the child's exit
+  # status before it can be reported.  This matters when a package hook,
+  # capability probe, or service check stops the installer after APT has
+  # already completed.
+  set +e
   bash "$tmp_dir/Ss2022/install.sh" <&3
   status=$?
+  set -e
   exec 3>&-
-  exit "$status"
 else
+  set +e
   bash "$tmp_dir/Ss2022/install.sh"
+  status=$?
+  set -e
 fi
+if [ "$status" -ne 0 ]; then
+  printf '[ERROR] 安装脚本退出（退出码 %s）。\n' "$status" >&2
+fi
+exit "$status"

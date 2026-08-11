@@ -345,6 +345,12 @@ grep -A5 '^service_definition_path_present()' "$ROOT/lib/service.sh" | grep -Fq 
   || fail_test 'service path presence check ignores broken symlinks'
 grep -Fq 'service_definition_path_present "$name" && ! service_definition_is_managed' "$ROOT/install.sh" \
   || fail_test 'installer preflight can overlook a broken service-definition symlink'
+grep -Fq "是否明确接管该 sing-box 服务并替换其服务定义" "$ROOT/install.sh" \
+  || fail_test 'installer does not request explicit approval before replacing a foreign sing-box unit'
+grep -Fq 'SS_MANAGER_SERVICE_TAKEOVER_APPROVED=0' "$ROOT/install.sh" \
+  || fail_test 'installer trusts an inherited service-takeover approval'
+grep -Fq '[[ "${SS_MANAGER_SERVICE_TAKEOVER_APPROVED:-0}" == 1 ]]' "$ROOT/lib/singbox.sh" \
+  || fail_test 'sing-box unit replacement does not require the preflight takeover approval'
 (
   INIT_SYSTEM=systemd
   service_active=1

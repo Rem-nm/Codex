@@ -51,7 +51,7 @@
 }
 ```
 
-`upload_kernel_bytes` 和 `download_kernel_bytes` 是当前 tc action 的采样基线。它们与流量累计值在同一个文件中原子提交，避免一份文件已更新、另一份尚未更新的窗口。自 1.0.4 起，首次成功采样会兼容读取并删除旧版 `tc-counters.json`。
+`upload_kernel_bytes` 和 `download_kernel_bytes` 是当前 tc action 的采样基线。它们与流量累计值在同一个文件中原子提交，避免一份文件已更新、另一份尚未更新的窗口。升级旧版 manager 时，安装事务会先保存旧文件，再把 1.0.4 以前缺少的两个基线字段从旧版 `tc-counters.json` 安全迁入；没有可用旧基线时只补零，不覆盖累计流量。首次成功采样后会清理旧版 `tc-counters.json`。
 
 所有持久字节字段和 `quota_bytes` 都限制在 JSON/IEEE-754 可精确表达的 `0..9007199254740991`。默认配额计费值为 `current_download_bytes`；端口层 `current_upload_bytes` 仍显示和归档，但不用于自动停用，除非管理员明确迁移 manager 状态策略。下载计数也可能包含 TCP 握手回复等未认证响应，因此该策略只降低未认证流量的影响，不提供认证级计费保证。
 

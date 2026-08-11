@@ -132,6 +132,11 @@ install_transaction_exit_handler() {
 trap install_transaction_exit_handler EXIT
 install_transaction_set_phase installing || die '无法持久记录安装事务阶段。'
 
+# Upgrade pre-1.0.4 traffic state only after the install transaction has
+# snapshotted the old files.  A failure or crash therefore restores the
+# legacy file instead of leaving a half-migrated database behind.
+traffic_migrate_legacy_state || die '旧版 traffic.json 迁移失败；安装事务将恢复安装前状态。'
+
 if [[ ! -f "$MANAGER_STATE" ]]; then
   manager_created_at=$(timestamp_iso) || die '无法生成 manager 状态时间戳。'
   jq -n \

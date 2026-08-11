@@ -81,15 +81,50 @@ EOF
   fi
 }
 
+required_runtime_commands() {
+  printf '%s\n' \
+    awk base64 curl date find flock grep gzip install ip jq mktemp openssl python3 \
+    qrencode readlink sed sha256sum shuf ss sysctl tar tc tr uname wc
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    printf '%s\n' systemctl journalctl
+  else
+    printf '%s\n' rc-service rc-update supervise-daemon
+  fi
+}
+
+runtime_commands_present() {
+  local command_name
+  while IFS= read -r command_name; do
+    [[ -n "$command_name" ]] || continue
+    command -v "$command_name" >/dev/null 2>&1 || return 1
+  done < <(required_runtime_commands)
+}
+
+apt_update_or_die() {
+  if apt-get update; then
+    return 0
+  fi
+  if [[ "$HOST_OS_ID" == debian && "$HOST_OS_VERSION" == 11* ]] \
+    && grep -RqsE --include='*.list' --include='*.sources' \
+      'bullseye/updates|bullseye-backports' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+    die 'APT 软件源更新失败：Debian 11 仍包含失效的 bullseye/updates 或 bullseye-backports 源。请将安全源改为 bullseye-security，并删除或迁移 backports 源后重试；本项目未修改你的 APT 配置。'
+  fi
+  die 'APT 软件源更新失败；请先修复系统 APT 源后重试。'
+}
+
 install_packages() {
   detect_host
   local -a packages=()
   mapfile -t packages < <(package_list)
   case "$PACKAGE_MANAGER" in
     apt-get)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y --no-install-recommends "${packages[@]}"
+      if runtime_commands_present; then
+        info '所需依赖命令已存在，跳过 APT 更新；保留现有依赖和项目数据。'
+      else
+        export DEBIAN_FRONTEND=noninteractive
+        apt_update_or_die
+        apt-get install -y --no-install-recommends "${packages[@]}"
+      fi
       ;;
     dnf)
       dnf -y install "${packages[@]}" || {

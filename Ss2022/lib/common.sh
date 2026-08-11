@@ -20,7 +20,7 @@ if [[ -r "$VERSION_FILE" ]]; then
   IFS= read -r MANAGER_VERSION <"$VERSION_FILE" || true
   MANAGER_VERSION=${MANAGER_VERSION//$'\r'/}
 fi
-MANAGER_VERSION="${MANAGER_VERSION:-1.0.5}"
+MANAGER_VERSION="${MANAGER_VERSION:-1.0.6}"
 [[ "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
   printf 'Invalid manager VERSION: %s\n' "$MANAGER_VERSION" >&2
   exit 1
@@ -194,7 +194,20 @@ validate_installed_state_files() {
   done
   validate_manager_state_semantic "$MANAGER_STATE" || die 'manager.json 语义无效；请先使用备份恢复。'
   validate_nodes_file_semantic "$NODES_FILE" || die 'nodes.json 语义无效；请先使用备份恢复。'
-  validate_traffic_file_semantic "$TRAFFIC_FILE" "$NODES_FILE" || die 'traffic.json 语义或节点关联无效；请先使用备份恢复。'
+  # Versions before 1.0.4 kept the tc kernel baseline in a separate
+  # tc-counters.json file.  Keep accepting that exact, structurally safe
+  # legacy form long enough for the install transaction to migrate it.  Do
+  # not write anything here: the transaction must snapshot the old state
+  # before the migration so a later failure can restore it byte-for-byte.
+  LEGACY_TRAFFIC_STATE_NEEDS_MIGRATION=0
+  if ! validate_traffic_file_semantic "$TRAFFIC_FILE" "$NODES_FILE"; then
+    if traffic_legacy_file_semantic "$TRAFFIC_FILE" "$NODES_FILE"; then
+      LEGACY_TRAFFIC_STATE_NEEDS_MIGRATION=1
+      warn '检测到旧版 traffic.json，将在安装事务中补齐内核计数基线；累计流量和节点数据不会被覆盖。'
+    else
+      die 'traffic.json 语义或节点关联无效；请先使用备份恢复。'
+    fi
+  fi
   validate_history_file_semantic "$HISTORY_FILE" || die 'traffic-history.json 语义无效；请先使用备份恢复。'
   validate_interfaces_file_semantic "$INTERFACES_FILE" || die 'interfaces.json 语义无效；请先使用备份恢复。'
   local plan_file="$DATA_DIR/bandwidth-plan.json"

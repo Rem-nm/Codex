@@ -84,15 +84,33 @@ service_enable() {
 }
 
 service_is_enabled() {
-  local name=$1 state output
+  local name=$1 state output status=0
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    state=$(systemctl is-enabled "$(service_systemd_unit_name "$name")" 2>/dev/null) || :
+    state=$(systemctl is-enabled "$(service_systemd_unit_name "$name")" 2>/dev/null) || status=$?
     case "$state" in
       enabled|enabled-runtime|linked|linked-runtime|alias) return 0 ;;
       disabled|static|indirect|generated|transient|masked|masked-runtime) return 1 ;;
       not-found) return 1 ;;
-      '') return 2 ;;
-      *) return 2 ;;
+      '')
+        # Debian 11/systemd 247 can return an empty result for a unit that
+        # does not exist.  Prove absence through LoadState before treating
+        # the empty is-enabled response as an operationally unknown state.
+        local presence_status=0
+        service_exists "$name" || presence_status=$?
+        (( presence_status == 1 )) && return 1
+        return 2
+        ;;
+      *)
+        # Keep fail-closed behavior for unexpected states, but do not turn a
+        # nonzero is-enabled status into a false ownership conflict when the
+        # unit is demonstrably absent.
+        if (( status != 0 )); then
+          local presence_status=0
+          service_exists "$name" || presence_status=$?
+          (( presence_status == 1 )) && return 1
+        fi
+        return 2
+        ;;
     esac
   else
     output=$(rc-update show default 2>/dev/null) || return 2

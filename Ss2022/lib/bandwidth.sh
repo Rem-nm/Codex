@@ -71,14 +71,14 @@ probe_tc_capabilities() {
   (( ${#families[@]} >= 1 )) || probe_ok=0
   ip link set dev "$interface" up >/dev/null 2>&1 || probe_ok=0
   (( probe_ok == 0 )) || tc qdisc add dev "$interface" clsact >/dev/null 2>&1 || probe_ok=0
-  (( probe_ok == 0 )) || tc actions add action gact pass index "$gact_index" cookie "$gact_cookie" >/dev/null 2>&1 || probe_ok=0
-  (( probe_ok == 0 )) || tc actions add action police rate 1mbit burst 64kb mtu 64kb conform-exceed drop/pass index "$police_index" cookie "$police_cookie" >/dev/null 2>&1 || probe_ok=0
+  (( probe_ok == 0 )) || tc_create_shared_action gact "$gact_index" "$gact_cookie" 0 || probe_ok=0
+  (( probe_ok == 0 )) || tc_create_shared_action police "$police_index" "$police_cookie" 1 || probe_ok=0
   if (( probe_ok == 1 )); then
     for family in "${families[@]}"; do
       family_pref=$(tc_family_pref 65000 "$family") || { probe_ok=0; break; }
       for protocol in tcp udp; do
-        tc filter add dev "$interface" ingress pref "$family_pref" protocol "$family" flower skip_hw ip_proto "$protocol" dst_port 9 action gact index "$gact_index" >/dev/null 2>&1 || { probe_ok=0; break 2; }
-        tc filter add dev "$interface" egress pref "$family_pref" protocol "$family" flower skip_hw ip_proto "$protocol" src_port 9 action police index "$police_index" >/dev/null 2>&1 || { probe_ok=0; break 2; }
+        tc_add_flower_rule "$interface" ingress "$family" "$protocol" 9 "$family_pref" gact "$gact_index" "$gact_cookie" >/dev/null 2>&1 || { probe_ok=0; break 2; }
+        tc_add_flower_rule "$interface" egress "$family" "$protocol" 9 "$family_pref" police "$police_index" "$police_cookie" >/dev/null 2>&1 || { probe_ok=0; break 2; }
         expected_rules=$((expected_rules + 1))
       done
     done
@@ -584,10 +584,31 @@ tc_create_shared_action() {
       (( status == 1 )) || { error "无法检查 tc action $other_kind/$index。"; return 1; }
     fi
   done
+  # Some kernels expose clsact/flower and cookie-bearing inline actions but
+  # reject standalone `tc actions add` with EPERM.  Let the first filter bind
+  # create that shared action in this mode; subsequent filters reuse its index
+  # and cookie exactly like the standalone path.
   if [[ "$kind" == police ]]; then
-    tc actions add action police rate "${limit}mbit" burst 64kb mtu 64kb conform-exceed drop/pass index "$index" cookie "$cookie"
+    if tc actions add action police rate "${limit}mbit" burst 64kb mtu 64kb conform-exceed drop/pass index "$index" cookie "$cookie" 2>/dev/null; then
+      return 0
+    fi
+  elif tc actions add action gact pass index "$index" cookie "$cookie" 2>/dev/null; then
+    return 0
+  fi
+  if entry=$(tc_action_lookup "$kind" "$index"); then
+    tc_action_cookie_matches "$entry" "$cookie" || {
+      error "tc action $kind/$index 已由其他程序使用，拒绝以内联方式接管。"
+      return 1
+    }
+    return 0
   else
-    tc actions add action gact pass index "$index" cookie "$cookie"
+    status=$?
+    (( status == 1 )) || {
+      error "无法确认 tc action $kind/$index 是否可由内联规则创建。"
+      return 1
+    }
+    TC_INLINE_ACTIONS=1
+    return 0
   fi
 }
 
@@ -612,10 +633,11 @@ bandwidth_preflight_actions() {
 }
 
 tc_add_flower_rule() {
-  local interface=$1 direction=$2 family=$3 protocol=$4 port=$5 pref=$6 kind=$7 index=$8
+  local interface=$1 direction=$2 family=$3 protocol=$4 port=$5 pref=$6 kind=$7 index=$8 cookie=${9:-}
   local -a args=(filter add dev "$interface" "$direction" pref "$pref" protocol "$family" flower skip_hw ip_proto "$protocol")
   if [[ "$direction" == ingress ]]; then args+=(dst_port "$port"); else args+=(src_port "$port"); fi
   args+=(action "$kind" index "$index")
+  [[ "${TC_INLINE_ACTIONS:-0}" == 1 && -n "$cookie" ]] && args+=(cookie "$cookie")
   tc "${args[@]}"
 }
 
@@ -1020,7 +1042,7 @@ bandwidth_apply_nodes() {
         [[ -n "$family" ]] || continue
         family_pref=$(tc_family_pref "$pref" "$family") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
         for protocol in tcp udp; do
-          if ! tc_add_flower_rule "$interface" "$direction" "$family" "$protocol" "$port" "$family_pref" "$kind" "$index"; then
+          if ! tc_add_flower_rule "$interface" "$direction" "$family" "$protocol" "$port" "$family_pref" "$kind" "$index" "$cookie"; then
             error "tc 规则创建失败：接口 $interface，$direction，$family/$protocol，端口 $port"
             bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"
             return 1

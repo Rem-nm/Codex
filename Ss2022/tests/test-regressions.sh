@@ -221,6 +221,24 @@ captured_tc=$(
   printf 'assertion failed: limited aggregate action lacks police drop/pass or ownership cookie\n' >&2
   exit 1
 }
+(
+  TC_INLINE_ACTIONS=0
+  tc_action_lookup() { return 1; }
+  tc() {
+    [[ "$1" == actions && "$2" == add ]] && return 1
+    printf '%q ' "$@"
+  }
+  tc_create_shared_action gact 1000000003 00112233445566778899aabbccddeeff 0
+  [[ "${TC_INLINE_ACTIONS:-0}" == 1 ]] || {
+    printf 'assertion failed: standalone action failure did not select inline compatibility mode\n' >&2
+    exit 1
+  }
+  captured_tc=$(tc_add_flower_rule eth0 ingress ip tcp 20001 49123 gact 1000000003 00112233445566778899aabbccddeeff)
+  [[ "$captured_tc" == *'filter add dev eth0 ingress pref 49123 protocol ip flower skip_hw ip_proto tcp dst_port 20001 action gact index 1000000003 cookie 00112233445566778899aabbccddeeff'* ]] || {
+    printf 'assertion failed: inline action fallback did not carry its ownership cookie\n' >&2
+    exit 1
+  }
+)
 assert_equal 49123 "$(tc_family_pref 49123 ip)" 'IPv4 tc rules must retain the base priority'
 assert_equal 49124 "$(tc_family_pref 49123 ipv6)" 'IPv6 tc rules must use a distinct priority'
 

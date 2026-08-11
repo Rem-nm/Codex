@@ -47,11 +47,21 @@ install_preflight_existing_paths() {
 
 install_preflight_service_ownership() {
   local name path source presence_status
+  # This approval is an in-process result of the prompt below.  Never trust a
+  # value inherited from the caller to authorize replacing a foreign service.
+  SS_MANAGER_SERVICE_TAKEOVER_APPROVED=0
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     path=$(service_definition_path "$name") || return 1
     if service_definition_path_present "$name" && ! service_definition_is_managed "$name"; then
-      die "$path 已存在且不是本项目创建；安装预检已停止，尚未修改项目状态。"
+      if [[ "$name" == "$SING_BOX_SERVICE" ]]; then
+        warn "$path 已存在且不是本项目创建。"
+        prompt_yes_no '是否明确接管该 sing-box 服务并替换其服务定义？失败时会自动恢复' n \
+          || die '未接管已有 sing-box 服务，安装已安全停止。'
+        SS_MANAGER_SERVICE_TAKEOVER_APPROVED=1
+      else
+        die "$path 已存在且不是本项目创建；安装预检已停止，尚未修改项目状态。"
+      fi
     fi
     if ! service_definition_path_present "$name"; then
       presence_status=0

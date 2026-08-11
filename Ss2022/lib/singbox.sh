@@ -378,7 +378,9 @@ install_singbox_service_unit() {
   fi
   [[ -f "$source" && ! -L "$source" ]] || die "缺少常规 sing-box 服务模板或模板为符号链接：$source"
   if service_definition_path_present "$SING_BOX_SERVICE" && ! singbox_service_unit_is_managed; then
-    die "$destination 已存在且不是本项目创建，拒绝静默覆盖。"
+    [[ "${SS_MANAGER_SERVICE_TAKEOVER_APPROVED:-0}" == 1 ]] \
+      || die "$destination 已存在且不是本项目创建，拒绝静默覆盖。"
+    warn "已按明确授权接管现有 sing-box 服务定义：$destination"
   fi
   if ! service_definition_path_present "$SING_BOX_SERVICE"; then
     service_exists "$SING_BOX_SERVICE" || presence_status=$?

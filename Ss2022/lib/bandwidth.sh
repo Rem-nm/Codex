@@ -278,7 +278,7 @@ import sys
 
 raw = sys.stdin.read()
 pattern = re.compile(
-    r"\{\"order\":(?P<order>[0-9]+)\s+police\s+0x(?P<index>[0-9A-Fa-f]+).*?\"control_action\":(?P<control>\{.*?\})\s+overhead\s+\S+\s+ref\s+(?P<ref>[0-9]+)\s+bind\s+(?P<bind>[0-9]+),(?P<after>.*?)\"cookie\":\"(?P<cookie>[0-9A-Fa-f]{32})\"\}",
+    r"\{\"order\":(?P<order>[0-9]+)\s+police\s+0x(?P<index>[0-9A-Fa-f]+).*?\"control_action\":(?P<control>\{.*?\})\s+overhead\s+\S+\s+ref\s+(?P<ref>[0-9]+)\s+bind\s+(?P<bind>[0-9]+)\s*,(?P<after>.*?)\"cookie\":\"(?P<cookie>[0-9A-Fa-f]{32})\"\}",
     re.S,
 )
 

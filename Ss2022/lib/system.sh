@@ -83,7 +83,7 @@ EOF
 
 required_runtime_commands() {
   printf '%s\n' \
-    awk base64 curl date find flock grep gzip install ip jq mktemp openssl python3 \
+    awk base64 curl date find flock grep head gzip install ip jq mktemp openssl python3 \
     qrencode readlink sed sha256sum shuf ss sysctl tar tc tr uname wc
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     printf '%s\n' systemctl journalctl
@@ -207,7 +207,7 @@ install_packages() {
       ;;
     *) die "未识别的包管理器：$PACKAGE_MANAGER。" ;;
   esac
-  require_cmd awk base64 curl date find flock grep install ip jq mktemp openssl python3 qrencode readlink sed sha256sum shuf ss sysctl tar tc tr uname wc
+  require_cmd awk base64 curl date find flock grep head install ip jq mktemp openssl python3 qrencode readlink sed sha256sum shuf ss sysctl tar tc tr uname wc
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     require_cmd systemctl journalctl
   else

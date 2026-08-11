@@ -402,10 +402,75 @@ tc_action_entry_from_json() {
   ' <<<"$output"
 }
 
+tc_action_legacy_json() {
+  local output=$1 kind=$2 expected_index=$3
+  local index_hex index_decimal cookie bind bytes packets drops overlimits requeues backlog qlen
+
+  [[ "$kind" == gact || "$kind" == police ]] || return 1
+  [[ "$expected_index" =~ ^[0-9]+$ ]] || return 1
+
+  # iproute2 5.10 emits an unquoted, human-readable `police` action body
+  # despite accepting -j.  Extract only the identity and counters needed by
+  # the ownership checks, then feed the normalized object through the same
+  # jq validation used for modern iproute2 JSON.
+  index_hex=$(sed -nE "s/.*[[:space:]]${kind}[[:space:]]+0x([0-9A-Fa-f]+).*/\1/p" <<<"$output" | head -n 1)
+  if [[ -n "$index_hex" ]]; then
+    index_decimal=$(printf '%d' "0x$index_hex") || return 1
+  else
+    index_decimal=$(sed -nE 's/.*"index"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  fi
+  [[ "$index_decimal" == "$expected_index" ]] || return 1
+
+  cookie=$(sed -nE 's/.*"cookie"[[:space:]]*:[[:space:]]*"([0-9A-Fa-f]{32})".*/\1/p' <<<"$output" | head -n 1)
+  [[ "$cookie" =~ ^[A-Fa-f0-9]{32}$ ]] || return 1
+  bind=$(sed -nE 's/.*[[:space:]]bind[[:space:]]+([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  [[ "$bind" =~ ^[0-9]+$ ]] || bind=$(sed -nE 's/.*"bind"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  [[ "$bind" =~ ^[0-9]+$ ]] || return 1
+
+  bytes=$(sed -nE 's/.*"bytes"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  packets=$(sed -nE 's/.*"packets"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  drops=$(sed -nE 's/.*"drops"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  overlimits=$(sed -nE 's/.*"overlimits"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  requeues=$(sed -nE 's/.*"requeues"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  backlog=$(sed -nE 's/.*"backlog"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  qlen=$(sed -nE 's/.*"qlen"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  bytes=${bytes:-0}; packets=${packets:-0}; drops=${drops:-0}; overlimits=${overlimits:-0}
+  requeues=${requeues:-0}; backlog=${backlog:-0}; qlen=${qlen:-0}
+  for value in "$bytes" "$packets" "$drops" "$overlimits" "$requeues" "$backlog" "$qlen"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  done
+  jq -n \
+    --arg kind "$kind" \
+    --arg cookie "${cookie,,}" \
+    --argjson index "$index_decimal" \
+    --argjson bind "$bind" \
+    --argjson bytes "$bytes" \
+    --argjson packets "$packets" \
+    --argjson drops "$drops" \
+    --argjson overlimits "$overlimits" \
+    --argjson requeues "$requeues" \
+    --argjson backlog "$backlog" \
+    --argjson qlen "$qlen" \
+    '{kind:$kind,index:$index,cookie:$cookie,bind:$bind,stats:{bytes:$bytes,packets:$packets,drops:$drops,overlimits:$overlimits,requeues:$requeues,backlog:$backlog,qlen:$qlen}}'
+}
+
 tc_action_lookup() {
-  local kind=$1 index=$2 output count
-  output=$(tc -j actions list action "$kind" 2>/dev/null) || return 2
-  jq -e . >/dev/null 2>&1 <<<"$output" || return 2
+  local kind=$1 index=$2 output count status=0
+  [[ "$kind" == gact || "$kind" == police ]] || return 1
+  [[ "$index" =~ ^[0-9]+$ ]] || return 1
+  # Query one index instead of listing all actions.  This avoids the invalid
+  # police JSON emitted by iproute2 5.10 when any unrelated police action is
+  # present, while still allowing an exact ownership decision.
+  output=$(tc -j actions get action "$kind" index "$index" 2>&1) || status=$?
+  if (( status != 0 )); then
+    if grep -qiE 'specified index not found|no such file|not found' <<<"$output"; then
+      return 1
+    fi
+    return 2
+  fi
+  if ! jq -e . >/dev/null 2>&1 <<<"$output"; then
+    output=$(tc_action_legacy_json "$output" "$kind" "$index") || return 2
+  fi
   count=$(jq -r --arg kind "$kind" --argjson index "$index" '
     [ .. | objects | select((.kind? // "") == $kind) | select((((.index? // -1) | tonumber?) // -1) == $index) ] | length
   ' <<<"$output") || return 2

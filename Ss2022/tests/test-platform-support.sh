@@ -103,6 +103,7 @@ assert_equal 'restart:sing-box' "$captured_service_call" 'restart must restart a
 PACKAGE_MANAGER=apk
 apk_packages=$(package_list)
 grep -qx bash <<<"$apk_packages"
+grep -qx gcompat <<<"$apk_packages"
 grep -qx iproute2 <<<"$apk_packages"
 grep -qx openrc <<<"$apk_packages"
 grep -q 'apk add --no-cache procps-ng' "$ROOT/lib/system.sh"

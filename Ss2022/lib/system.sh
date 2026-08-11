@@ -77,7 +77,10 @@ EOF
     # iproute-tc package. Keep yum compatible with that layout.
     printf '%s\n' iproute procps-ng qrencode
   else
-    printf '%s\n' bash iproute2 openrc
+    # SagerNet publishes the Linux release binary against glibc.  Alpine's
+    # musl loader needs gcompat so the downloaded sing-box can be executed and
+    # checked before it is installed.
+    printf '%s\n' bash gcompat iproute2 openrc
   fi
 }
 

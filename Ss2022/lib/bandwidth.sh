@@ -434,6 +434,9 @@ bandwidth_build_actions() {
 
 tc_action_entry_from_json() {
   local output=$1 kind=$2 index=$3
+  if ! jq -e . >/dev/null 2>&1 <<<"$output"; then
+    output=$(tc_action_legacy_json "$output" "$kind" "$index") || return 1
+  fi
   jq -ce --arg kind "$kind" --argjson index "$index" '
     [ .. | objects
       | select((.kind? // "") == $kind)
@@ -497,6 +500,15 @@ tc_action_legacy_json() {
     '{kind:$kind,index:$index,cookie:$cookie,bind:$bind,stats:{bytes:$bytes,packets:$packets,drops:$drops,overlimits:$overlimits,requeues:$requeues,backlog:$backlog,qlen:$qlen}}'
 }
 
+tc_action_normalize_json() {
+  local output=$1 kind=$2 index=$3
+  if jq -e . >/dev/null 2>&1 <<<"$output"; then
+    printf '%s' "$output"
+  else
+    tc_action_legacy_json "$output" "$kind" "$index"
+  fi
+}
+
 tc_action_lookup() {
   local kind=$1 index=$2 output count status=0
   [[ "$kind" == gact || "$kind" == police ]] || return 1
@@ -511,9 +523,7 @@ tc_action_lookup() {
     fi
     return 2
   fi
-  if ! jq -e . >/dev/null 2>&1 <<<"$output"; then
-    output=$(tc_action_legacy_json "$output" "$kind" "$index") || return 2
-  fi
+  output=$(tc_action_normalize_json "$output" "$kind" "$index") || return 2
   count=$(jq -r --arg kind "$kind" --argjson index "$index" '
     [ .. | objects | select((.kind? // "") == $kind) | select((((.index? // -1) | tonumber?) // -1) == $index) ] | length
   ' <<<"$output") || return 2

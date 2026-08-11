@@ -196,9 +196,7 @@ tc_action_counter_from_json() {
   [[ "$kind" == gact || "$kind" == police ]] || return 1
   [[ "$index" =~ ^[0-9]+$ ]] || return 1
   [[ "$cookie" =~ ^[A-Fa-f0-9]{32}$ ]] || return 1
-  if ! jq -e . >/dev/null 2>&1 <<<"$output"; then
-    output=$(tc_action_legacy_json "$output" "$kind" "$index") || return 1
-  fi
+  output=$(tc_action_normalize_json "$output" "$kind" "$index") || return 1
   jq -er --arg kind "$kind" --argjson index "$index" --arg cookie "${cookie,,}" --argjson max "$MAX_SAFE_JSON_INTEGER" '
     def norm_cookie:
       tostring | ascii_downcase | sub("^0x"; "") | gsub("[:-]"; "");

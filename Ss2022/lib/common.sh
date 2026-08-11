@@ -20,7 +20,7 @@ if [[ -r "$VERSION_FILE" ]]; then
   IFS= read -r MANAGER_VERSION <"$VERSION_FILE" || true
   MANAGER_VERSION=${MANAGER_VERSION//$'\r'/}
 fi
-MANAGER_VERSION="${MANAGER_VERSION:-1.0.12}"
+MANAGER_VERSION="${MANAGER_VERSION:-1.0.13}"
 [[ "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
   printf 'Invalid manager VERSION: %s\n' "$MANAGER_VERSION" >&2
   exit 1

@@ -157,6 +157,7 @@ EOF
 legacy_tc_action=$(tc_action_legacy_json "$legacy_tc_action_output" police 1900071943)
 jq -e '.kind == "police" and .index == 1900071943 and .bind == 0 and .stats.bytes == 17' <<<"$legacy_tc_action" >/dev/null
 [[ "$(tc_action_counter_from_json "$legacy_tc_action_output" police 1900071943 3f6e692761769638d3a502f616972ab0)" == 17 ]]
+[[ "$(tc_action_bind_count_from_json "$legacy_tc_action_output" police 1900071943 3f6e692761769638d3a502f616972ab0)" == 0 ]]
 
 legacy_tc_filter_output=$(cat <<'EOF'
 [{"protocol":"ip","pref":65000,"kind":"flower","chain":0},{"protocol":"ip","pref":65000,"kind":"flower","chain":0,"options":{"handle":1,"keys":{"eth_type":"ipv4","ip_proto":"tcp","dst_port":9},"actions":[{"order":1 police 0x7140e4b3 rate 1Mbit burst 64Kb mtu 64Kb ,"control_action":{"type":"drop"} overhead 0b

@@ -593,7 +593,7 @@ grep -q 'MENU_ACTION_STATUS' "$ROOT/ss-manager.sh"
 grep -q 'generate_singbox_config "$NODES_FILE" "$candidate"' "$ROOT/install.sh"
 grep -q 'backup_create_manual_flow' "$ROOT/lib/backup.sh"
 grep -q 'validate_installed_state_files' "$ROOT/install.sh"
-grep -Fq 'bash "$tmp_dir/Ss2022/install.sh" <&3' "$ROOT/bootstrap.sh"
+grep -Fq 'bash "$tmp_dir/Ss2022/install.sh" </dev/tty' "$ROOT/bootstrap.sh"
 grep -q 'traffic_migrate_legacy_state' "$ROOT/install.sh"
 grep -q 'release_manager_lock' "$ROOT/install.sh"
 if grep -q 'load_json_or_default "$COUNTERS_FILE"' "$ROOT/lib/common.sh"; then

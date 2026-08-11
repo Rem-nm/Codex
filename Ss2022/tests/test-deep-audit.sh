@@ -620,6 +620,29 @@ make_fixture "$committed"
   [[ ! -e "$INSTALL_TRANSACTION_DIR" ]] || fail_test 'committed install journal was not cleared'
 )
 
+# Recovery must free exact stale sing-box download artifacts before restoring
+# services, because systemd refuses daemon-reload while /run is below its
+# safety buffer.  Foreign runtime files remain untouched.
+(
+  recovery_space="$test_tmp/recovery-space"
+  make_fixture "$recovery_space"
+  CONFIG_DIR="$recovery_space/config"
+  RUNTIME_DIR="$recovery_space/run"
+  INSTALL_TRANSACTION_DIR="$CONFIG_DIR/install-transaction"
+  mkdir -p -- "$INSTALL_TRANSACTION_DIR"
+  printf '%s\n' '{"schema_version":1,"phase":"installing"}' >"$INSTALL_TRANSACTION_DIR/journal.json"
+  stale_runtime="$RUNTIME_DIR/sing-box-old.tar.gz"
+  foreign_runtime="$RUNTIME_DIR/operator-notes"
+  printf '%s\n' stale >"$stale_runtime"
+  printf '%s\n' keep >"$foreign_runtime"
+  install_transaction_restore() {
+    [[ ! -e "$stale_runtime" ]] || fail_test 'stale sing-box runtime artifact was not removed before recovery'
+    [[ -f "$foreign_runtime" ]] || fail_test 'foreign runtime file was removed during recovery'
+  }
+  install_transaction_clear() { :; }
+  recover_incomplete_install_transaction
+)
+
 (
   INSTALL_TRANSACTION_DIR="$test_tmp/restore-target-transaction"
   mkdir -p -- "$INSTALL_TRANSACTION_DIR"

@@ -137,7 +137,7 @@ grep -q '^# Managed by Ss2022$' "$ROOT/openrc/sing-box"
 grep -q 'supervisor="supervise-daemon"' "$ROOT/openrc/sing-box"
 grep -q 'rc_ulimit="-n 1048576"' "$ROOT/openrc/sing-box"
 grep -q '^# Managed by Ss2022$' "$ROOT/openrc/ss-manager-traffic"
-grep -q 'proc_argv0' "$ROOT/lib/singbox.sh"
+grep -q 'proc_cmdline' "$ROOT/lib/singbox.sh"
 grep -q 'cmdline' "$ROOT/lib/singbox.sh"
 
 if grep -R -n -E -- '-- "\$[A-Za-z_][A-Za-z0-9_]*" -o ' "$ROOT/lib" "$ROOT/bootstrap.sh"; then

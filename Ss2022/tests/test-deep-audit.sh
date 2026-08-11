@@ -24,8 +24,6 @@ source "$ROOT/lib/links.sh"
 # shellcheck disable=SC1091
 source "$ROOT/lib/menu.sh"
 
-ensure_dir() { mkdir -p -- "$1"; }
-
 fail_test() { printf 'assertion failed: %s\n' "$*" >&2; exit 1; }
 assert_equal() {
   local expected=$1 actual=$2 message=$3

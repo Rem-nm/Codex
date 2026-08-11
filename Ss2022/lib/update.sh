@@ -24,6 +24,9 @@ singbox_update_info() {
 singbox_update_transaction_exit_handler() {
   local status=$?
   trap - EXIT
+  if [[ -n "${SINGBOX_DOWNLOAD_WORKDIR:-}" ]] && ! singbox_cleanup_download_workspace; then
+    error 'sing-box 下载暂存目录清理失败；请保留更新事务证据以便恢复。'
+  fi
   if [[ "${SINGBOX_UPDATE_TRANSACTION_ACTIVE:-0}" == 1 ]]; then
     (( status != 0 )) || status=1
     set +e

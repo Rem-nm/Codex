@@ -1,6 +1,68 @@
 #!/usr/bin/env bash
 # sing-box binary lifecycle, configuration generation and health checks.
 
+# Large official archives must not be staged under /run: on many VPS images it
+# is a small tmpfs, and stale failed downloads can exhaust it while the root
+# filesystem still has plenty of space.  The install/update transaction traps
+# use this variable to remove a workspace if the process exits mid-download.
+SINGBOX_DOWNLOAD_WORKDIR=''
+SINGBOX_DOWNLOAD_WORKROOT=''
+
+singbox_cleanup_download_workspace() {
+  local path=${SINGBOX_DOWNLOAD_WORKDIR:-}
+  local root=${SINGBOX_DOWNLOAD_WORKROOT:-}
+  if [[ -z "$path" ]]; then
+    SINGBOX_DOWNLOAD_WORKROOT=''
+    return 0
+  fi
+  [[ -n "$root" && "$root" == /* && "$root" != / ]] || return 1
+  [[ "$path" == "$root"/.ss-manager-sing-box-work.* ]] || return 1
+  [[ -d "$root" && ! -L "$root" && -O "$root" ]] || return 1
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    SINGBOX_DOWNLOAD_WORKDIR=''
+    SINGBOX_DOWNLOAD_WORKROOT=''
+    return 0
+  fi
+  [[ -d "$path" && ! -L "$path" && -O "$path" ]] || return 1
+  rm -rf -- "$path" || return 1
+  SINGBOX_DOWNLOAD_WORKDIR=''
+  SINGBOX_DOWNLOAD_WORKROOT=''
+}
+
+singbox_cleanup_stale_download_workspaces() {
+  local root=$1 path
+  [[ -n "$root" && "$root" == /* && "$root" != / ]] || return 1
+  [[ -d "$root" && ! -L "$root" && -O "$root" ]] || return 1
+  find "$root" -mindepth 1 -maxdepth 1 -name '.ss-manager-sing-box-work.*' -print0 |
+    while IFS= read -r -d '' path; do
+      [[ -d "$path" && ! -L "$path" && -O "$path" ]] || return 1
+      rm -rf -- "$path" || return 1
+    done
+}
+
+singbox_cleanup_stale_runtime_artifacts() {
+  [[ -d "$RUNTIME_DIR" && ! -L "$RUNTIME_DIR" ]] || return 1
+  find "$RUNTIME_DIR" -mindepth 1 -maxdepth 1 -print0 |
+    while IFS= read -r -d '' path; do
+      case "$path" in
+        "$RUNTIME_DIR"/sing-box-*.tar.gz|\
+        "$RUNTIME_DIR"/sing-box-*.SHA256SUMS|\
+        "$RUNTIME_DIR"/sing-box-*-extract.*|\
+        "$RUNTIME_DIR"/sing-box-candidates.*.list|\
+        "$RUNTIME_DIR"/sing-box.previous)
+          [[ ! -L "$path" && -O "$path" ]] || return 1
+          rm -rf -- "$path" || return 1
+          ;;
+      esac
+    done
+}
+
+singbox_die_after_download_cleanup() {
+  local message=$1
+  singbox_cleanup_download_workspace || true
+  die "$message"
+}
+
 singbox_api_url_for_version() {
   local requested=${1:-}
   if [[ -z "$requested" || "$requested" == latest ]]; then
@@ -178,25 +240,36 @@ install_singbox_from_release() {
     assert_official_singbox_release_url "$checksum_url"
   fi
 
-  local archive_file="$RUNTIME_DIR/sing-box-${version}-${HOST_ARCH}.$$.${RANDOM}.tar.gz"
-  local checksum_file="$RUNTIME_DIR/sing-box-${version}.$$.${RANDOM}.SHA256SUMS"
-  local extract_dir="$RUNTIME_DIR/sing-box-${version}-${HOST_ARCH}-extract.$$.${RANDOM}"
-  local candidate_list="$RUNTIME_DIR/sing-box-candidates.$$.${RANDOM}.list"
-  # /run is commonly mounted noexec on hardened Debian hosts.  Keep the
-  # candidate next to the final binary so version/configuration probes run on
-  # the same executable filesystem as the installed service.
-  local candidate_dir
+  # /run is commonly a small tmpfs (and may be full) on VPS images.  Stage the
+  # archive, checksum, extraction tree and rollback copy beside the final
+  # binary on the persistent executable filesystem instead.
+  local candidate_dir work_dir
   candidate_dir=$(dirname -- "$SING_BOX_BINARY") || die '无法确定 sing-box 候选目录。'
+  ensure_dir "$candidate_dir" 755 || die '无法准备 sing-box 候选目录。'
+  singbox_cleanup_stale_download_workspaces "$candidate_dir" \
+    || die '无法清理 sing-box 下载暂存目录。'
+  singbox_cleanup_stale_runtime_artifacts || die '无法清理 sing-box 运行时暂存文件。'
+  singbox_cleanup_download_workspace || die '无法清理上一次 sing-box 下载暂存目录。'
+  work_dir=$(mktemp -d "$candidate_dir/.ss-manager-sing-box-work.XXXXXXXX") \
+    || die '无法创建 sing-box 下载暂存目录；请检查磁盘空间。'
+  chmod 700 -- "$work_dir" || { rm -rf -- "$work_dir"; die '无法保护 sing-box 下载暂存目录。'; }
+  SINGBOX_DOWNLOAD_WORKDIR="$work_dir"
+  SINGBOX_DOWNLOAD_WORKROOT="$candidate_dir"
+  local archive_file="$work_dir/archive.tar.gz"
+  local checksum_file="$work_dir/checksums.txt"
+  local extract_dir="$work_dir/extract"
+  local candidate_list="$work_dir/candidates.list"
+  # Keep the candidate next to the final binary so version/configuration
+  # probes run on the same executable filesystem as the installed service.
   local candidate="$candidate_dir/.sing-box-${version}-${HOST_ARCH}.candidate.${BASHPID}.${RANDOM}"
-  [[ ! -e "$archive_file" && ! -L "$archive_file" && ! -e "$checksum_file" && ! -L "$checksum_file" \
-    && ! -e "$extract_dir" && ! -L "$extract_dir" && ! -e "$candidate" && ! -L "$candidate" ]] \
-    || die 'sing-box 下载或安装暂存路径已存在，拒绝覆盖。'
-  mkdir -m 700 -- "$extract_dir" || die '无法创建 sing-box 解压目录。'
+  [[ ! -e "$candidate" && ! -L "$candidate" ]] \
+    || singbox_die_after_download_cleanup 'sing-box 下载或安装暂存路径已存在，拒绝覆盖。'
+  mkdir -m 700 -- "$extract_dir" \
+    || singbox_die_after_download_cleanup '无法创建 sing-box 解压目录。'
   info "正在下载 sing-box $version（$HOST_ARCH）……"
   if ! curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 120 \
     --output "$archive_file" -- "$archive_url"; then
-    rm -f -- "$archive_file"
-    die 'sing-box 官方 Release 下载失败；未替换现有二进制。'
+    singbox_die_after_download_cleanup 'sing-box 官方 Release 下载失败；未替换现有二进制。'
   fi
   local expected actual
   if [[ -n "$archive_digest" ]]; then
@@ -204,48 +277,57 @@ install_singbox_from_release() {
   else
     if ! curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 30 \
       --output "$checksum_file" -- "$checksum_url"; then
-      rm -f -- "$archive_file" "$checksum_file"
-      die 'sing-box 官方校验文件下载失败；未替换现有二进制。'
+      singbox_die_after_download_cleanup 'sing-box 官方校验文件下载失败；未替换现有二进制。'
     fi
     expected=$(checksum_file_digest_for_asset "$checksum_file" "$archive_name") \
-      || die "官方 SHA256 文件中必须且只能包含一个 $archive_name 校验值。"
+      || singbox_die_after_download_cleanup "官方 SHA256 文件中必须且只能包含一个 $archive_name 校验值。"
   fi
-  [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || die "官方 SHA256 文件中没有 $archive_name 的有效校验值。"
-  actual=$(sha256sum -- "$archive_file" | awk '{print $1}') || die '无法计算 sing-box 下载文件摘要。'
-  [[ "${actual,,}" == "${expected,,}" ]] || die "sing-box 下载校验失败，已停止替换。"
+  [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] \
+    || singbox_die_after_download_cleanup "官方 SHA256 文件中没有 $archive_name 的有效校验值。"
+  actual=$(sha256sum -- "$archive_file" | awk '{print $1}') \
+    || singbox_die_after_download_cleanup '无法计算 sing-box 下载文件摘要。'
+  [[ "${actual,,}" == "${expected,,}" ]] \
+    || singbox_die_after_download_cleanup 'sing-box 下载校验失败，已停止替换。'
 
   if tar -tzf "$archive_file" | awk '/^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}'; then :; else
-    die 'sing-box 官方归档包含不安全路径，已停止解压。'
+    singbox_die_after_download_cleanup 'sing-box 官方归档包含不安全路径，已停止解压。'
   fi
   if tar -tvzf "$archive_file" | awk 'substr($1,1,1) != "-" && substr($1,1,1) != "d" {bad=1} END {exit bad}'; then :; else
-    die 'sing-box 官方归档包含链接、设备或其他非普通条目，已停止解压。'
+    singbox_die_after_download_cleanup 'sing-box 官方归档包含链接、设备或其他非普通条目，已停止解压。'
   fi
-  tar -xzf "$archive_file" -C "$extract_dir" --no-same-owner --no-same-permissions || die 'sing-box 官方归档解压失败。'
+  tar -xzf "$archive_file" -C "$extract_dir" --no-same-owner --no-same-permissions \
+    || singbox_die_after_download_cleanup 'sing-box 官方归档解压失败。'
   local extracted
   local -a extracted_candidates=()
-  [[ ! -e "$candidate_list" && ! -L "$candidate_list" ]] || die 'sing-box 归档枚举暂存文件已存在。'
+  [[ ! -e "$candidate_list" && ! -L "$candidate_list" ]] \
+    || singbox_die_after_download_cleanup 'sing-box 归档枚举暂存文件已存在。'
   find "$extract_dir" -type f -name sing-box -perm -u+x -print0 >"$candidate_list" \
-    || { rm -f -- "$candidate_list"; die '无法枚举 sing-box 归档中的可执行文件。'; }
+    || singbox_die_after_download_cleanup '无法枚举 sing-box 归档中的可执行文件。'
   while IFS= read -r -d '' extracted; do extracted_candidates+=("$extracted"); done <"$candidate_list"
-  rm -f -- "$candidate_list" || die 'sing-box 归档枚举暂存文件清理失败。'
-  (( ${#extracted_candidates[@]} == 1 )) || die '官方归档必须且只能包含一个可执行 sing-box。'
+  rm -f -- "$candidate_list" \
+    || singbox_die_after_download_cleanup 'sing-box 归档枚举暂存文件清理失败。'
+  (( ${#extracted_candidates[@]} == 1 )) \
+    || singbox_die_after_download_cleanup '官方归档必须且只能包含一个可执行 sing-box。'
   extracted=${extracted_candidates[0]}
-  install -m 755 -- "$extracted" "$candidate" || die '无法安装 sing-box 候选二进制。'
+  install -m 755 -- "$extracted" "$candidate" \
+    || singbox_die_after_download_cleanup '无法安装 sing-box 候选二进制。'
   local candidate_version
   candidate_version=$("$candidate" version 2>/dev/null | awk 'NR == 1 { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+([-.].*)?$/) { print $i; exit } }') \
-    || die 'sing-box 候选二进制无法执行。'
-  [[ "$candidate_version" == "$version" ]] || die "下载的 sing-box 版本与 Release 标签不一致。"
+    || singbox_die_after_download_cleanup 'sing-box 候选二进制无法执行。'
+  [[ "$candidate_version" == "$version" ]] \
+    || singbox_die_after_download_cleanup '下载的 sing-box 版本与 Release 标签不一致。'
   if [[ -f "$SING_BOX_CONFIG" ]]; then
-    "$candidate" check -c "$SING_BOX_CONFIG" >/dev/null || die "新 sing-box 无法读取当前配置，已停止替换。"
+    "$candidate" check -c "$SING_BOX_CONFIG" >/dev/null \
+      || singbox_die_after_download_cleanup '新 sing-box 无法读取当前配置，已停止替换。'
   fi
 
-  local old_binary="$RUNTIME_DIR/sing-box.previous"
+  local old_binary="$work_dir/previous"
   if [[ -x "$SING_BOX_BINARY" ]]; then
-    install -m 755 -- "$SING_BOX_BINARY" "$old_binary" || die '无法备份当前 sing-box 二进制。'
+    install -m 755 -- "$SING_BOX_BINARY" "$old_binary" \
+      || singbox_die_after_download_cleanup '无法备份当前 sing-box 二进制。'
   fi
   if ! atomic_file_write "$candidate" "$SING_BOX_BINARY" 755 755; then
-    rm -rf -- "$extract_dir" "$archive_file" "$checksum_file" "$candidate" "$old_binary"
-    die 'sing-box 二进制替换失败；版本状态保持不变。'
+    singbox_die_after_download_cleanup 'sing-box 二进制替换失败；版本状态保持不变。'
   fi
   if [[ -f "$SING_BOX_CONFIG" ]] && ! "$SING_BOX_BINARY" check -c "$SING_BOX_CONFIG" >/dev/null 2>&1; then
     if [[ -x "$old_binary" ]]; then
@@ -262,8 +344,7 @@ install_singbox_from_release() {
     else
       rm -f -- "$SING_BOX_BINARY" || die '严重：摘要检查失败且新 sing-box 无法移除。'
     fi
-    rm -rf -- "$extract_dir" "$archive_file" "$checksum_file" "$candidate" "$old_binary"
-    die 'sing-box 安装后摘要检查失败，已恢复替换前的二进制。'
+    singbox_die_after_download_cleanup 'sing-box 安装后摘要检查失败，已恢复替换前的二进制。'
   }
   if ! singbox_commit_binary_state "$version" true "$installed_digest"; then
     if [[ -x "$old_binary" ]]; then
@@ -271,10 +352,9 @@ install_singbox_from_release() {
     else
       rm -f -- "$SING_BOX_BINARY" || die '严重：管理状态失败且新 sing-box 无法移除。'
     fi
-    rm -rf -- "$extract_dir" "$archive_file" "$checksum_file" "$candidate" "$old_binary"
-    die 'sing-box 版本/摘要管理状态写入失败，已恢复替换前的二进制。'
+    singbox_die_after_download_cleanup 'sing-box 版本/摘要管理状态写入失败，已恢复替换前的二进制。'
   fi
-  rm -rf -- "$extract_dir" "$archive_file" "$checksum_file" "$candidate" "$old_binary" \
+  singbox_cleanup_download_workspace \
     || warn 'sing-box 已安装，但下载暂存文件清理不完整。'
   success "已安装 sing-box $version（来源：SagerNet/sing-box 官方 Release）。"
 }

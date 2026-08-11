@@ -135,6 +135,9 @@ INSTALL_TRANSACTION_ACTIVE=1
 install_transaction_exit_handler() {
   local status=$?
   trap - EXIT
+  if [[ -n "${SINGBOX_DOWNLOAD_WORKDIR:-}" ]] && ! singbox_cleanup_download_workspace; then
+    error 'sing-box 下载暂存目录清理失败；请保留安装事务证据以便恢复。'
+  fi
   if [[ "${INSTALL_TRANSACTION_ACTIVE:-0}" == 1 && "$status" -ne 0 ]]; then
     set +e
     error "安装/修复在退出码 $status 处中断，正在恢复安装前的完整状态。"

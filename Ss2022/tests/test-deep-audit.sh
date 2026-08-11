@@ -351,6 +351,8 @@ grep -Fq 'SS_MANAGER_SERVICE_TAKEOVER_APPROVED=0' "$ROOT/install.sh" \
   || fail_test 'installer trusts an inherited service-takeover approval'
 grep -Fq '[[ "${SS_MANAGER_SERVICE_TAKEOVER_APPROVED:-0}" == 1 ]]' "$ROOT/lib/singbox.sh" \
   || fail_test 'sing-box unit replacement does not require the preflight takeover approval'
+grep -Fq 'for name in "${service_names[@]}"; do' "$ROOT/install.sh" \
+  || fail_test 'service takeover prompts still run with stdin redirected to the service-name producer'
 (
   INIT_SYSTEM=systemd
   service_active=1

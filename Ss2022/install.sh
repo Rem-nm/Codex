@@ -47,11 +47,18 @@ install_preflight_existing_paths() {
 
 install_preflight_service_ownership() {
   local name path source presence_status
+  local -a service_names=()
   # This approval is an in-process result of the prompt below.  Never trust a
   # value inherited from the caller to authorize replacing a foreign service.
   SS_MANAGER_SERVICE_TAKEOVER_APPROVED=0
+  # Read service names before prompting.  A prompt inside a while-loop whose
+  # stdin is a process-substitution pipe would consume service names instead
+  # of the operator's y/n answer (and appear to skip the prompt on a TTY).
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
+    service_names+=("$name")
+  done < <(install_transaction_service_names)
+  for name in "${service_names[@]}"; do
     path=$(service_definition_path "$name") || return 1
     if service_definition_path_present "$name" && ! service_definition_is_managed "$name"; then
       if [[ "$name" == "$SING_BOX_SERVICE" ]]; then
@@ -83,7 +90,7 @@ install_preflight_service_ownership() {
       source="$SCRIPT_DIR/openrc/$OPENRC_TRAFFIC_SERVICE"
     fi
     [[ -f "$source" && ! -L "$source" ]] || die "安装源缺少常规服务模板或模板为符号链接：$source"
-  done < <(install_transaction_service_names)
+  done
   export SS_MANAGER_SERVICE_TAKEOVER_APPROVED
 }
 

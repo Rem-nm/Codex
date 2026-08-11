@@ -168,6 +168,15 @@ EOF
 legacy_tc_filter=$(tc_filter_normalize_json "$legacy_tc_filter_output")
 jq -e 'length == 2 and .[1].options.actions[0].kind == "police" and .[1].options.actions[0].index == 1900078259 and .[1].options.actions[0].bind == 2' <<<"$legacy_tc_filter" >/dev/null
 
+legacy_tc_filter_without_stats=$(cat <<'EOF'
+[{"protocol":"ip","pref":65000,"kind":"flower","chain":0},{"protocol":"ip","pref":65000,"kind":"flower","chain":0,"options":{"handle":1,"keys":{"eth_type":"ipv4","ip_proto":"tcp","src_port":9},"actions":[{"order":1 police 0x7140e4b3 rate 1Mbit burst 64Kb mtu 64Kb ,"control_action":{"type":"drop"} overhead 0b
+ ref 3 bind 2
+,"cookie":"8578a2a2f5b7633e44fe29abadd5767e"}]}}]
+EOF
+)
+legacy_tc_filter_without_stats_normalized=$(tc_filter_normalize_json "$legacy_tc_filter_without_stats")
+jq -e 'length == 2 and .[1].options.actions[0].kind == "police" and .[1].options.actions[0].bind == 2 and (.[1].options.actions[0].stats // null) == null' <<<"$legacy_tc_filter_without_stats_normalized" >/dev/null
+
 grep -q 'cp -a -- "$path" "$preparing/$name.present"' "$ROOT/lib/backup.sh"
 grep -q 'cp -a -- "$present" "$path"' "$ROOT/lib/backup.sh"
 

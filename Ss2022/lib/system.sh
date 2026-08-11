@@ -166,7 +166,11 @@ install_packages() {
             -o 'Dir::Etc::sourceparts=-'
           )
         fi
-        if ! apt-get "${apt_options[@]}" install -y --no-install-recommends "${packages[@]}"; then
+        # The manager only needs the commands to exist.  Avoid upgrading
+        # unrelated already-installed packages during an idempotent repair;
+        # this also avoids triggering large post-install hooks (for example
+        # ca-certificates/man-db) before the manager itself is installed.
+        if ! apt-get "${apt_options[@]}" install -y --no-install-recommends --no-upgrade "${packages[@]}"; then
           apt_source_override_cleanup
           return 1
         fi

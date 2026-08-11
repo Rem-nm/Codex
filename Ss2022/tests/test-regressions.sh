@@ -239,6 +239,10 @@ captured_tc=$(
     exit 1
   }
 )
+grep -Fq 'cookie=$(jq -er '\''.cookie'\'' <<<"$action")' "$ROOT/lib/bandwidth.sh" || {
+  printf 'assertion failed: filter publication must refresh each action cookie\n' >&2
+  exit 1
+}
 assert_equal 49123 "$(tc_family_pref 49123 ip)" 'IPv4 tc rules must retain the base priority'
 assert_equal 49124 "$(tc_family_pref 49123 ipv6)" 'IPv6 tc rules must use a distinct priority'
 

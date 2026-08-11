@@ -1038,6 +1038,7 @@ bandwidth_apply_nodes() {
       direction=$(jq -er '.direction' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
       kind=$(jq -er '.kind' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
       index=$(jq -er '.index' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+      cookie=$(jq -er '.cookie' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
       while IFS= read -r family; do
         [[ -n "$family" ]] || continue
         family_pref=$(tc_family_pref "$pref" "$family") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }

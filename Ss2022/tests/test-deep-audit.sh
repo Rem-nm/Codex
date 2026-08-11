@@ -353,6 +353,21 @@ grep -Fq '[[ "${SS_MANAGER_SERVICE_TAKEOVER_APPROVED:-0}" == 1 ]]' "$ROOT/lib/si
   || fail_test 'sing-box unit replacement does not require the preflight takeover approval'
 grep -Fq 'for name in "${service_names[@]}"; do' "$ROOT/install.sh" \
   || fail_test 'service takeover prompts still run with stdin redirected to the service-name producer'
+
+# Official sing-box archives can be larger than a VPS /run tmpfs.  All
+# download, extraction and rollback artifacts must therefore live beside the
+# persistent binary, while old /run artifacts are only cleaned by exact names.
+grep -Fq 'work_dir=$(mktemp -d "$candidate_dir/.ss-manager-sing-box-work.' "$ROOT/lib/singbox.sh" \
+  || fail_test 'sing-box downloads are still staged under the small runtime tmpfs'
+grep -Fq 'singbox_cleanup_stale_runtime_artifacts' "$ROOT/lib/singbox.sh" \
+  || fail_test 'stale runtime sing-box artifacts are not cleaned safely'
+if grep -Eq 'local (archive_file|checksum_file|extract_dir|candidate_list|old_binary)="\$RUNTIME_DIR' "$ROOT/lib/singbox.sh"; then
+  fail_test 'sing-box archive or rollback paths still use RUNTIME_DIR'
+fi
+grep -Fq 'singbox_cleanup_download_workspace' "$ROOT/install.sh" \
+  || fail_test 'install transaction does not clean a failed sing-box download workspace'
+grep -Fq 'singbox_cleanup_download_workspace' "$ROOT/lib/update.sh" \
+  || fail_test 'update transaction does not clean a failed sing-box download workspace'
 (
   INIT_SYSTEM=systemd
   service_active=1

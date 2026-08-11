@@ -667,7 +667,7 @@ tc_rule_json_handles() {
       | select(any($actions[];
           (((.kind // "") | tostring | ascii_downcase) == $expected_action)
           and ((((.index // -1) | tonumber?) // -1) == $expected_index)))
-      | .handle // empty
+      | ($options.handle // .handle // empty)
     ' <<<"$rules_json"
 }
 

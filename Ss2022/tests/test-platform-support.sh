@@ -62,6 +62,16 @@ assert_equal 2 "$service_presence_status" 'empty failed systemd presence query m
 service_enabled_status=0
 service_is_enabled sing-box || service_enabled_status=$?
 assert_equal 2 "$service_enabled_status" 'empty failed systemd enablement query must stay unknown'
+
+systemctl() {
+  case "$1" in
+    is-enabled) return 1 ;;
+    show) printf 'LoadState=not-found\n'; return 1 ;;
+  esac
+}
+service_enabled_status=0
+service_is_enabled sing-box || service_enabled_status=$?
+assert_equal 1 "$service_enabled_status" 'empty is-enabled output for an absent unit must prove disabled'
 service_active_status=0
 service_is_active sing-box || service_active_status=$?
 assert_equal 2 "$service_active_status" 'empty failed systemd active query must stay unknown'

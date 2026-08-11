@@ -20,8 +20,8 @@ Ss2022 是一个基于 [sing-box](https://sing-box.sagernet.org/) 的 Shadowsock
 root 安装入口必须同时固定完整 Git commit 和该 commit 的 GitHub 归档 SHA256；不接受分支名。下面的值会在每次正式发布时固定更新：
 
 ```bash
-SS_MANAGER_COMMIT='cfdbe4d413e9790092d35f2449979056c71eb31e'
-SS_MANAGER_ARCHIVE_SHA256='e536eaae5d42ff80c63d544e8a7419f5d5d7c986513ea0a98abfd03c28349e7c'
+SS_MANAGER_COMMIT='f33b686f733a8f6f11c0b8d597a38c3777c0e568'
+SS_MANAGER_ARCHIVE_SHA256='2a7d545671048a1bf3af6a714c8143fe11139d404fa4de9bc74b5290ec5134c3'
 curl -fsSL "https://raw.githubusercontent.com/Rem-nm/Codex/$SS_MANAGER_COMMIT/Ss2022/bootstrap.sh" \
   | SS_MANAGER_COMMIT="$SS_MANAGER_COMMIT" SS_MANAGER_ARCHIVE_SHA256="$SS_MANAGER_ARCHIVE_SHA256" sh
 ```
@@ -29,8 +29,8 @@ curl -fsSL "https://raw.githubusercontent.com/Rem-nm/Codex/$SS_MANAGER_COMMIT/Ss
 最小化 Alpine 默认没有 Bash/curl 时，可使用 BusyBox 自带的 wget 启动：
 
 ```bash
-SS_MANAGER_COMMIT='cfdbe4d413e9790092d35f2449979056c71eb31e'
-SS_MANAGER_ARCHIVE_SHA256='e536eaae5d42ff80c63d544e8a7419f5d5d7c986513ea0a98abfd03c28349e7c'
+SS_MANAGER_COMMIT='f33b686f733a8f6f11c0b8d597a38c3777c0e568'
+SS_MANAGER_ARCHIVE_SHA256='2a7d545671048a1bf3af6a714c8143fe11139d404fa4de9bc74b5290ec5134c3'
 wget -qO- "https://raw.githubusercontent.com/Rem-nm/Codex/$SS_MANAGER_COMMIT/Ss2022/bootstrap.sh" \
   | SS_MANAGER_COMMIT="$SS_MANAGER_COMMIT" SS_MANAGER_ARCHIVE_SHA256="$SS_MANAGER_ARCHIVE_SHA256" sh
 ```
@@ -41,7 +41,7 @@ wget -qO- "https://raw.githubusercontent.com/Rem-nm/Codex/$SS_MANAGER_COMMIT/Ss2
 bash install.sh
 ```
 
-安装过程会自动识别发行版以及 apt/yum/dnf/apk，安装必要依赖，使用 SagerNet 官方 GitHub Release 下载 sing-box，在 Debian/Ubuntu/CentOS/AlmaLinux 上创建 systemd 服务、在 Alpine 上创建 OpenRC 服务，配置 BBR/TCP Fast Open 能力，并安装 `/usr/local/bin/rem`。依赖包会先由系统包管理器补齐且失败时不会反向卸载；重复修复时如果所需命令已经存在会跳过无必要的 APT 更新，避免旧 Debian 软件源阻断既有安装。Debian 11 若仍配置 `bullseye/updates` 或 `bullseye-backports`，首次依赖安装前需先修复软件源；随后安装/修复会保存持久恢复日志，任一步失败会一起恢复旧程序、状态文件、服务定义、sing-box、`rem`、sysctl 文件和实时内核值。
+安装过程会自动识别发行版以及 apt/yum/dnf/apk，安装必要依赖，使用 SagerNet 官方 GitHub Release 下载 sing-box，在 Debian/Ubuntu/CentOS/AlmaLinux 上创建 systemd 服务、在 Alpine 上创建 OpenRC 服务，配置 BBR/TCP Fast Open 能力，并安装 `/usr/local/bin/rem`。依赖包会先由系统包管理器补齐且失败时不会反向卸载；重复修复时如果所需命令已经存在会跳过无必要的 APT 更新，避免旧 Debian 软件源阻断既有安装。Debian 11 若仍配置 `bullseye/updates` 或 `bullseye-backports`，依赖安装会临时使用官方 `bullseye`/`bullseye-security` 主源，不修改 `/etc/apt`；临时源也不可用时再提示升级系统或修复软件源。随后安装/修复会保存持久恢复日志，任一步失败会一起恢复旧程序、状态文件、服务定义、sing-box、`rem`、sysctl 文件和实时内核值。
 
 首次安装完成后不会询问“是否创建节点”，而是直接进入第一个节点创建流程。创建完成后，任意目录执行：
 

@@ -94,6 +94,27 @@ grep -qx openrc <<<"$apk_packages"
 grep -q 'apk add --no-cache procps-ng' "$ROOT/lib/system.sh"
 grep -q 'apk add --no-cache procps' "$ROOT/lib/system.sh"
 
+(
+  HOST_OS_ID=debian
+  HOST_OS_VERSION=11
+  apt_debian11_sources_stale() { return 0; }
+  apt-get() { :; }
+  apt_update_or_die
+  [[ -s "$APT_SOURCE_OVERRIDE" ]] || {
+    printf 'assertion failed: Debian 11 fallback source list was not created\n' >&2
+    exit 1
+  }
+  grep -Fqx 'deb http://security.debian.org/debian-security bullseye-security main' "$APT_SOURCE_OVERRIDE" || {
+    printf 'assertion failed: Debian 11 fallback did not use bullseye-security\n' >&2
+    exit 1
+  }
+  apt_source_override_cleanup
+  [[ -z "$APT_SOURCE_OVERRIDE" ]] || {
+    printf 'assertion failed: Debian 11 fallback source list was not cleaned\n' >&2
+    exit 1
+  }
+)
+
 grep -q 'alpine)' "$ROOT/lib/system.sh"
 grep -q 'INIT_SYSTEM=openrc' "$ROOT/lib/system.sh"
 grep -q '^# Managed by Ss2022$' "$ROOT/openrc/sing-box"

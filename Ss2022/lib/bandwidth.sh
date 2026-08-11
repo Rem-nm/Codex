@@ -85,9 +85,11 @@ probe_tc_capabilities() {
   fi
   if (( probe_ok == 1 )); then
     ingress_output=$(tc -s -j filter show dev "$interface" ingress 2>/dev/null) || probe_ok=0
-    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" 'type == "array" and length == $expected' >/dev/null 2>&1 <<<"$ingress_output" || probe_ok=0
+    if (( probe_ok == 1 )); then ingress_output=$(tc_filter_normalize_json "$ingress_output") || probe_ok=0; fi
+    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" '[.[] | select((.options? // null) | type == "object")] | length == $expected' >/dev/null 2>&1 <<<"$ingress_output" || probe_ok=0
     egress_output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null) || probe_ok=0
-    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" 'type == "array" and length == $expected' >/dev/null 2>&1 <<<"$egress_output" || probe_ok=0
+    if (( probe_ok == 1 )); then egress_output=$(tc_filter_normalize_json "$egress_output") || probe_ok=0; fi
+    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" '[.[] | select((.options? // null) | type == "object")] | length == $expected' >/dev/null 2>&1 <<<"$egress_output" || probe_ok=0
     if (( probe_ok == 1 )); then
       for family in "${families[@]}"; do
         family_pref=$(tc_family_pref 65000 "$family") || { probe_ok=0; break; }
@@ -260,6 +262,46 @@ tc_interface_exists() {
   return 1
 }
 
+tc_filter_normalize_json() {
+  local output=$1
+  if jq -e . >/dev/null 2>&1 <<<"$output"; then
+    printf '%s' "$output"
+    return 0
+  fi
+  # iproute2 5.10 emits the police action body as human-readable tokens
+  # inside otherwise JSON-looking filter output. Normalize that one legacy
+  # shape before applying the normal jq ownership and rule checks.
+  printf '%s' "$output" | python3 -c '
+import json
+import re
+import sys
+
+raw = sys.stdin.read()
+pattern = re.compile(
+    r"\{\"order\":(?P<order>[0-9]+)\s+police\s+0x(?P<index>[0-9A-Fa-f]+).*?\"control_action\":(?P<control>\{.*?\})\s+overhead\s+\S+\s+ref\s+(?P<ref>[0-9]+)\s+bind\s+(?P<bind>[0-9]+),(?P<after>.*?)\"cookie\":\"(?P<cookie>[0-9A-Fa-f]{32})\"\}",
+    re.S,
+)
+
+def replace(match):
+    return (
+        "{\"order\":" + match.group("order")
+        + ",\"kind\":\"police\",\"index\":" + str(int(match.group("index"), 16))
+        + ",\"control_action\":" + match.group("control")
+        + ",\"ref\":" + match.group("ref")
+        + ",\"bind\":" + match.group("bind")
+        + "," + match.group("after")
+        + "\"cookie\":\"" + match.group("cookie") + "\"}"
+    )
+
+normalized = pattern.sub(replace, raw)
+try:
+    value = json.loads(normalized)
+except (TypeError, ValueError):
+    raise SystemExit(1)
+json.dump(value, sys.stdout, separators=(",", ":"))
+'
+}
+
 tc_filter_scoped_json() {
   local interface=$1 direction=$2 family=$3 pref=$4 raw qdisc interface_status=0
   tc_interface_exists "$interface" || interface_status=$?
@@ -274,6 +316,7 @@ tc_filter_scoped_json() {
     return 0
   fi
   raw=$(tc -j filter show dev "$interface" "$direction" 2>/dev/null) || return 1
+  raw=$(tc_filter_normalize_json "$raw") || return 1
   jq -ce --arg family "$family" --argjson pref "$pref" '
     [ .[]
       | select((((.pref // -1) | tonumber?) // -1) == $pref)

@@ -510,7 +510,7 @@ fi
     printf '\n' >>"$probe_log"
     if [[ "${1:-}" == -V ]]; then printf '%s\n' 'tc utility, iproute2-test'; return 0; fi
     if [[ "${1:-}" == -j && "${2:-}" == actions ]]; then printf '%s\n' '[]'; return 0; fi
-    if [[ "${1:-}" == -s && "${2:-}" == -j && "${3:-}" == filter ]]; then printf '%s\n' '[{},{}]'; return 0; fi
+    if [[ "${1:-}" == -s && "${2:-}" == -j && "${3:-}" == filter ]]; then printf '%s\n' '[{"options":{}},{"options":{}}]'; return 0; fi
     if [[ "${1:-}" == -s && "${2:-}" == -j && "${3:-}" == actions ]]; then printf '%s\n' '{}'; return 0; fi
     return 0
   }

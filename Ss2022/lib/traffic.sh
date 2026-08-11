@@ -179,6 +179,7 @@ tc_counter_json() {
     output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null) || return 1
   fi
   [[ -n "$output" ]] || return 1
+  output=$(tc_filter_normalize_json "$output") || return 1
   jq -e 'type == "array"' >/dev/null 2>&1 <<<"$output" || return 1
   local ipv6_pref
   ipv6_pref=$(tc_family_pref "$pref" ipv6) || return 1

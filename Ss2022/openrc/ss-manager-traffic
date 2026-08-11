@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+# Managed by Ss2022
+# shellcheck disable=SC2034
+
+name="Ss2022 traffic maintenance"
+description="Ss2022 traffic accounting and quota maintenance"
+supervisor="supervise-daemon"
+command="/opt/ss-manager/openrc/ss-manager-traffic-loop.sh"
+pidfile="/run/ss-manager/traffic-supervisor.pid"
+respawn_delay=5
+respawn_max=0
+retry="TERM/10/KILL/5"
+umask=077
+
+depend() {
+  after sing-box
+}
+
+start_pre() {
+  # Never retain a manager transaction lock inherited from rc-service.
+  exec 9>&-
+  checkpath --directory --mode 0700 /run/ss-manager
+}

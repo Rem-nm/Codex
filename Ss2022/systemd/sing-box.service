@@ -1,0 +1,22 @@
+[Unit]
+Description=sing-box managed by Ss2022
+Documentation=https://sing-box.sagernet.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Managed by Ss2022
+Type=simple
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/run/ss-manager /var/lib/ss-manager
+
+[Install]
+WantedBy=multi-user.target

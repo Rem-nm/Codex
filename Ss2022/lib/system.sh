@@ -100,14 +100,50 @@ runtime_commands_present() {
   done < <(required_runtime_commands)
 }
 
+apt_debian11_sources_stale() {
+  [[ "$HOST_OS_ID" == debian && "$HOST_OS_VERSION" == 11* ]] \
+    && grep -RqsE --include='*.list' --include='*.sources' \
+      'bullseye/updates|bullseye-backports' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null
+}
+
+APT_SOURCE_OVERRIDE=''
+
+apt_source_override_cleanup() {
+  if [[ -n "${APT_SOURCE_OVERRIDE:-}" ]]; then
+    rm -f -- "$APT_SOURCE_OVERRIDE" || true
+    APT_SOURCE_OVERRIDE=''
+  fi
+}
+
 apt_update_or_die() {
+  APT_SOURCE_OVERRIDE=''
+  if apt_debian11_sources_stale; then
+    # Bullseye's old backports and pre-bullseye-security spelling can make an
+    # otherwise usable host fail before package installation.  Use a minimal,
+    # signed source list for this one invocation only; never rewrite the
+    # operator's /etc/apt configuration or third-party repositories.
+    APT_SOURCE_OVERRIDE=$(mktemp) || die '无法创建 Debian 11 临时 APT 源列表。'
+    chmod 600 -- "$APT_SOURCE_OVERRIDE" || {
+      apt_source_override_cleanup
+      die '无法保护 Debian 11 临时 APT 源列表。'
+    }
+    printf '%s\n' \
+      'deb http://deb.debian.org/debian bullseye main' \
+      'deb http://deb.debian.org/debian bullseye-updates main' \
+      'deb http://security.debian.org/debian-security bullseye-security main' \
+      >"$APT_SOURCE_OVERRIDE" || {
+      apt_source_override_cleanup
+      die '无法写入 Debian 11 临时 APT 源列表。'
+    }
+    warn '检测到 Debian 11 失效源；本次仅使用临时 bullseye/bullseye-security 源，不修改 /etc/apt 配置。'
+    if apt-get -o "Dir::Etc::sourcelist=$APT_SOURCE_OVERRIDE" -o 'Dir::Etc::sourceparts=-' update; then
+      return 0
+    fi
+    apt_source_override_cleanup
+    die 'Debian 11 临时 APT 源更新失败；请升级 Debian 或检查网络连接。'
+  fi
   if apt-get update; then
     return 0
-  fi
-  if [[ "$HOST_OS_ID" == debian && "$HOST_OS_VERSION" == 11* ]] \
-    && grep -RqsE --include='*.list' --include='*.sources' \
-      'bullseye/updates|bullseye-backports' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
-    die 'APT 软件源更新失败：Debian 11 仍包含失效的 bullseye/updates 或 bullseye-backports 源。请将安全源改为 bullseye-security，并删除或迁移 backports 源后重试；本项目未修改你的 APT 配置。'
   fi
   die 'APT 软件源更新失败；请先修复系统 APT 源后重试。'
 }
@@ -123,7 +159,18 @@ install_packages() {
       else
         export DEBIAN_FRONTEND=noninteractive
         apt_update_or_die
-        apt-get install -y --no-install-recommends "${packages[@]}"
+        local -a apt_options=()
+        if [[ -n "$APT_SOURCE_OVERRIDE" ]]; then
+          apt_options=(
+            -o "Dir::Etc::sourcelist=$APT_SOURCE_OVERRIDE"
+            -o 'Dir::Etc::sourceparts=-'
+          )
+        fi
+        if ! apt-get "${apt_options[@]}" install -y --no-install-recommends "${packages[@]}"; then
+          apt_source_override_cleanup
+          return 1
+        fi
+        apt_source_override_cleanup
       fi
       ;;
     dnf)

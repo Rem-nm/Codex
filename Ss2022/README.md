@@ -41,7 +41,7 @@ wget -qO- "https://raw.githubusercontent.com/Rem-nm/Codex/$SS_MANAGER_COMMIT/Ss2
 bash install.sh
 ```
 
-安装过程会自动识别发行版以及 apt/yum/dnf/apk，安装必要依赖，使用 SagerNet 官方 GitHub Release 下载 sing-box，在 Debian/Ubuntu/CentOS/AlmaLinux 上创建 systemd 服务、在 Alpine 上创建 OpenRC 服务，配置 BBR/TCP Fast Open 能力，并安装 `/usr/local/bin/rem`。依赖包会先由系统包管理器补齐且失败时不会反向卸载；重复修复时如果所需命令已经存在会跳过无必要的 APT 更新，避免旧 Debian 软件源阻断既有安装。Debian 11 若仍配置 `bullseye/updates` 或 `bullseye-backports`，首次依赖安装前需先修复软件源；随后安装/修复会保存持久恢复日志，任一步失败会一起恢复旧程序、状态文件、服务定义、sing-box、`rem`、sysctl 文件和实时内核值。
+安装过程会自动识别发行版以及 apt/yum/dnf/apk，安装必要依赖，使用 SagerNet 官方 GitHub Release 下载 sing-box，在 Debian/Ubuntu/CentOS/AlmaLinux 上创建 systemd 服务、在 Alpine 上创建 OpenRC 服务，配置 BBR/TCP Fast Open 能力，并安装 `/usr/local/bin/rem`。依赖包会先由系统包管理器补齐且失败时不会反向卸载；重复修复时如果所需命令已经存在会跳过无必要的 APT 更新，避免旧 Debian 软件源阻断既有安装。Debian 11 若仍配置 `bullseye/updates` 或 `bullseye-backports`，依赖安装会临时使用官方 `bullseye`/`bullseye-security` 主源，不修改 `/etc/apt`；临时源也不可用时再提示升级系统或修复软件源。随后安装/修复会保存持久恢复日志，任一步失败会一起恢复旧程序、状态文件、服务定义、sing-box、`rem`、sysctl 文件和实时内核值。
 
 首次安装完成后不会询问“是否创建节点”，而是直接进入第一个节点创建流程。创建完成后，任意目录执行：
 

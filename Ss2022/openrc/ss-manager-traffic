@@ -18,5 +18,7 @@ depend() {
 }
 
 start_pre() {
+  # Never retain a manager transaction lock inherited from rc-service.
+  exec 9>&-
   checkpath --directory --mode 0700 /run/ss-manager
 }

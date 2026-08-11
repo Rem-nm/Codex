@@ -93,4 +93,16 @@ tar -xzf "$archive" -C "$tmp_dir" --strip-components=1 --no-same-owner --no-same
 [ -f "$tmp_dir/Ss2022/lib/common.sh" ] || fail '项目归档缺少必要模块。'
 [ -f "$tmp_dir/Ss2022/VERSION" ] || fail '项目归档缺少 VERSION。'
 
-bash "$tmp_dir/Ss2022/install.sh"
+# When this entry point is started as `wget -qO- ... | sh`, stdin belongs to
+# the bootstrap source and is already exhausted by the time install.sh asks a
+# takeover question.  Reattach the child to the controlling terminal for the
+# interactive case; keep stdin unchanged for callers that deliberately run in
+# a non-interactive environment without a tty.
+if [ -r /dev/tty ] && [ -w /dev/tty ] && exec 3<>/dev/tty 2>/dev/null; then
+  bash "$tmp_dir/Ss2022/install.sh" <&3
+  status=$?
+  exec 3>&-
+  exit "$status"
+else
+  bash "$tmp_dir/Ss2022/install.sh"
+fi

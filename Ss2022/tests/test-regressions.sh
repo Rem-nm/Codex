@@ -118,6 +118,35 @@ rm -rf -- "$manager_package_fixture"
   rm -rf -- "$binary_identity_fixture"
 )
 
+(
+  legacy_fixture=$(mktemp -d)
+  mkdir -p -- "$legacy_fixture/data" "$legacy_fixture/run"
+  node_id=0123456789abcdef0123456789abcdef
+  NODES_FILE="$legacy_fixture/data/nodes.json"
+  TRAFFIC_FILE="$legacy_fixture/data/traffic.json"
+  COUNTERS_FILE="$legacy_fixture/data/tc-counters.json"
+  RUNTIME_DIR="$legacy_fixture/run"
+  jq -n --arg id "$node_id" '{schema_version:1,nodes:[{
+    node_id:$id,name:"Legacy",method:"2022-blake3-aes-256-gcm",
+    password:"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",port:20001,
+    address:"192.0.2.1",address_type:"ipv4",status:"enabled",status_reason:"",
+    quota_bytes:0,reset_day:1,upload_limit_mbps:0,download_limit_mbps:0,
+    created_at:"2026-01-01T00:00:00Z",updated_at:"2026-01-01T00:00:00Z",
+    last_reset_at:"2026-01-01T00:00:00Z",next_reset_at:"2026-02-01T00:00:00Z"}]}' >"$NODES_FILE"
+  jq -n --arg id "$node_id" '{schema_version:1,nodes:{($id):{
+    current_upload_bytes:10,current_download_bytes:20,total_upload_bytes:100,total_download_bytes:200,
+    quota_bytes:0,reset_day:1,last_reset_at:"2026-01-01T00:00:00Z",
+    next_reset_at:"2026-02-01T00:00:00Z",updated_at:"2026-01-01T00:00:00Z"}}}' >"$TRAFFIC_FILE"
+  jq -n --arg id "$node_id" '{schema_version:1,nodes:{($id):{upload_kernel_bytes:77,download_kernel_bytes:88}}}' >"$COUNTERS_FILE"
+  LEGACY_TRAFFIC_STATE_NEEDS_MIGRATION=1
+  assert_true 'pre-1.0.4 traffic state must migrate during the install transaction' traffic_migrate_legacy_state
+  validate_traffic_file_semantic "$TRAFFIC_FILE" "$NODES_FILE"
+  assert_equal 77 "$(jq -r --arg id "$node_id" '.nodes[$id].upload_kernel_bytes' "$TRAFFIC_FILE")" 'legacy upload baseline was not preserved'
+  assert_equal 88 "$(jq -r --arg id "$node_id" '.nodes[$id].download_kernel_bytes' "$TRAFFIC_FILE")" 'legacy download baseline was not preserved'
+  assert_equal 300 "$(jq -r --arg id "$node_id" '.nodes[$id].total_upload_bytes + .nodes[$id].total_download_bytes' "$TRAFFIC_FILE")" 'legacy totals changed during migration'
+  rm -rf -- "$legacy_fixture"
+)
+
 assert_equal '2026-07' "$(settlement_period_label '2026-08-01T00:00:00Z')" 'a reset on day 1 must label the month whose traffic just closed'
 assert_equal '2026-08' "$(settlement_period_label '2026-08-15T00:00:00Z')" 'an initial partial reset-day cycle must keep its closing month'
 assert_equal '2026-09' "$(settlement_period_label '2026-09-15T00:00:00Z')" 'the next reset-day cycle must have a distinct month label'
@@ -526,6 +555,8 @@ grep -q 'MENU_ACTION_STATUS' "$ROOT/ss-manager.sh"
 grep -q 'generate_singbox_config "$NODES_FILE" "$candidate"' "$ROOT/install.sh"
 grep -q 'backup_create_manual_flow' "$ROOT/lib/backup.sh"
 grep -q 'validate_installed_state_files' "$ROOT/install.sh"
+grep -Fq 'bash "$tmp_dir/Ss2022/install.sh" <&3' "$ROOT/bootstrap.sh"
+grep -q 'traffic_migrate_legacy_state' "$ROOT/install.sh"
 grep -q 'release_manager_lock' "$ROOT/install.sh"
 if grep -q 'load_json_or_default "$COUNTERS_FILE"' "$ROOT/lib/common.sh"; then
   printf 'assertion failed: new installations must not recreate the legacy two-file traffic baseline\n' >&2

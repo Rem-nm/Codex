@@ -27,6 +27,84 @@ traffic_new_entry() {
     '{current_upload_bytes:0,current_download_bytes:0,total_upload_bytes:0,total_download_bytes:0,upload_kernel_bytes:0,download_kernel_bytes:0,quota_bytes:$quota,reset_day:$reset_day,last_reset_at:$now,next_reset_at:$next,updated_at:$now}'
 }
 
+traffic_legacy_file_semantic() {
+  local source=$1 nodes_source=${2:-}
+  jq -e --argjson max "$MAX_SAFE_JSON_INTEGER" '
+    def iso: type == "string" and ((try fromdateiso8601 catch null) != null);
+    def uint: type == "number" and . >= 0 and . <= $max and floor == .;
+    .schema_version == 1 and (.nodes | type == "object")
+    and all(.nodes | to_entries[];
+      (.key | test("^[a-f0-9]{32}$"))
+      and (.value | type == "object")
+      and (.value as $entry |
+        all(["current_upload_bytes","current_download_bytes","total_upload_bytes","total_download_bytes","quota_bytes"][];
+          . as $key | ($entry[$key] | uint))
+        and ($entry.reset_day | type == "number" and floor == . and . >= 1 and . <= 28)
+        and ($entry.last_reset_at | iso)
+        and ($entry.next_reset_at | iso)
+        and ($entry.last_reset_at < $entry.next_reset_at)
+        and ((($entry.updated_at // $entry.last_reset_at) | iso))
+        and ((($entry.upload_kernel_bytes // 0) | uint))
+        and ((($entry.download_kernel_bytes // 0) | uint)))
+    )
+  ' "$source" >/dev/null 2>&1 || return 1
+  if [[ -n "$nodes_source" ]]; then
+    jq -e --slurpfile nodes "$nodes_source" '
+      ([.nodes | keys[]] | sort) == ([$nodes[0].nodes[].node_id] | sort)
+    ' "$source" >/dev/null 2>&1 || return 1
+  fi
+}
+
+traffic_migrate_legacy_state() {
+  [[ "${LEGACY_TRAFFIC_STATE_NEEDS_MIGRATION:-0}" == 1 ]] || return 0
+  traffic_legacy_file_semantic "$TRAFFIC_FILE" "$NODES_FILE" || return 1
+
+  local counters_json='{"schema_version":1,"nodes":{}}'
+  if [[ -e "$COUNTERS_FILE" || -L "$COUNTERS_FILE" ]]; then
+    if [[ -f "$COUNTERS_FILE" && ! -L "$COUNTERS_FILE" ]] \
+      && jq -e --argjson max "$MAX_SAFE_JSON_INTEGER" '
+        (.schema_version == 1 and (.nodes | type == "object"))
+        and all(.nodes | to_entries[];
+          (.key | test("^[a-f0-9]{32}$"))
+          and (.value | type == "object")
+          and ((.value.upload_kernel_bytes // 0) | type == "number" and . >= 0 and . <= $max and floor == .)
+          and ((.value.download_kernel_bytes // 0) | type == "number" and . >= 0 and . <= $max and floor == .))
+      ' "$COUNTERS_FILE" >/dev/null 2>&1; then
+      counters_json=$(jq -c . "$COUNTERS_FILE") || return 1
+    else
+      warn '旧版 tc-counters.json 无法安全读取；将保留累计流量并从零建立新的内核计数基线。'
+    fi
+  fi
+
+  local temporary
+  temporary=$(runtime_temp_file traffic-migration) || return 1
+  if ! jq --argjson counters "$counters_json" '
+    .nodes |= with_entries(
+      .key as $id
+      | .value as $entry
+      | .value = ($entry + {
+          upload_kernel_bytes: ($entry.upload_kernel_bytes // $counters.nodes[$id].upload_kernel_bytes // 0),
+          download_kernel_bytes: ($entry.download_kernel_bytes // $counters.nodes[$id].download_kernel_bytes // 0),
+          updated_at: ($entry.updated_at // $entry.last_reset_at)
+        })
+    )
+  ' "$TRAFFIC_FILE" >"$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if ! validate_traffic_file_semantic "$temporary" "$NODES_FILE"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  atomic_json_write "$temporary" "$TRAFFIC_FILE" 600 || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  rm -f -- "$temporary" || warn '旧版 traffic.json 已迁移，但迁移暂存文件清理失败。'
+  LEGACY_TRAFFIC_STATE_NEEDS_MIGRATION=0
+  info '旧版 traffic.json 已安全迁移，累计流量和节点关联保持不变。'
+}
+
 traffic_candidate_add_node() {
   local node_id=$1 quota=$2 reset_day=$3
   local entry

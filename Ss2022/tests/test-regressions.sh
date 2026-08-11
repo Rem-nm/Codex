@@ -224,7 +224,7 @@ captured_tc=$(
   tc() { printf '%q ' "$@"; }
   tc_create_shared_action gact 1000000001 0123456789abcdef0123456789abcdef 0
 )
-[[ "$captured_tc" == *'actions add action gact pass index 1000000001 cookie 0123456789abcdef0123456789abcdef'* ]] || {
+[[ "$captured_tc" == *'actions add action gact pass index 1000000001 cookie 0123456789abcdef0123456789abcdef skip_hw'* ]] || {
   printf 'assertion failed: unlimited aggregate action lacks identity/cookie\n' >&2
   exit 1
 }
@@ -233,7 +233,7 @@ captured_tc=$(
   tc() { printf '%q ' "$@"; }
   tc_create_shared_action police 1000000002 fedcba9876543210fedcba9876543210 20
 )
-[[ "$captured_tc" == *'actions add action police rate 20mbit burst 64kb mtu 64kb conform-exceed drop/pass index 1000000002 cookie fedcba9876543210fedcba9876543210'* ]] || {
+[[ "$captured_tc" == *'actions add action police rate 20mbit burst 64kb mtu 64kb conform-exceed drop/pass index 1000000002 cookie fedcba9876543210fedcba9876543210 skip_hw'* ]] || {
   printf 'assertion failed: limited aggregate action lacks police drop/pass or ownership cookie\n' >&2
   exit 1
 }
@@ -593,7 +593,7 @@ grep -q 'MENU_ACTION_STATUS' "$ROOT/ss-manager.sh"
 grep -q 'generate_singbox_config "$NODES_FILE" "$candidate"' "$ROOT/install.sh"
 grep -q 'backup_create_manual_flow' "$ROOT/lib/backup.sh"
 grep -q 'validate_installed_state_files' "$ROOT/install.sh"
-grep -Fq 'bash "$tmp_dir/Ss2022/install.sh" <&3' "$ROOT/bootstrap.sh"
+grep -Fq 'bash "$tmp_dir/Ss2022/install.sh" </dev/tty' "$ROOT/bootstrap.sh"
 grep -q 'traffic_migrate_legacy_state' "$ROOT/install.sh"
 grep -q 'release_manager_lock' "$ROOT/install.sh"
 if grep -q 'load_json_or_default "$COUNTERS_FILE"' "$ROOT/lib/common.sh"; then

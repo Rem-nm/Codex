@@ -113,16 +113,16 @@ tar -xzf "$archive" -C "$tmp_dir" --strip-components=1 --no-same-owner --no-same
 # interactive case; keep stdin unchanged for callers that deliberately run in
 # a non-interactive environment without a tty.
 status=0
-if [ -r /dev/tty ] && [ -w /dev/tty ] && exec 3<>/dev/tty 2>/dev/null; then
+if [ -r /dev/tty ] && [ -w /dev/tty ] \
+  && sh -c 'exec 3<>/dev/tty' 2>/dev/null; then
   # Do not let the bootstrap shell's `set -e` discard the child's exit
   # status before it can be reported.  This matters when a package hook,
   # capability probe, or service check stops the installer after APT has
   # already completed.
   set +e
-  bash "$tmp_dir/Ss2022/install.sh" <&3
+  bash "$tmp_dir/Ss2022/install.sh" </dev/tty
   status=$?
   set -e
-  exec 3>&-
 else
   set +e
   bash "$tmp_dir/Ss2022/install.sh"

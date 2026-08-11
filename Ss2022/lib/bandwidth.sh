@@ -589,10 +589,10 @@ tc_create_shared_action() {
   # create that shared action in this mode; subsequent filters reuse its index
   # and cookie exactly like the standalone path.
   if [[ "$kind" == police ]]; then
-    if tc actions add action police rate "${limit}mbit" burst 64kb mtu 64kb conform-exceed drop/pass index "$index" cookie "$cookie" 2>/dev/null; then
+    if tc actions add action police rate "${limit}mbit" burst 64kb mtu 64kb conform-exceed drop/pass index "$index" cookie "$cookie" skip_hw 2>/dev/null; then
       return 0
     fi
-  elif tc actions add action gact pass index "$index" cookie "$cookie" 2>/dev/null; then
+  elif tc actions add action gact pass index "$index" cookie "$cookie" skip_hw 2>/dev/null; then
     return 0
   fi
   if entry=$(tc_action_lookup "$kind" "$index"); then

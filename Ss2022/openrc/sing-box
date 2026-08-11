@@ -24,6 +24,10 @@ checkconfig() {
 }
 
 start_pre() {
+  # The installer/menu holds manager lock fd 9 while starting services. Do not
+  # let OpenRC's supervisor inherit that lock, or every later menu action
+  # would appear to be running concurrently forever.
+  exec 9>&-
   checkpath --directory --mode 0700 /run/ss-manager
   checkconfig
 }

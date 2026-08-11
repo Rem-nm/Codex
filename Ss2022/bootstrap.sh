@@ -42,8 +42,21 @@ esac
 
 if [ "${ID:-}" = alpine ]; then
   # A minimal Alpine image normally has BusyBox wget but not Bash/curl/tar.
-  apk add --no-cache bash ca-certificates curl tar >/dev/null \
-    || fail 'Alpine 基础安装依赖下载失败。'
+  # Do not refresh the repository indexes during an idempotent repair when
+  # these packages are already present.  Small Alpine containers can have a
+  # very low cgroup memory limit; an unnecessary apk index refresh may be OOM
+  # killed before the actual manager can inspect its existing installation.
+  bootstrap_packages=''
+  command -v bash >/dev/null 2>&1 || bootstrap_packages="$bootstrap_packages bash"
+  command -v curl >/dev/null 2>&1 || bootstrap_packages="$bootstrap_packages curl"
+  command -v tar >/dev/null 2>&1 || bootstrap_packages="$bootstrap_packages tar"
+  apk info -e ca-certificates >/dev/null 2>&1 || bootstrap_packages="$bootstrap_packages ca-certificates"
+  if [ -n "$bootstrap_packages" ]; then
+    # Word splitting is intentional: the package names above are constants.
+    # shellcheck disable=SC2086
+    apk add --no-cache $bootstrap_packages >/dev/null \
+      || fail 'Alpine 基础安装依赖下载失败。'
+  fi
 fi
 
 command -v bash >/dev/null 2>&1 || fail '系统缺少 Bash。'

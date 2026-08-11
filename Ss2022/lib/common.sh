@@ -20,7 +20,7 @@ if [[ -r "$VERSION_FILE" ]]; then
   IFS= read -r MANAGER_VERSION <"$VERSION_FILE" || true
   MANAGER_VERSION=${MANAGER_VERSION//$'\r'/}
 fi
-MANAGER_VERSION="${MANAGER_VERSION:-1.0.14}"
+MANAGER_VERSION="${MANAGER_VERSION:-1.0.20}"
 [[ "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
   printf 'Invalid manager VERSION: %s\n' "$MANAGER_VERSION" >&2
   exit 1
@@ -619,10 +619,14 @@ validate_traffic_file_semantic() {
 
 validate_history_file_semantic() {
   local source=$1
+  # Keep the escapes as JSON escapes for jq regex.  Doubling the
+  # backslashes makes the character class range from `\\` to `u`, which
+  # rejects ordinary names (for example, `alpine-renamed`) as if they
+  # contained a control character.
   jq -e --argjson max "$MAX_SAFE_JSON_INTEGER" '
     def iso: type == "string" and ((try fromdateiso8601 catch null) != null);
     def uint: type == "number" and . >= 0 and . <= $max and floor == .;
-    def clean_name: type == "string" and length >= 1 and length <= 64 and (test("[\\u0000-\\u001f\\u007f]") | not);
+    def clean_name: type == "string" and length >= 1 and length <= 64 and (test("[\u0000-\u001f\u007f]") | not);
     def traffic_snapshot:
       type == "object"
       and (. as $entry | all(["current_upload_bytes","current_download_bytes","total_upload_bytes","total_download_bytes","quota_bytes"][];

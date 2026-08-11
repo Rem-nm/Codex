@@ -103,10 +103,12 @@ assert_equal 'restart:sing-box' "$captured_service_call" 'restart must restart a
 PACKAGE_MANAGER=apk
 apk_packages=$(package_list)
 grep -qx bash <<<"$apk_packages"
+grep -qx gcompat <<<"$apk_packages"
 grep -qx iproute2 <<<"$apk_packages"
 grep -qx openrc <<<"$apk_packages"
 grep -q 'apk add --no-cache procps-ng' "$ROOT/lib/system.sh"
 grep -q 'apk add --no-cache procps' "$ROOT/lib/system.sh"
+grep -q 'apk info -e' "$ROOT/lib/system.sh"
 
 (
   HOST_OS_ID=debian
@@ -134,7 +136,11 @@ grep -q 'INIT_SYSTEM=openrc' "$ROOT/lib/system.sh"
 grep -q '^# Managed by Ss2022$' "$ROOT/openrc/sing-box"
 grep -q 'supervisor="supervise-daemon"' "$ROOT/openrc/sing-box"
 grep -q 'rc_ulimit="-n 1048576"' "$ROOT/openrc/sing-box"
+grep -q 'exec 9>&-' "$ROOT/openrc/sing-box"
 grep -q '^# Managed by Ss2022$' "$ROOT/openrc/ss-manager-traffic"
+grep -q 'exec 9>&-' "$ROOT/openrc/ss-manager-traffic"
+grep -q 'proc_cmdline' "$ROOT/lib/singbox.sh"
+grep -q 'cmdline' "$ROOT/lib/singbox.sh"
 
 if grep -R -n -E -- '-- "\$[A-Za-z_][A-Za-z0-9_]*" -o ' "$ROOT/lib" "$ROOT/bootstrap.sh"; then
   printf 'assertion failed: curl output option appears after end-of-options marker\n' >&2
@@ -143,6 +149,7 @@ fi
 grep -q -- '--output "$archive_file" -- "$archive_url"' "$ROOT/lib/singbox.sh"
 grep -q -- '--output "$archive" -- "$asset_url"' "$ROOT/lib/update.sh"
 grep -q -- '--output "$archive" -- "$archive_url"' "$ROOT/bootstrap.sh"
+grep -q 'apk info -e ca-certificates' "$ROOT/bootstrap.sh"
 grep -q '^trap cleanup 0$' "$ROOT/bootstrap.sh"
 grep -q 'set +e' "$ROOT/bootstrap.sh"
 grep -q '安装脚本退出（退出码' "$ROOT/bootstrap.sh"

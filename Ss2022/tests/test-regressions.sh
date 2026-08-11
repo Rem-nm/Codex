@@ -161,6 +161,22 @@ purged_history=$(traffic_candidate_purge_deleted_node "$history_test" node-a)
 assert_equal false "$(jq 'has("cycles") and (.cycles | has("node-a"))' <<<"$purged_history")" 'declining deleted-node history retention must purge completed cycles'
 rm -f -- "$history_test"
 
+deleted_history_test=$(mktemp)
+deleted_traffic_test=$(mktemp)
+deleted_node_id=0123456789abcdef0123456789abcdef
+printf '%s\n' '{"schema_version":1,"cycles":{}}' >"$deleted_history_test"
+jq -n --arg id "$deleted_node_id" '{schema_version:1,nodes:{($id):{
+  current_upload_bytes:0,current_download_bytes:0,total_upload_bytes:0,total_download_bytes:0,
+  upload_kernel_bytes:0,download_kernel_bytes:0,quota_bytes:0,reset_day:1,
+  last_reset_at:"2026-01-01T00:00:00Z",next_reset_at:"2026-02-01T00:00:00Z",
+  updated_at:"2026-01-01T00:00:00Z"}}}' >"$deleted_traffic_test"
+archived_history=$(traffic_candidate_archive_deleted_node "$deleted_history_test" "$deleted_node_id" 'alpine-renamed' "$deleted_traffic_test")
+archived_history_file=$(mktemp)
+printf '%s\n' "$archived_history" >"$archived_history_file"
+assert_true 'archiving a deleted node with an ordinary name must produce valid history' validate_history_file_semantic "$archived_history_file"
+rm -f -- "$archived_history_file"
+rm -f -- "$deleted_history_test" "$deleted_traffic_test"
+
 tc_json=$(jq -nc '[
   {protocol:"ip",pref:49123,kind:"flower",options:{keys:{ip_proto:"tcp",dst_port:20001},actions:[{kind:"gact",stats:{bytes:100}}]}},
   {protocol:"ip",pref:49123,kind:"flower",options:{keys:{ip_proto:"udp",dst_port:20001},actions:[{kind:"gact",stats:{bytes:200}}]}},
@@ -219,6 +235,28 @@ captured_tc=$(
 )
 [[ "$captured_tc" == *'actions add action police rate 20mbit burst 64kb mtu 64kb conform-exceed drop/pass index 1000000002 cookie fedcba9876543210fedcba9876543210'* ]] || {
   printf 'assertion failed: limited aggregate action lacks police drop/pass or ownership cookie\n' >&2
+  exit 1
+}
+(
+  TC_INLINE_ACTIONS=0
+  tc_action_lookup() { return 1; }
+  tc() {
+    [[ "$1" == actions && "$2" == add ]] && return 1
+    printf '%q ' "$@"
+  }
+  tc_create_shared_action gact 1000000003 00112233445566778899aabbccddeeff 0
+  [[ "${TC_INLINE_ACTIONS:-0}" == 1 ]] || {
+    printf 'assertion failed: standalone action failure did not select inline compatibility mode\n' >&2
+    exit 1
+  }
+  captured_tc=$(tc_add_flower_rule eth0 ingress ip tcp 20001 49123 gact 1000000003 00112233445566778899aabbccddeeff)
+  [[ "$captured_tc" == *'filter add dev eth0 ingress pref 49123 protocol ip flower skip_hw ip_proto tcp dst_port 20001 action gact index 1000000003 cookie 00112233445566778899aabbccddeeff'* ]] || {
+    printf 'assertion failed: inline action fallback did not carry its ownership cookie\n' >&2
+    exit 1
+  }
+)
+grep -Fq 'cookie=$(jq -er '\''.cookie'\'' <<<"$action")' "$ROOT/lib/bandwidth.sh" || {
+  printf 'assertion failed: filter publication must refresh each action cookie\n' >&2
   exit 1
 }
 assert_equal 49123 "$(tc_family_pref 49123 ip)" 'IPv4 tc rules must retain the base priority'

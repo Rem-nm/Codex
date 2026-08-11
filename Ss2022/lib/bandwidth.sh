@@ -85,9 +85,11 @@ probe_tc_capabilities() {
   fi
   if (( probe_ok == 1 )); then
     ingress_output=$(tc -s -j filter show dev "$interface" ingress 2>/dev/null) || probe_ok=0
-    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" 'type == "array" and length == $expected' >/dev/null 2>&1 <<<"$ingress_output" || probe_ok=0
+    if (( probe_ok == 1 )); then ingress_output=$(tc_filter_normalize_json "$ingress_output") || probe_ok=0; fi
+    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" '[.[] | select((.options? // null) | type == "object")] | length == $expected' >/dev/null 2>&1 <<<"$ingress_output" || probe_ok=0
     egress_output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null) || probe_ok=0
-    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" 'type == "array" and length == $expected' >/dev/null 2>&1 <<<"$egress_output" || probe_ok=0
+    if (( probe_ok == 1 )); then egress_output=$(tc_filter_normalize_json "$egress_output") || probe_ok=0; fi
+    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" '[.[] | select((.options? // null) | type == "object")] | length == $expected' >/dev/null 2>&1 <<<"$egress_output" || probe_ok=0
     if (( probe_ok == 1 )); then
       for family in "${families[@]}"; do
         family_pref=$(tc_family_pref 65000 "$family") || { probe_ok=0; break; }
@@ -260,6 +262,46 @@ tc_interface_exists() {
   return 1
 }
 
+tc_filter_normalize_json() {
+  local output=$1
+  if jq -e . >/dev/null 2>&1 <<<"$output"; then
+    printf '%s' "$output"
+    return 0
+  fi
+  # iproute2 5.10 emits the police action body as human-readable tokens
+  # inside otherwise JSON-looking filter output. Normalize that one legacy
+  # shape before applying the normal jq ownership and rule checks.
+  printf '%s' "$output" | python3 -c '
+import json
+import re
+import sys
+
+raw = sys.stdin.read()
+pattern = re.compile(
+    r"\{\"order\":(?P<order>[0-9]+)\s+police\s+0x(?P<index>[0-9A-Fa-f]+).*?\"control_action\":(?P<control>\{.*?\})\s+overhead\s+\S+\s+ref\s+(?P<ref>[0-9]+)\s+bind\s+(?P<bind>[0-9]+),(?P<after>.*?)\"cookie\":\"(?P<cookie>[0-9A-Fa-f]{32})\"\}",
+    re.S,
+)
+
+def replace(match):
+    return (
+        "{\"order\":" + match.group("order")
+        + ",\"kind\":\"police\",\"index\":" + str(int(match.group("index"), 16))
+        + ",\"control_action\":" + match.group("control")
+        + ",\"ref\":" + match.group("ref")
+        + ",\"bind\":" + match.group("bind")
+        + "," + match.group("after")
+        + "\"cookie\":\"" + match.group("cookie") + "\"}"
+    )
+
+normalized = pattern.sub(replace, raw)
+try:
+    value = json.loads(normalized)
+except (TypeError, ValueError):
+    raise SystemExit(1)
+json.dump(value, sys.stdout, separators=(",", ":"))
+'
+}
+
 tc_filter_scoped_json() {
   local interface=$1 direction=$2 family=$3 pref=$4 raw qdisc interface_status=0
   tc_interface_exists "$interface" || interface_status=$?
@@ -274,6 +316,7 @@ tc_filter_scoped_json() {
     return 0
   fi
   raw=$(tc -j filter show dev "$interface" "$direction" 2>/dev/null) || return 1
+  raw=$(tc_filter_normalize_json "$raw") || return 1
   jq -ce --arg family "$family" --argjson pref "$pref" '
     [ .[]
       | select((((.pref // -1) | tonumber?) // -1) == $pref)
@@ -391,6 +434,9 @@ bandwidth_build_actions() {
 
 tc_action_entry_from_json() {
   local output=$1 kind=$2 index=$3
+  if ! jq -e . >/dev/null 2>&1 <<<"$output"; then
+    output=$(tc_action_legacy_json "$output" "$kind" "$index") || return 1
+  fi
   jq -ce --arg kind "$kind" --argjson index "$index" '
     [ .. | objects
       | select((.kind? // "") == $kind)
@@ -402,10 +448,82 @@ tc_action_entry_from_json() {
   ' <<<"$output"
 }
 
+tc_action_legacy_json() {
+  local output=$1 kind=$2 expected_index=$3
+  local index_hex index_decimal cookie bind bytes packets drops overlimits requeues backlog qlen
+
+  [[ "$kind" == gact || "$kind" == police ]] || return 1
+  [[ "$expected_index" =~ ^[0-9]+$ ]] || return 1
+
+  # iproute2 5.10 emits an unquoted, human-readable `police` action body
+  # despite accepting -j.  Extract only the identity and counters needed by
+  # the ownership checks, then feed the normalized object through the same
+  # jq validation used for modern iproute2 JSON.
+  index_hex=$(sed -nE "s/.*[[:space:]]${kind}[[:space:]]+0x([0-9A-Fa-f]+).*/\1/p" <<<"$output" | head -n 1)
+  if [[ -n "$index_hex" ]]; then
+    index_decimal=$(printf '%d' "0x$index_hex") || return 1
+  else
+    index_decimal=$(sed -nE 's/.*"index"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  fi
+  [[ "$index_decimal" == "$expected_index" ]] || return 1
+
+  cookie=$(sed -nE 's/.*"cookie"[[:space:]]*:[[:space:]]*"([0-9A-Fa-f]{32})".*/\1/p' <<<"$output" | head -n 1)
+  [[ "$cookie" =~ ^[A-Fa-f0-9]{32}$ ]] || return 1
+  bind=$(sed -nE 's/.*[[:space:]]bind[[:space:]]+([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  [[ "$bind" =~ ^[0-9]+$ ]] || bind=$(sed -nE 's/.*"bind"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  [[ "$bind" =~ ^[0-9]+$ ]] || return 1
+
+  bytes=$(sed -nE 's/.*"bytes"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  packets=$(sed -nE 's/.*"packets"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  drops=$(sed -nE 's/.*"drops"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  overlimits=$(sed -nE 's/.*"overlimits"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  requeues=$(sed -nE 's/.*"requeues"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  backlog=$(sed -nE 's/.*"backlog"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  qlen=$(sed -nE 's/.*"qlen"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  bytes=${bytes:-0}; packets=${packets:-0}; drops=${drops:-0}; overlimits=${overlimits:-0}
+  requeues=${requeues:-0}; backlog=${backlog:-0}; qlen=${qlen:-0}
+  for value in "$bytes" "$packets" "$drops" "$overlimits" "$requeues" "$backlog" "$qlen"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  done
+  jq -n \
+    --arg kind "$kind" \
+    --arg cookie "${cookie,,}" \
+    --argjson index "$index_decimal" \
+    --argjson bind "$bind" \
+    --argjson bytes "$bytes" \
+    --argjson packets "$packets" \
+    --argjson drops "$drops" \
+    --argjson overlimits "$overlimits" \
+    --argjson requeues "$requeues" \
+    --argjson backlog "$backlog" \
+    --argjson qlen "$qlen" \
+    '{kind:$kind,index:$index,cookie:$cookie,bind:$bind,stats:{bytes:$bytes,packets:$packets,drops:$drops,overlimits:$overlimits,requeues:$requeues,backlog:$backlog,qlen:$qlen}}'
+}
+
+tc_action_normalize_json() {
+  local output=$1 kind=$2 index=$3
+  if jq -e . >/dev/null 2>&1 <<<"$output"; then
+    printf '%s' "$output"
+  else
+    tc_action_legacy_json "$output" "$kind" "$index"
+  fi
+}
+
 tc_action_lookup() {
-  local kind=$1 index=$2 output count
-  output=$(tc -j actions list action "$kind" 2>/dev/null) || return 2
-  jq -e . >/dev/null 2>&1 <<<"$output" || return 2
+  local kind=$1 index=$2 output count status=0
+  [[ "$kind" == gact || "$kind" == police ]] || return 1
+  [[ "$index" =~ ^[0-9]+$ ]] || return 1
+  # Query one index instead of listing all actions.  This avoids the invalid
+  # police JSON emitted by iproute2 5.10 when any unrelated police action is
+  # present, while still allowing an exact ownership decision.
+  output=$(tc -j actions get action "$kind" index "$index" 2>&1) || status=$?
+  if (( status != 0 )); then
+    if grep -qiE 'specified index not found|no such file|not found' <<<"$output"; then
+      return 1
+    fi
+    return 2
+  fi
+  output=$(tc_action_normalize_json "$output" "$kind" "$index") || return 2
   count=$(jq -r --arg kind "$kind" --argjson index "$index" '
     [ .. | objects | select((.kind? // "") == $kind) | select((((.index? // -1) | tonumber?) // -1) == $index) ] | length
   ' <<<"$output") || return 2
@@ -559,7 +677,7 @@ tc_rule_json_handles() {
       | select(any($actions[];
           (((.kind // "") | tostring | ascii_downcase) == $expected_action)
           and ((((.index // -1) | tonumber?) // -1) == $expected_index)))
-      | .handle // empty
+      | ($options.handle // .handle // empty)
     ' <<<"$rules_json"
 }
 

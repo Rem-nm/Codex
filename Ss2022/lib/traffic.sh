@@ -179,6 +179,7 @@ tc_counter_json() {
     output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null) || return 1
   fi
   [[ -n "$output" ]] || return 1
+  output=$(tc_filter_normalize_json "$output") || return 1
   jq -e 'type == "array"' >/dev/null 2>&1 <<<"$output" || return 1
   local ipv6_pref
   ipv6_pref=$(tc_family_pref "$pref" ipv6) || return 1
@@ -195,6 +196,7 @@ tc_action_counter_from_json() {
   [[ "$kind" == gact || "$kind" == police ]] || return 1
   [[ "$index" =~ ^[0-9]+$ ]] || return 1
   [[ "$cookie" =~ ^[A-Fa-f0-9]{32}$ ]] || return 1
+  output=$(tc_action_normalize_json "$output" "$kind" "$index") || return 1
   jq -er --arg kind "$kind" --argjson index "$index" --arg cookie "${cookie,,}" --argjson max "$MAX_SAFE_JSON_INTEGER" '
     def norm_cookie:
       tostring | ascii_downcase | sub("^0x"; "") | gsub("[:-]"; "");
@@ -251,7 +253,6 @@ tc_action_counter_json() {
   local kind=$1 index=$2 cookie=$3 output
   output=$(tc -s -j actions get action "$kind" index "$index" 2>/dev/null) || return 1
   [[ -n "$output" ]] || return 1
-  jq -e . >/dev/null 2>&1 <<<"$output" || return 1
   tc_action_counter_from_json "$output" "$kind" "$index" "$cookie"
 }
 

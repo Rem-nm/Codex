@@ -224,7 +224,7 @@ captured_tc=$(
   tc() { printf '%q ' "$@"; }
   tc_create_shared_action gact 1000000001 0123456789abcdef0123456789abcdef 0
 )
-[[ "$captured_tc" == *'actions add action gact pass index 1000000001 cookie 0123456789abcdef0123456789abcdef'* ]] || {
+[[ "$captured_tc" == *'actions add action gact pass index 1000000001 cookie 0123456789abcdef0123456789abcdef skip_hw'* ]] || {
   printf 'assertion failed: unlimited aggregate action lacks identity/cookie\n' >&2
   exit 1
 }
@@ -233,7 +233,7 @@ captured_tc=$(
   tc() { printf '%q ' "$@"; }
   tc_create_shared_action police 1000000002 fedcba9876543210fedcba9876543210 20
 )
-[[ "$captured_tc" == *'actions add action police rate 20mbit burst 64kb mtu 64kb conform-exceed drop/pass index 1000000002 cookie fedcba9876543210fedcba9876543210'* ]] || {
+[[ "$captured_tc" == *'actions add action police rate 20mbit burst 64kb mtu 64kb conform-exceed drop/pass index 1000000002 cookie fedcba9876543210fedcba9876543210 skip_hw'* ]] || {
   printf 'assertion failed: limited aggregate action lacks police drop/pass or ownership cookie\n' >&2
   exit 1
 }

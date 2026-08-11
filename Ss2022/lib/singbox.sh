@@ -428,14 +428,19 @@ singbox_confirm_inactive() {
 }
 
 singbox_process_pid() {
-  local binary_real proc_path proc_exe
+  local binary_real proc_path proc_exe proc_argv0
   local -a pids=()
   binary_real=$(readlink -f -- "$SING_BOX_BINARY" 2>/dev/null || true)
   [[ -n "$binary_real" ]] || return 1
   for proc_path in /proc/[0-9]*; do
     [[ -r "$proc_path/exe" ]] || continue
     proc_exe=$(readlink -f -- "$proc_path/exe" 2>/dev/null || true)
-    [[ "$proc_exe" == "$binary_real" ]] || continue
+    # On musl systems, gcompat executes the glibc sing-box release through
+    # the musl loader, so /proc/<pid>/exe resolves to ld-musl rather than the
+    # configured binary.  The supervised process still exposes its absolute
+    # executable path as argv[0]; use it as a second, exact identity check.
+    proc_argv0=$(tr '\0' '\n' <"$proc_path/cmdline" 2>/dev/null | head -n 1 || true)
+    [[ "$proc_exe" == "$binary_real" || "$proc_argv0" == "$binary_real" ]] || continue
     pids+=("${proc_path##*/}")
   done
   ((${#pids[@]} == 1)) || return 1

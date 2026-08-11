@@ -20,8 +20,8 @@ Ss2022 是一个基于 [sing-box](https://sing-box.sagernet.org/) 的 Shadowsock
 root 安装入口必须同时固定完整 Git commit 和该 commit 的 GitHub 归档 SHA256；不接受分支名。下面的值会在每次正式发布时固定更新：
 
 ```bash
-SS_MANAGER_COMMIT='3b7dc599860851f727def422a7cd3eec64ef0fec'
-SS_MANAGER_ARCHIVE_SHA256='2d23eb7206e735ccdfdaab23d015cedb5b99f7b453c162b0ea4b037c065c1423'
+SS_MANAGER_COMMIT='cfdbe4d413e9790092d35f2449979056c71eb31e'
+SS_MANAGER_ARCHIVE_SHA256='e536eaae5d42ff80c63d544e8a7419f5d5d7c986513ea0a98abfd03c28349e7c'
 curl -fsSL "https://raw.githubusercontent.com/Rem-nm/Codex/$SS_MANAGER_COMMIT/Ss2022/bootstrap.sh" \
   | SS_MANAGER_COMMIT="$SS_MANAGER_COMMIT" SS_MANAGER_ARCHIVE_SHA256="$SS_MANAGER_ARCHIVE_SHA256" sh
 ```
@@ -29,8 +29,8 @@ curl -fsSL "https://raw.githubusercontent.com/Rem-nm/Codex/$SS_MANAGER_COMMIT/Ss
 最小化 Alpine 默认没有 Bash/curl 时，可使用 BusyBox 自带的 wget 启动：
 
 ```bash
-SS_MANAGER_COMMIT='3b7dc599860851f727def422a7cd3eec64ef0fec'
-SS_MANAGER_ARCHIVE_SHA256='2d23eb7206e735ccdfdaab23d015cedb5b99f7b453c162b0ea4b037c065c1423'
+SS_MANAGER_COMMIT='cfdbe4d413e9790092d35f2449979056c71eb31e'
+SS_MANAGER_ARCHIVE_SHA256='e536eaae5d42ff80c63d544e8a7419f5d5d7c986513ea0a98abfd03c28349e7c'
 wget -qO- "https://raw.githubusercontent.com/Rem-nm/Codex/$SS_MANAGER_COMMIT/Ss2022/bootstrap.sh" \
   | SS_MANAGER_COMMIT="$SS_MANAGER_COMMIT" SS_MANAGER_ARCHIVE_SHA256="$SS_MANAGER_ARCHIVE_SHA256" sh
 ```

@@ -317,7 +317,7 @@ install_singbox_from_release() {
   [[ "$candidate_version" == "$version" ]] \
     || singbox_die_after_download_cleanup '下载的 sing-box 版本与 Release 标签不一致。'
   if [[ -f "$SING_BOX_CONFIG" ]]; then
-    "$candidate" check -c "$SING_BOX_CONFIG" >/dev/null \
+    "$candidate" check -c "$SING_BOX_CONFIG" >/dev/null 2>&1 \
       || singbox_die_after_download_cleanup '新 sing-box 无法读取当前配置，已停止替换。'
   fi
 
@@ -398,7 +398,7 @@ generate_singbox_config() {
   # Transform the protected node database directly. This keeps every node key
   # out of both shell-expanded external command arguments and process listings.
   jq -e --arg listen_mode "$listen_mode" --argjson tfo "$tfo_supported" '
-    def inbound($node; $listen; $tag):
+    def ss_inbound($node; $listen; $tag):
       ({
         type: "shadowsocks",
         tag: $tag,
@@ -407,20 +407,54 @@ generate_singbox_config() {
         method: $node.method,
         password: $node.password
       } | if $tfo then .tcp_fast_open = true else . end);
+    def vless_inbound($node; $listen; $tag):
+      ({
+        type: "vless",
+        tag: $tag,
+        listen: $listen,
+        listen_port: $node.port,
+        users: [{uuid:$node.uuid, flow:$node.flow}],
+        tls: {
+          enabled: true,
+          server_name: $node.reality_server_name,
+          reality: {
+            enabled: true,
+            handshake: {
+              server: $node.reality_handshake_server,
+              server_port: $node.reality_handshake_port
+            },
+            private_key: $node.reality_private_key,
+            short_id: [$node.reality_short_id]
+          }
+        }
+      } | if $tfo then .tcp_fast_open = true else . end);
+    def inbound($node; $listen; $tag):
+      if ($node.protocol // "shadowsocks") == "shadowsocks" then
+        ss_inbound($node; $listen; $tag)
+      elif $node.protocol == "vless" then
+        vless_inbound($node; $listen; $tag)
+      else
+        error("unsupported node protocol")
+      end;
+    def tag_prefix($node):
+      if ($node.protocol // "shadowsocks") == "shadowsocks" then "ss"
+      elif $node.protocol == "vless" then "vless"
+      else error("unsupported node protocol") end;
     [
       .nodes[]
       | select(.status == "enabled") as $node
+      | tag_prefix($node) as $prefix
       | if $listen_mode == "dual" then
-          inbound($node; "::"; "ss-\($node.node_id)")
+          inbound($node; "::"; "\($prefix)-\($node.node_id)")
         elif $listen_mode == "ipv4" then
-          inbound($node; "0.0.0.0"; "ss-\($node.node_id)")
+          inbound($node; "0.0.0.0"; "\($prefix)-\($node.node_id)")
         elif $node.address_type == "ipv4" then
-          inbound($node; "0.0.0.0"; "ss-\($node.node_id)")
+          inbound($node; "0.0.0.0"; "\($prefix)-\($node.node_id)")
         elif $node.address_type == "ipv6" then
-          inbound($node; "::"; "ss-\($node.node_id)")
+          inbound($node; "::"; "\($prefix)-\($node.node_id)")
         elif $node.address_type == "domain" then
-          inbound($node; "0.0.0.0"; "ss-\($node.node_id)-ipv4"),
-          inbound($node; "::"; "ss-\($node.node_id)-ipv6")
+          inbound($node; "0.0.0.0"; "\($prefix)-\($node.node_id)-ipv4"),
+          inbound($node; "::"; "\($prefix)-\($node.node_id)-ipv6")
         else
           error("unsupported node address type")
         end
@@ -564,10 +598,14 @@ port_listener_owned_by_pid() {
 }
 
 singbox_owns_node_port() {
-  local port=$1 pid=${2:-}
+  local port=$1 pid=${2:-} protocol=${3:-shadowsocks}
   [[ -n "$pid" ]] || pid=$(singbox_process_pid) || return 1
-  port_listener_owned_by_pid tcp "$port" "$pid" any \
-    && port_listener_owned_by_pid udp "$port" "$pid" any
+  port_listener_owned_by_pid tcp "$port" "$pid" any || return 1
+  if [[ "$protocol" == shadowsocks ]]; then
+    port_listener_owned_by_pid udp "$port" "$pid" any
+  else
+    [[ "$protocol" == vless ]]
+  fi
 }
 
 singbox_health_check_once() {
@@ -577,13 +615,14 @@ singbox_health_check_once() {
   main_pid=$(singbox_process_pid) || { error "无法确认唯一的 sing-box 主进程。"; return 1; }
   [[ "$main_pid" =~ ^[0-9]+$ && "$main_pid" -gt 0 ]] || { error "无法取得 sing-box 主进程 PID。"; return 1; }
   kill -0 "$main_pid" 2>/dev/null || { error "sing-box 主进程不存在。"; return 1; }
-  singbox_check_config "$SING_BOX_CONFIG" >/dev/null || { error "当前运行配置检查失败。"; return 1; }
+  singbox_check_config "$SING_BOX_CONFIG" >/dev/null 2>&1 || { error "当前运行配置检查失败。"; return 1; }
 
-  local node port address_type listener family node_lines listeners
+  local node port protocol address_type listener family node_lines listeners
   node_lines=$(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source") || return 1
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     port=$(jq -er '.port' <<<"$node") || return 1
+    protocol=$(node_protocol "$node") || return 1
     address_type=$(jq -er '.address_type' <<<"$node") || return 1
     listeners=$(node_listeners_for_family "$address_type") || return 1
     while IFS= read -r listener; do
@@ -591,8 +630,10 @@ singbox_health_check_once() {
       [[ "$listener" == '::' ]] && family=ipv6 || family=ipv4
       port_listener_owned_by_pid tcp "$port" "$main_pid" "$family" \
         || { error "预期 $family TCP 端口未由 sing-box 监听：$port"; return 1; }
-      port_listener_owned_by_pid udp "$port" "$main_pid" "$family" \
-        || { error "预期 $family UDP 端口未由 sing-box 监听：$port"; return 1; }
+      if [[ "$protocol" == shadowsocks ]]; then
+        port_listener_owned_by_pid udp "$port" "$main_pid" "$family" \
+          || { error "预期 $family UDP 端口未由 sing-box 监听：$port"; return 1; }
+      fi
     done <<<"$listeners"
   done <<<"$node_lines"
   return 0

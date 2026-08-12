@@ -278,7 +278,7 @@ import sys
 
 raw = sys.stdin.read()
 pattern = re.compile(
-    r"\{\"order\":(?P<order>[0-9]+)\s+police\s+0x(?P<index>[0-9A-Fa-f]+).*?\"control_action\":(?P<control>\{.*?\})\s+overhead\s+\S+\s+ref\s+(?P<ref>[0-9]+)\s+bind\s+(?P<bind>[0-9]+)\s*,(?P<after>.*?)\"cookie\":\"(?P<cookie>[0-9A-Fa-f]{32})\"\}",
+    r"\{\s*\"order\"\s*:\s*(?P<order>[0-9]+)\s+police\s+0x(?P<index>[0-9A-Fa-f]+).*?\"control_action\"\s*:\s*(?P<control>\{.*?\})\s+overhead\s+\S+\s+ref\s+(?P<ref>[0-9]+)\s+bind\s+(?P<bind>[0-9]+)\s*,(?P<after>.*?)\"cookie\"\s*:\s*\"(?P<cookie>[0-9A-Fa-f]{32})\"\s*\}",
     re.S,
 )
 
@@ -405,13 +405,15 @@ bandwidth_action_kind() {
 }
 
 bandwidth_build_actions() {
-  local nodes_source=$1 output_file=$2 node node_id port direction limit identity index cookie kind node_lines
+  local nodes_source=$1 output_file=$2 node node_id port direction limit identity index cookie kind node_lines protocols protocols_json
   jq -n '[]' >"$output_file" || return 1
   node_lines=$(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source") || return 1
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     node_id=$(jq -er '.node_id' <<<"$node") || return 1
     port=$(jq -er '.port' <<<"$node") || return 1
+    protocols=$(node_transport_protocols "$node") || return 1
+    protocols_json=$(printf '%s\n' "$protocols" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
     for direction in ingress egress; do
       if [[ "$direction" == ingress ]]; then
         limit=$(jq -er '.upload_limit_mbps // 0' <<<"$node") || return 1
@@ -423,8 +425,8 @@ bandwidth_build_actions() {
       cookie=${identity#*$'\t'}
       kind=$(bandwidth_action_kind "$limit") || return 1
       jq --arg node_id "$node_id" --arg direction "$direction" --arg kind "$kind" --arg cookie "$cookie" \
-        --argjson port "$port" --argjson index "$index" --argjson limit "$limit" \
-        '. += [{node_id:$node_id,direction:$direction,port:$port,kind:$kind,index:$index,cookie:$cookie,limit_mbps:$limit}]' \
+        --argjson port "$port" --argjson index "$index" --argjson limit "$limit" --argjson protocols "$protocols_json" \
+        '. += [{node_id:$node_id,direction:$direction,port:$port,kind:$kind,index:$index,cookie:$cookie,limit_mbps:$limit,protocols:$protocols}]' \
         "$output_file" >"$output_file.next" || return 1
       mv -f -- "$output_file.next" "$output_file" || return 1
     done
@@ -450,36 +452,62 @@ tc_action_entry_from_json() {
 
 tc_action_legacy_json() {
   local output=$1 kind=$2 expected_index=$3
-  local index_hex index_decimal cookie bind bytes packets drops overlimits requeues backlog qlen
+  local candidate index_hex index_decimal cookie bind bytes packets drops overlimits requeues backlog qlen
 
   [[ "$kind" == gact || "$kind" == police ]] || return 1
   [[ "$expected_index" =~ ^[0-9]+$ ]] || return 1
 
   # iproute2 5.10 emits an unquoted, human-readable `police` action body
-  # despite accepting -j.  Extract only the identity and counters needed by
-  # the ownership checks, then feed the normalized object through the same
-  # jq validation used for modern iproute2 JSON.
-  index_hex=$(sed -nE "s/.*[[:space:]]${kind}[[:space:]]+0x([0-9A-Fa-f]+).*/\1/p" <<<"$output" | head -n 1)
+  # despite accepting -j. Older iproute2 (for example Ubuntu 18.04) emits
+  # the complete action listing in the same form and omits the decimal index
+  # for police. Select the one matching block first, then extract only the
+  # identity and counters needed by ownership/statistics checks.
+  candidate=$output
+  if grep -Eq '(^|[[:space:]])action order[[:space:]]+[0-9]+:' <<<"$output"; then
+    local expected_hex
+    expected_hex=$(printf '%x' "$expected_index") || return 1
+    candidate=$(awk -v kind="$kind" -v expected="$expected_index" -v expected_hex="$expected_hex" '
+      BEGIN { RS=""; ORS="\n\n" }
+      {
+        has_kind = ($0 ~ (": *" kind "[[:space:]]"))
+        has_decimal = ($0 ~ ("index[[:space:]]+" expected "[[:space:]]"))
+        has_hex = ($0 ~ ("[[:space:]]" kind "[[:space:]]+0x" expected_hex "([[:space:]]|$)"))
+        if (has_kind && (has_decimal || has_hex)) { print; found=1; exit }
+      }
+      END { if (!found) exit 1 }
+    ' <<<"$output") || return 1
+  fi
+
+  index_hex=$(sed -nE "s/.*[[:space:]]${kind}[[:space:]]+0x([0-9A-Fa-f]+).*/\1/p" <<<"$candidate" | head -n 1)
   if [[ -n "$index_hex" ]]; then
     index_decimal=$(printf '%d' "0x$index_hex") || return 1
   else
-    index_decimal=$(sed -nE 's/.*"index"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+    index_decimal=$(sed -nE 's/.*index[[:space:]]+([0-9]+)[[:space:]]+ref[[:space:]]+[0-9]+[[:space:]]+bind[[:space:]]+[0-9]+.*/\1/p' <<<"$candidate" | head -n 1)
+    [[ -n "$index_decimal" ]] || index_decimal=$(sed -nE 's/.*"index"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
   fi
   [[ "$index_decimal" == "$expected_index" ]] || return 1
 
-  cookie=$(sed -nE 's/.*"cookie"[[:space:]]*:[[:space:]]*"([0-9A-Fa-f]{32})".*/\1/p' <<<"$output" | head -n 1)
+  cookie=$(sed -nE 's/.*"cookie"[[:space:]]*:[[:space:]]*"([0-9A-Fa-f]{32})".*/\1/p' <<<"$candidate" | head -n 1)
+  [[ -n "$cookie" ]] || cookie=$(sed -nE 's/.*[[:space:]]cookie[[:space:]]+([0-9A-Fa-f]{32}).*/\1/p' <<<"$candidate" | head -n 1)
   [[ "$cookie" =~ ^[A-Fa-f0-9]{32}$ ]] || return 1
-  bind=$(sed -nE 's/.*[[:space:]]bind[[:space:]]+([0-9]+).*/\1/p' <<<"$output" | head -n 1)
-  [[ "$bind" =~ ^[0-9]+$ ]] || bind=$(sed -nE 's/.*"bind"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  bind=$(sed -nE 's/.*[[:space:]]bind[[:space:]]+([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  [[ "$bind" =~ ^[0-9]+$ ]] || bind=$(sed -nE 's/.*"bind"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
   [[ "$bind" =~ ^[0-9]+$ ]] || return 1
 
-  bytes=$(sed -nE 's/.*"bytes"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
-  packets=$(sed -nE 's/.*"packets"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
-  drops=$(sed -nE 's/.*"drops"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
-  overlimits=$(sed -nE 's/.*"overlimits"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
-  requeues=$(sed -nE 's/.*"requeues"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
-  backlog=$(sed -nE 's/.*"backlog"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
-  qlen=$(sed -nE 's/.*"qlen"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$output" | head -n 1)
+  bytes=$(sed -nE 's/.*"bytes"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  packets=$(sed -nE 's/.*"packets"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  drops=$(sed -nE 's/.*"drops"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  overlimits=$(sed -nE 's/.*"overlimits"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  requeues=$(sed -nE 's/.*"requeues"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  backlog=$(sed -nE 's/.*"backlog"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  qlen=$(sed -nE 's/.*"qlen"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=$(sed -nE 's/.*Sent[[:space:]]+([0-9]+)[[:space:]]+bytes.*/\1/p' <<<"$candidate" | head -n 1)
+  [[ "$packets" =~ ^[0-9]+$ ]] || packets=$(sed -nE 's/.*Sent[[:space:]]+[0-9]+[[:space:]]+bytes[[:space:]]+([0-9]+)[[:space:]]+pkt.*/\1/p' <<<"$candidate" | head -n 1)
+  [[ "$drops" =~ ^[0-9]+$ ]] || drops=$(sed -nE 's/.*dropped[[:space:]]+([0-9]+),.*/\1/p' <<<"$candidate" | head -n 1)
+  [[ "$overlimits" =~ ^[0-9]+$ ]] || overlimits=$(sed -nE 's/.*overlimits[[:space:]]+([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  [[ "$requeues" =~ ^[0-9]+$ ]] || requeues=$(sed -nE 's/.*requeues[[:space:]]+([0-9]+).*/\1/p' <<<"$candidate" | head -n 1)
+  [[ "$backlog" =~ ^[0-9]+$ ]] || backlog=$(sed -nE 's/.*backlog[[:space:]]+([0-9]+)b.*/\1/p' <<<"$candidate" | head -n 1)
+  [[ "$qlen" =~ ^[0-9]+$ ]] || qlen=$(sed -nE 's/.*backlog[[:space:]]+[0-9]+b[[:space:]]+([0-9]+)p.*/\1/p' <<<"$candidate" | head -n 1)
   bytes=${bytes:-0}; packets=${packets:-0}; drops=${drops:-0}; overlimits=${overlimits:-0}
   requeues=${requeues:-0}; backlog=${backlog:-0}; qlen=${qlen:-0}
   for value in "$bytes" "$packets" "$drops" "$overlimits" "$requeues" "$backlog" "$qlen"; do
@@ -521,9 +549,20 @@ tc_action_lookup() {
     if grep -qiE 'specified index not found|no such file|not found' <<<"$output"; then
       return 1
     fi
-    return 2
+    # iproute2 before the action-get JSON interface rejects the otherwise
+    # valid `actions get action ...` form. Its list operation still exposes
+    # indexed, cookie-bearing actions, so use that as a compatibility path.
+    if grep -qi 'command "action" is unknown' <<<"$output"; then
+      output=$(tc -j actions ls action "$kind" 2>&1) || return 2
+    else
+      return 2
+    fi
   fi
-  output=$(tc_action_normalize_json "$output" "$kind" "$index") || return 2
+  output=$(tc_action_normalize_json "$output" "$kind" "$index") || {
+    status=$?
+    (( status == 1 )) && return 1
+    return 2
+  }
   count=$(jq -r --arg kind "$kind" --argjson index "$index" '
     [ .. | objects | select((.kind? // "") == $kind) | select((((.index? // -1) | tonumber?) // -1) == $index) ] | length
   ' <<<"$output") || return 2
@@ -592,7 +631,15 @@ tc_create_shared_action() {
     if tc actions add action police rate "${limit}mbit" burst 64kb mtu 64kb conform-exceed drop/pass index "$index" cookie "$cookie" skip_hw 2>/dev/null; then
       return 0
     fi
+    # Older tc accepts cookie-bearing standalone actions but rejects the
+    # skip_hw attribute on `actions add`; retain the same ownership contract
+    # while omitting only that unsupported attribute.
+    if tc actions add action police rate "${limit}mbit" burst 64kb mtu 64kb conform-exceed drop/pass index "$index" cookie "$cookie" 2>/dev/null; then
+      return 0
+    fi
   elif tc actions add action gact pass index "$index" cookie "$cookie" skip_hw 2>/dev/null; then
+    return 0
+  elif tc actions add action gact pass index "$index" cookie "$cookie" 2>/dev/null; then
     return 0
   fi
   if entry=$(tc_action_lookup "$kind" "$index"); then
@@ -740,11 +787,12 @@ bandwidth_legacy_filter_state() {
             limit=$(jq -er '.download_limit_mbps // 0' <<<"$node") || return 1
           fi
           kind=$(bandwidth_action_kind "$limit") || return 1
-          for protocol in tcp udp; do
+          while IFS= read -r protocol; do
+            [[ -n "$protocol" ]] || continue
             count=$(tc_rule_json_match_count "$rules" "$family_pref" "$family" "$protocol" "$direction" "$port" "$kind") || return 1
             (( count <= 1 )) || { printf 'mixed'; return 0; }
             matched=$((matched + count))
-          done
+          done < <(node_transport_protocols "$node")
         done <<<"$node_lines"
       done
     done
@@ -754,6 +802,55 @@ bandwidth_legacy_filter_state() {
   elif (( actual == matched )); then printf 'managed'
   else printf 'mixed'
   fi
+}
+
+bandwidth_reset_empty_manager_clsact() {
+  local interface_lines=$1 interface qdisc ingress egress
+  local -a removed=()
+
+  # Some older kernels keep a stale action bind count until the clsact qdisc
+  # itself disappears. Only use that escape hatch when every affected
+  # interface is recorded as created by Ss2022 and both directions are
+  # provably empty after the owned filters were removed. A foreign rule or an
+  # unknown qdisc state therefore remains a hard stop rather than being
+  # overwritten.
+  while IFS= read -r interface; do
+    [[ -n "$interface" ]] || continue
+    jq -e --arg interface "$interface" '
+      (.tc_clsact_interfaces // []) as $interfaces
+      | ($interfaces | type == "array")
+      and any($interfaces[]; . == $interface)
+    ' "$MANAGER_STATE" >/dev/null 2>&1 || return 1
+    qdisc=$(tc qdisc show dev "$interface" 2>/dev/null) || return 1
+    grep -q 'clsact' <<<"$qdisc" || return 1
+    ingress=$(tc -j filter show dev "$interface" ingress 2>/dev/null) || return 1
+    egress=$(tc -j filter show dev "$interface" egress 2>/dev/null) || return 1
+    ingress=$(tc_filter_normalize_json "$ingress") || return 1
+    egress=$(tc_filter_normalize_json "$egress") || return 1
+    jq -e 'type == "array" and length == 0' >/dev/null 2>&1 <<<"$ingress" || return 1
+    jq -e 'type == "array" and length == 0' >/dev/null 2>&1 <<<"$egress" || return 1
+  done <<<"$interface_lines"
+
+  while IFS= read -r interface; do
+    [[ -n "$interface" ]] || continue
+    if ! tc qdisc del dev "$interface" clsact >/dev/null 2>&1; then
+      local restore
+      for restore in "${removed[@]}"; do
+        tc qdisc add dev "$restore" clsact >/dev/null 2>&1 || true
+      done
+      return 1
+    fi
+    removed+=("$interface")
+  done <<<"$interface_lines"
+  printf '%s\n' "${removed[@]}"
+}
+
+bandwidth_recreate_manager_clsact() {
+  local interface_lines=$1 interface
+  while IFS= read -r interface; do
+    [[ -n "$interface" ]] || continue
+    tc qdisc add dev "$interface" clsact >/dev/null 2>&1 || return 1
+  done <<<"$interface_lines"
 }
 
 bandwidth_delete_legacy_filters() {
@@ -777,7 +874,8 @@ bandwidth_delete_legacy_filters() {
 
 bandwidth_remove_plan() {
   local plan_file=$1 pref action entry status expected_bind bind interface family direction family_pref rules actions_json owned_count
-  local node_id port kind index cookie protocol handles handle action_key action_lines interface_lines family_lines direction_action_lines
+  local node_id port kind index cookie protocol handles handle action_key action_lines interface_lines family_lines direction_action_lines protocol_lines protocol_count
+  local reset_interfaces='' needs_clsact_reset=0
   local -a deletions=()
   local -A observed_bind=()
   [[ -f "$plan_file" && ! -L "$plan_file" ]] || return 1
@@ -790,12 +888,13 @@ bandwidth_remove_plan() {
   family_lines=$(bandwidth_plan_families "$plan_file") || return 1
   family_count=$(awk 'NF {count++} END {print count+0}' <<<"$family_lines") || return 1
   (( family_count >= 1 )) || return 1
-  expected_bind=$((interface_count * family_count * 2))
   while IFS= read -r action; do
     [[ -n "$action" ]] || continue
     kind=$(jq -er '.kind' <<<"$action") || return 1
     index=$(jq -er '.index' <<<"$action") || return 1
     cookie=$(jq -er '.cookie' <<<"$action") || return 1
+    protocol_count=$(jq -er '(.protocols // ["tcp","udp"]) | length' <<<"$action") || return 1
+    expected_bind=$((interface_count * family_count * protocol_count))
     action_key="$kind:$index"
     observed_bind["$action_key"]=0
     if entry=$(tc_action_lookup "$kind" "$index"); then
@@ -825,7 +924,9 @@ bandwidth_remove_plan() {
           port=$(jq -er '.port' <<<"$action") || return 1
           kind=$(jq -er '.kind' <<<"$action") || return 1
           index=$(jq -er '.index' <<<"$action") || return 1
-          for protocol in tcp udp; do
+          protocol_lines=$(jq -r '(.protocols // ["tcp","udp"])[]' <<<"$action") || return 1
+          while IFS= read -r protocol; do
+            [[ -n "$protocol" ]] || continue
             handles=$(tc_rule_json_handles "$rules" "$family_pref" "$family" "$protocol" "$direction" "$port" "$kind" "$index") || return 1
             local handle_count
             handle_count=$(awk 'NF {count++} END {print count+0}' <<<"$handles") || return 1
@@ -838,7 +939,7 @@ bandwidth_remove_plan() {
               action_key="$kind:$index"
               observed_bind["$action_key"]=$(( ${observed_bind["$action_key"]:-0} + 1 ))
             fi
-          done
+          done <<<"$protocol_lines"
         done <<<"$direction_action_lines"
         owned_count=$(tc_rule_owned_action_count "$rules" "$actions_json") || return 1
         (( owned_count == matched_count )) || { error "tc 优先级包含使用 Ss2022 action 的未知规则，拒绝删除。"; return 1; }
@@ -873,13 +974,49 @@ bandwidth_remove_plan() {
     IFS=$'\t' read -r interface direction family family_pref handle <<<"$deletion"
     tc filter del dev "$interface" "$direction" protocol "$family" pref "$family_pref" handle "$handle" flower >/dev/null || return 1
   done
+
+  # Linux 4.15 can retain a non-zero action bind count after the last filter
+  # is deleted. Before removing the action, prove every affected clsact is
+  # empty and owned by this manager, then reset only those qdiscs. Modern
+  # kernels report bind=0 here and take the normal path without a qdisc reset.
   while IFS= read -r action; do
     [[ -n "$action" ]] || continue
     kind=$(jq -er '.kind' <<<"$action") || return 1
     index=$(jq -er '.index' <<<"$action") || return 1
     cookie=$(jq -er '.cookie' <<<"$action") || return 1
-    tc_delete_owned_action "$kind" "$index" "$cookie" || return 1
+    if entry=$(tc_action_lookup "$kind" "$index"); then
+      tc_action_cookie_matches "$entry" "$cookie" || return 1
+      bind=$(tc_action_bind_count_from_json "$entry" "$kind" "$index" "$cookie") || return 1
+      (( bind > 0 )) && needs_clsact_reset=1
+    else
+      status=$?
+      (( status == 1 )) || return 1
+    fi
   done <<<"$action_lines"
+  if (( needs_clsact_reset == 1 )); then
+    reset_interfaces=$(bandwidth_reset_empty_manager_clsact "$interface_lines") || {
+      error '旧版内核的 tc action 仍有绑定，且无法证明项目 clsact 已完全为空；拒绝清理。'
+      return 1
+    }
+    [[ -n "$reset_interfaces" ]] || {
+      error '旧版内核的 tc action 绑定无法安全归零；拒绝清理。'
+      return 1
+    }
+  fi
+
+  while IFS= read -r action; do
+    [[ -n "$action" ]] || continue
+    kind=$(jq -er '.kind' <<<"$action") || return 1
+    index=$(jq -er '.index' <<<"$action") || return 1
+    cookie=$(jq -er '.cookie' <<<"$action") || return 1
+    if ! tc_delete_owned_action "$kind" "$index" "$cookie"; then
+      [[ -z "$reset_interfaces" ]] || bandwidth_recreate_manager_clsact "$reset_interfaces" || true
+      return 1
+    fi
+  done <<<"$action_lines"
+  if [[ -n "$reset_interfaces" ]]; then
+    bandwidth_recreate_manager_clsact "$reset_interfaces" || return 1
+  fi
 }
 
 delete_manager_tc_filters() {
@@ -1009,7 +1146,7 @@ bandwidth_apply_nodes() {
     return 1
   }
 
-  local interface action kind index cookie limit port direction family family_pref protocol
+  local interface action kind index cookie limit port direction family family_pref protocol protocol_lines
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
     ensure_clsact "$interface" || {
@@ -1042,13 +1179,15 @@ bandwidth_apply_nodes() {
       while IFS= read -r family; do
         [[ -n "$family" ]] || continue
         family_pref=$(tc_family_pref "$pref" "$family") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
-        for protocol in tcp udp; do
+        protocol_lines=$(jq -r '(.protocols // ["tcp","udp"])[]' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+        while IFS= read -r protocol; do
+          [[ -n "$protocol" ]] || continue
           if ! tc_add_flower_rule "$interface" "$direction" "$family" "$protocol" "$port" "$family_pref" "$kind" "$index" "$cookie"; then
             error "tc 规则创建失败：接口 $interface，$direction，$family/$protocol，端口 $port"
             bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"
             return 1
           fi
-        done
+        done <<<"$protocol_lines"
       done <<<"$family_lines"
     done <<<"$action_lines"
   done <<<"$interfaces"
@@ -1091,14 +1230,15 @@ bandwidth_check_nodes() {
   family_count=$(jq -r 'length' <<<"$plan_families") || { rm -f -- "$expected_actions"; return 1; }
   (( family_count >= 1 )) || { rm -f -- "$expected_actions"; return 1; }
 
-  local action kind index cookie entry expected_bind bind
-  expected_bind=$((interfaces_count * family_count * 2))
+  local action kind index cookie entry expected_bind bind protocol_count
   action_lines=$(jq -c '.[]' "$expected_actions") || { rm -f -- "$expected_actions"; return 1; }
   while IFS= read -r action; do
     [[ -n "$action" ]] || continue
     kind=$(jq -er '.kind' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
     index=$(jq -er '.index' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
     cookie=$(jq -er '.cookie' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
+    protocol_count=$(jq -er '(.protocols // ["tcp","udp"]) | length' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
+    expected_bind=$((interfaces_count * family_count * protocol_count))
     if ! entry=$(tc_action_lookup "$kind" "$index"); then rm -f -- "$expected_actions"; return 1; fi
     tc_action_cookie_matches "$entry" "$cookie" || { rm -f -- "$expected_actions"; return 1; }
     bind=$(tc_action_bind_count_from_json "$entry" "$kind" "$index" "$cookie") || { rm -f -- "$expected_actions"; return 1; }
@@ -1106,7 +1246,7 @@ bandwidth_check_nodes() {
   done <<<"$action_lines"
 
   local pref interface family family_pref direction rules actions_json owned_count expected_owned port protocol match_count
-  local plan_family_lines direction_action_lines
+  local plan_family_lines direction_action_lines protocol_lines
   pref=$(jq -er '.pref' "$plan_file") || { rm -f -- "$expected_actions"; return 1; }
   plan_family_lines=$(jq -r '.[]' <<<"$plan_families") || { rm -f -- "$expected_actions"; return 1; }
   while IFS= read -r interface; do
@@ -1118,7 +1258,7 @@ bandwidth_check_nodes() {
         rules=$(tc_filter_scoped_json "$interface" "$direction" "$family" "$family_pref") || { rm -f -- "$expected_actions"; return 1; }
         actions_json=$(jq -c --arg direction "$direction" '[.[] | select(.direction == $direction)]' "$expected_actions") || { rm -f -- "$expected_actions"; return 1; }
         direction_action_lines=$(jq -c '.[]' <<<"$actions_json") || { rm -f -- "$expected_actions"; return 1; }
-        expected_owned=$(jq -r 'length * 2' <<<"$actions_json") || { rm -f -- "$expected_actions"; return 1; }
+        expected_owned=$(jq -r '[.[] | ((.protocols // ["tcp","udp"]) | length)] | add // 0' <<<"$actions_json") || { rm -f -- "$expected_actions"; return 1; }
         owned_count=$(tc_rule_owned_action_count "$rules" "$actions_json") || { rm -f -- "$expected_actions"; return 1; }
         [[ "$owned_count" == "$expected_owned" ]] || { rm -f -- "$expected_actions"; return 1; }
         while IFS= read -r action; do
@@ -1126,10 +1266,12 @@ bandwidth_check_nodes() {
           port=$(jq -er '.port' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
           kind=$(jq -er '.kind' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
           index=$(jq -er '.index' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
-          for protocol in tcp udp; do
+          protocol_lines=$(jq -r '(.protocols // ["tcp","udp"])[]' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
+          while IFS= read -r protocol; do
+            [[ -n "$protocol" ]] || continue
             match_count=$(tc_rule_json_match_count "$rules" "$family_pref" "$family" "$protocol" "$direction" "$port" "$kind" "$index") || { rm -f -- "$expected_actions"; return 1; }
             [[ "$match_count" == 1 ]] || { rm -f -- "$expected_actions"; return 1; }
-          done
+          done <<<"$protocol_lines"
         done <<<"$direction_action_lines"
       done
     done <<<"$plan_family_lines"

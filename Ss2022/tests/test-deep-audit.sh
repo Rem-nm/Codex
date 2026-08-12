@@ -313,6 +313,13 @@ assert_equal $'2001:db8::10\tipv6' "$address_fallback" 'blank address did not fa
   system_port_in_use 20001 || fail_test 'TCP listener was reported as free'
   grep -q -- '-ltn' "$ss_log" || fail_test 'TCP port probe included non-listening sockets'
   grep -q -- '-lun' "$ss_log" || fail_test 'UDP listener snapshot was not queried'
+
+  : >"$ss_log"
+  system_port_in_use_for_protocol 20001 vless || fail_test 'VLESS TCP listener was reported as free'
+  grep -q -- '-ltn' "$ss_log" || fail_test 'VLESS port probe did not query TCP listeners'
+  if grep -q -- '-lun' "$ss_log"; then
+    fail_test 'VLESS port probe unnecessarily queried UDP listeners'
+  fi
 )
 if (
   # shellcheck disable=SC1091
@@ -794,6 +801,34 @@ action_create_line=$(grep -n 'if ! tc_create_shared_action' "$ROOT/lib/bandwidth
 [[ -n "$plan_write_line" && -n "$action_create_line" && "$plan_write_line" -lt "$action_create_line" ]] \
   || fail_test 'tc ownership plan is not durable before kernel mutation'
 grep -q -- '--self-test' "$ROOT/lib/update.sh" || fail_test 'manager update self-test still contends on the manager lock'
+grep -q '^manager_update_preflight()' "$ROOT/ss-manager.sh" \
+  || fail_test 'new manager lacks a state/configuration compatibility preflight'
+grep -q -- '--update-preflight' "$ROOT/ss-manager.sh" \
+  || fail_test 'new manager lacks an explicit update-preflight entry point'
+grep -Fq 'manager_update_preflight >/dev/null || exit 1' "$ROOT/ss-manager.sh" \
+  || fail_test 'legacy updater self-test cannot invoke the new compatibility preflight'
+preflight_body=$(awk '
+  /^manager_update_preflight\(\)/ {inside=1}
+  inside {print}
+  inside && /^}/ {exit}
+' "$ROOT/ss-manager.sh")
+grep -Fq 'ensure_dir "$RUNTIME_DIR" 700' <<<"$preflight_body" \
+  || fail_test 'manager update preflight does not protect its volatile candidate directory'
+if grep -Eq '^[[:space:]]*ensure_runtime_dirs([[:space:]]|$)' <<<"$preflight_body"; then
+  fail_test 'manager update preflight mutates permanent runtime/state directories before commit'
+fi
+grep -Fq 'LEGACY_TRAFFIC_STATE_NEEDS_MIGRATION' <<<"$preflight_body" \
+  || fail_test 'manager-only update can strand the legacy traffic migration outside install rollback'
+grep -Fq 'nodes_schema_upgrade_copy "$NODES_FILE" "$candidate_nodes"' <<<"$preflight_body" \
+  || fail_test 'manager update preflight does not test legacy schema migration in a candidate file'
+grep -Fq 'vless_generation_capabilities_available' <<<"$preflight_body" \
+  || fail_test 'manager update preflight does not verify VLESS identity generation capabilities'
+grep -Fq 'source "$SCRIPT_DIR/lib/nodes.sh"' "$ROOT/install.sh" \
+  || fail_test 'installer cannot run VLESS identity capability checks'
+grep -Fq 'nodes_file_has_vless "$NODES_FILE"' "$ROOT/install.sh" \
+  || fail_test 'idempotent install does not detect existing VLESS nodes'
+grep -Fq 'vless_generation_capabilities_available' "$ROOT/install.sh" \
+  || fail_test 'idempotent install does not verify existing VLESS identity generators'
 grep -q 'manager_update_transaction_begin' "$ROOT/lib/update.sh" || fail_test 'manager update lacks a persistent rollback transaction'
 grep -q 'ss-manager.update-old' "$ROOT/lib/common.sh" || fail_test 'rem wrapper lacks interrupted directory-switch recovery'
 grep -Fq '# Managed by Ss2022' "$ROOT/lib/common.sh" || fail_test 'rem wrapper lacks an explicit ownership marker'
@@ -806,6 +841,9 @@ if grep -q '^Persistent=true$' "$ROOT/systemd/ss-manager-traffic.timer"; then fa
 grep -q '^UMask=0077$' "$ROOT/systemd/sing-box.service" || fail_test 'sing-box service does not protect newly created files'
 if grep -R -E -- '--arg password "\$password"|--argjson record "\$record"|qrencode[^|]*"\$uri"|--arg value "\$1"' "$ROOT/lib"; then
   fail_test 'a credential-bearing value is still passed in an external process argument'
+fi
+if grep -R -E -- '--arg (uuid|short_id) "\$(uuid|short_id)"' "$ROOT/lib"; then
+  fail_test 'VLESS authentication identifiers are still passed in observable jq arguments'
 fi
 
 printf 'deep audit regression tests passed\n'

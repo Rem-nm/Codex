@@ -19,6 +19,8 @@ source "$SCRIPT_DIR/lib/traffic.sh"
 source "$SCRIPT_DIR/lib/bandwidth.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/backup.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/nodes.sh"
 
 require_root
 detect_host
@@ -262,6 +264,13 @@ else
   info "保留现有本项目管理的 sing-box：$(singbox_binary_version)"
 fi
 
+installed_vless_status=0
+nodes_file_has_vless "$NODES_FILE" || installed_vless_status=$?
+(( installed_vless_status <= 1 )) || die '无法可靠读取现有节点协议；安装事务将恢复安装前状态。'
+if (( installed_vless_status == 0 )) && ! vless_generation_capabilities_available; then
+  die '当前 sing-box 或本机安全随机源无法完成 VLESS UUID、Reality KeyPair、Short ID 生成/校验；安装事务将恢复安装前状态。'
+fi
+
 detect_listen_mode || die '监听模式探测/状态提交失败。'
 detect_traffic_interfaces || die '默认路由接口探测/状态提交失败。'
 configure_bbr || die 'BBR 配置未能安全提交。'
@@ -270,7 +279,7 @@ singbox_config_supports_tfo || die 'TCP Fast Open 配置能力探测状态未能
 
 candidate=$(runtime_temp_file config.install-candidate) || die '无法创建候选配置暂存文件。'
 generate_singbox_config "$NODES_FILE" "$candidate" || die '无法从节点数据库生成候选配置。'
-singbox_check_config "$candidate" >/dev/null || die '节点数据库生成的候选配置未通过 sing-box 官方检查。'
+singbox_check_config "$candidate" >/dev/null 2>&1 || die '节点数据库生成的候选配置未通过 sing-box 官方检查。'
 check_manager_maintenance_service_files
 
 install_singbox_service_unit || die 'sing-box 服务定义安装失败。'

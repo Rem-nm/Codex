@@ -336,6 +336,12 @@ jq -n '{schema_version:2,pref:49123,boot_id:"00000000-0000-0000-0000-00000000000
     fi
   }
   tc_delete_owned_action() { printf 'owned-action %s %s %s\n' "$1" "$2" "$3" >>"$owned_delete_log"; }
+  # The production cleanup may reset an empty manager-owned clsact on legacy
+  # kernels whose action bind count remains stale after filter deletion. This
+  # ownership fixture has no real qdisc; model the proven reset/recreate path
+  # without touching the host interface used by the test runner.
+  bandwidth_reset_empty_manager_clsact() { printf '%s\n' "$1"; }
+  bandwidth_recreate_manager_clsact() { :; }
   tc() { printf '%q ' "$@" >>"$owned_delete_log"; printf '\n' >>"$owned_delete_log"; }
   bandwidth_remove_plan "$owned_plan"
 )

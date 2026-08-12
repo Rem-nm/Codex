@@ -77,6 +77,16 @@ singbox_update_flow() {
   singbox_update_transaction_begin || return 1
   backup_create_snapshot "sing-box-update-$target" >/dev/null || return 1
   install_singbox_from_release "$target"
+  local vless_status=0
+  nodes_file_has_vless "$NODES_FILE" || vless_status=$?
+  if (( vless_status > 1 )); then
+    error '无法可靠读取节点协议；将由持久事务恢复旧版 sing-box。'
+    return 1
+  fi
+  if (( vless_status == 0 )) && ! vless_generation_capabilities_available; then
+    error '新版 sing-box 或本机安全随机源无法完成 VLESS UUID、Reality KeyPair、Short ID 生成/校验；将由持久事务恢复旧版。'
+    return 1
+  fi
   if (( old_active == 1 )) && { ! singbox_restart || ! singbox_health_check "$NODES_FILE"; }; then
     error '新版 sing-box 健康检查失败，将由持久事务恢复旧版。'
     return 1
@@ -86,7 +96,7 @@ singbox_update_flow() {
       error '更新前 sing-box 已停止，但更新后无法确认仍处于停止状态。'
       return 1
     }
-    if ! singbox_check_config "$SING_BOX_CONFIG" >/dev/null; then
+    if ! singbox_check_config "$SING_BOX_CONFIG" >/dev/null 2>&1; then
       error '新版 sing-box 在停止状态下未能再次通过当前配置检查，将由持久事务恢复旧版。'
       return 1
     fi

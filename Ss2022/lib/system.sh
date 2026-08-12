@@ -87,7 +87,7 @@ EOF
 required_runtime_commands() {
   printf '%s\n' \
     awk base64 curl date find flock grep head gzip install ip jq mktemp openssl python3 \
-    qrencode readlink sed sha256sum shuf ss sysctl tar tc tr uname wc
+    qrencode readlink sed sha256sum shuf ss sysctl tar tc timeout tr uname wc
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     printf '%s\n' systemctl journalctl
   else
@@ -153,73 +153,82 @@ apt_update_or_die() {
 
 install_packages() {
   detect_host
+  # common.sh uses a private umask for node credentials and transaction
+  # evidence.  Package managers and their maintainer scripts expect the
+  # conventional system umask, so do not let that hardening accidentally make
+  # unrelated package-managed files unreadable.  Keep the relaxed umask in a
+  # subshell so every success and failure path restores the parent's 077.
   local -a packages=()
   mapfile -t packages < <(package_list)
-  case "$PACKAGE_MANAGER" in
-    apt-get)
-      if runtime_commands_present; then
-        info '所需依赖命令已存在，跳过 APT 更新；保留现有依赖和项目数据。'
-      else
-        export DEBIAN_FRONTEND=noninteractive
-        apt_update_or_die
-        local -a apt_options=()
-        if [[ -n "$APT_SOURCE_OVERRIDE" ]]; then
-          apt_options=(
-            -o "Dir::Etc::sourcelist=$APT_SOURCE_OVERRIDE"
-            -o 'Dir::Etc::sourceparts=-'
-          )
-        fi
-        # The manager only needs the commands to exist.  Avoid upgrading
-        # unrelated already-installed packages during an idempotent repair;
-        # this also avoids triggering large post-install hooks (for example
-        # ca-certificates/man-db) before the manager itself is installed.
-        if ! apt-get "${apt_options[@]}" install -y --no-install-recommends --no-upgrade "${packages[@]}"; then
+  (
+    umask 022
+    trap apt_source_override_cleanup EXIT
+    case "$PACKAGE_MANAGER" in
+      apt-get)
+        if runtime_commands_present; then
+          info '所需依赖命令已存在，跳过 APT 更新；保留现有依赖和项目数据。'
+        else
+          export DEBIAN_FRONTEND=noninteractive
+          apt_update_or_die
+          local -a apt_options=()
+          if [[ -n "$APT_SOURCE_OVERRIDE" ]]; then
+            apt_options=(
+              -o "Dir::Etc::sourcelist=$APT_SOURCE_OVERRIDE"
+              -o 'Dir::Etc::sourceparts=-'
+            )
+          fi
+          # The manager only needs the commands to exist.  Avoid upgrading
+          # unrelated already-installed packages during an idempotent repair;
+          # this also avoids triggering large post-install hooks (for example
+          # ca-certificates/man-db) before the manager itself is installed.
+          if ! apt-get "${apt_options[@]}" install -y --no-install-recommends --no-upgrade "${packages[@]}"; then
+            apt_source_override_cleanup
+            return 1
+          fi
           apt_source_override_cleanup
-          return 1
         fi
-        apt_source_override_cleanup
-      fi
-      ;;
-    dnf)
-      dnf -y install "${packages[@]}" || {
-        warn "当前 DNF 仓库未提供 qrencode，尝试启用发行版提供的 EPEL 仓库。"
-        dnf -y install epel-release
-        dnf -y install "${packages[@]}"
-      }
-      ;;
-    yum)
-      yum -y install "${packages[@]}" || {
-        warn "当前 YUM 仓库未提供 qrencode，尝试启用发行版提供的 EPEL 仓库。"
-        yum -y install epel-release
-        yum -y install "${packages[@]}"
-      }
-      ;;
-    apk)
-      local -a missing_packages=()
-      local package_name
-      for package_name in "${packages[@]}"; do
-        apk info -e "$package_name" >/dev/null 2>&1 || missing_packages+=("$package_name")
-      done
-      if ((${#missing_packages[@]} > 0)); then
-        apk add --no-cache "${missing_packages[@]}"
-      else
-        info '所需 Alpine 依赖已存在，跳过 APK 更新；保留现有依赖和项目数据。'
-      fi
-      if ! command -v sysctl >/dev/null 2>&1; then
-        apk add --no-cache procps-ng \
-          || apk add --no-cache procps \
-          || die 'Alpine 软件源未提供 procps-ng/procps，无法安装 sysctl。'
-      fi
-      if ! command -v qrencode >/dev/null 2>&1; then
-        if ! apk add --no-cache libqrencode-tools; then
-          # Older Alpine branches provided the executable from libqrencode.
-          apk add --no-cache libqrencode || die 'Alpine 软件源未提供 qrencode；请确认已启用与当前版本匹配的官方 community 仓库。'
+        ;;
+      dnf)
+        if ! dnf -y install "${packages[@]}"; then
+          warn "当前 DNF 仓库未提供 qrencode，尝试启用发行版提供的 EPEL 仓库。"
+          dnf -y install epel-release || return 1
+          dnf -y install "${packages[@]}" || return 1
         fi
-      fi
-      ;;
-    *) die "未识别的包管理器：$PACKAGE_MANAGER。" ;;
-  esac
-  require_cmd awk base64 curl date find flock grep head install ip jq mktemp openssl python3 qrencode readlink sed sha256sum shuf ss sysctl tar tc tr uname wc
+        ;;
+      yum)
+        if ! yum -y install "${packages[@]}"; then
+          warn "当前 YUM 仓库未提供 qrencode，尝试启用发行版提供的 EPEL 仓库。"
+          yum -y install epel-release || return 1
+          yum -y install "${packages[@]}" || return 1
+        fi
+        ;;
+      apk)
+        local -a missing_packages=()
+        local package_name
+        for package_name in "${packages[@]}"; do
+          apk info -e "$package_name" >/dev/null 2>&1 || missing_packages+=("$package_name")
+        done
+        if ((${#missing_packages[@]} > 0)); then
+          apk add --no-cache "${missing_packages[@]}" || return 1
+        else
+          info '所需 Alpine 依赖已存在，跳过 APK 更新；保留现有依赖和项目数据。'
+        fi
+        if ! command -v sysctl >/dev/null 2>&1; then
+          apk add --no-cache procps-ng \
+            || apk add --no-cache procps \
+            || die 'Alpine 软件源未提供 procps-ng/procps，无法安装 sysctl。'
+        fi
+        if ! command -v qrencode >/dev/null 2>&1; then
+          if ! apk add --no-cache libqrencode-tools; then
+            # Older Alpine branches provided the executable from libqrencode.
+            apk add --no-cache libqrencode || die 'Alpine 软件源未提供 qrencode；请确认已启用与当前版本匹配的官方 community 仓库。'
+          fi
+        fi
+        ;;
+      *) die "未识别的包管理器：$PACKAGE_MANAGER。" ;;
+    esac
+  ) || return 1
+  require_cmd awk base64 curl date find flock grep head install ip jq mktemp openssl python3 qrencode readlink sed sha256sum shuf ss sysctl tar tc timeout tr uname wc
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     require_cmd systemctl journalctl
   else

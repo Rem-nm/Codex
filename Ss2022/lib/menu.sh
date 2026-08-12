@@ -85,7 +85,7 @@ node_update_field_in_file() {
 }
 
 choose_existing_node_key() {
-  local current_id=$1 required_method=$2 source_id source_node source_method
+  local current_id=$1 required_method=$2 source_id source_node source_method source_protocol
   while true; do
     select_node_for_flow source_id '请选择要复制密钥的现有节点' || return 1
     if [[ "$source_id" == "$current_id" ]]; then
@@ -93,6 +93,11 @@ choose_existing_node_key() {
       continue
     fi
     source_node=$(node_by_id "$source_id") || die '无法读取所选节点。'
+    source_protocol=$(node_protocol "$source_node") || die '所选节点协议字段无效。'
+    if [[ "$source_protocol" != shadowsocks ]]; then
+      warn 'VLESS 节点没有可复制的 Shadowsocks 密钥；请选择 SS2022 节点。'
+      continue
+    fi
     source_method=$(jq -er '.method' <<<"$source_node") || die '所选节点的加密方式无效。'
     if [[ "$source_method" != "$required_method" ]]; then
       warn "密钥长度必须匹配加密方式；请选择使用 $required_method 的节点。"
@@ -105,12 +110,13 @@ choose_existing_node_key() {
 
 node_delete_flow() {
   acquire_manager_lock
-  local node_id node node_name port keep_history candidate_nodes candidate_traffic candidate_history
+  local node_id node node_name protocol port keep_history candidate_nodes candidate_traffic candidate_history
   select_node_for_flow node_id '请选择要删除的节点' || return 0
   node=$(node_by_id "$node_id")
   node_name=$(jq -er '.name' <<<"$node")
+  protocol=$(node_protocol "$node") || die '节点协议字段无效。'
   port=$(jq -er '.port' <<<"$node")
-  printf '\n即将删除节点：%s（端口 %s，Node ID %s）\n' "$node_name" "$port" "$node_id"
+  printf '\n即将删除节点：%s（协议 %s，端口 %s，Node ID %s）\n' "$node_name" "$(protocol_label "$protocol")" "$port" "$node_id"
   prompt_yes_no '确认删除该节点？' n || return 0
   keep_history=n
   if prompt_yes_no '是否保留该节点的累计/周期流量数据备份？' y; then keep_history=y; fi
@@ -140,19 +146,39 @@ node_delete_flow() {
 
 node_modify_flow() {
   acquire_manager_lock
-  local node_id node field action requested name method port address_line address address_type password quota_gb quota reset_day upload_limit download_limit candidate_nodes candidate_traffic candidate_history traffic_source changed=0
+  local node_id node field action protocol requested name method port address_line address address_type password quota_gb quota reset_day upload_limit download_limit candidate_nodes candidate_traffic candidate_history traffic_source changed=0 show_credentials_after=0
+  local server_name handshake_line handshake_server handshake_port uuid keypair private_key public_key short_id
   select_node_for_flow node_id '请选择要修改的节点' || return 0
   node=$(node_by_id "$node_id")
-  printf '\n当前节点：%s（Node ID %s）\n' "$(jq -er '.name' <<<"$node")" "$node_id"
-  printf '1. 名称\n2. 加密方式（会自动生成符合新算法的密钥）\n3. 端口\n4. 修改密钥（重新生成或复制同算法节点）\n5. 节点地址\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n0. 返回\n> '
+  protocol=$(node_protocol "$node") || die '节点协议字段无效。'
+  printf '\n当前节点：%s（%s，Node ID %s）\n' "$(jq -er '.name' <<<"$node")" "$(protocol_label "$protocol")" "$node_id"
+  if [[ "$protocol" == shadowsocks ]]; then
+    printf '1. 名称\n2. 加密方式（会自动生成符合新算法的密钥）\n3. 端口\n4. 修改密钥（重新生成或复制同算法节点）\n5. 节点地址\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n0. 返回\n> '
+  else
+    printf '1. 名称\n2. 端口\n3. 节点地址\n4. Reality Server Name / SNI\n5. Reality 握手目标\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n9. 重新生成 UUID\n10. 重新生成 Reality KeyPair\n11. 重新生成 Short ID\n0. 返回\n> '
+  fi
   IFS= read -r field || die '读取输入失败。'
+  if [[ "$protocol" == shadowsocks ]]; then
+    case "$field" in
+      1) field=name ;; 2) field=ss-method ;; 3) field=port ;; 4) field=ss-key ;;
+      5) field=address ;; 6) field=quota ;; 7) field=reset ;; 8) field=bandwidth ;;
+      0) return 0 ;; *) warn '无效选项。'; return 0 ;;
+    esac
+  else
+    case "$field" in
+      1) field=name ;; 2) field=port ;; 3) field=address ;; 4) field=vless-sni ;;
+      5) field=vless-handshake ;; 6) field=quota ;; 7) field=reset ;; 8) field=bandwidth ;;
+      9) field=vless-uuid ;; 10) field=vless-keypair ;; 11) field=vless-short ;;
+      0) return 0 ;; *) warn '无效选项。'; return 0 ;;
+    esac
+  fi
   prepare_state_candidate_paths modify candidate_nodes candidate_traffic candidate_history \
     || die '无法创建修改事务候选文件。'
   install -m 600 -- "$NODES_FILE" "$candidate_nodes"
   install -m 600 -- "$TRAFFIC_FILE" "$candidate_traffic"
   install -m 600 -- "$HISTORY_FILE" "$candidate_history"
   case "$field" in
-    1)
+    name)
       requested=$(read_nonempty '请输入新的节点名称：')
       validate_name "$requested" || die '节点名称包含控制字符、路径字符或超过 64 个字符。'
       name=$(unique_node_name "$requested" "$node_id") || die '无法生成唯一名称。'
@@ -161,7 +187,7 @@ node_modify_flow() {
       mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       changed=1
       ;;
-    2)
+    ss-method)
       method=$(choose_method)
       password=$(generate_random_key "$(method_key_bytes "$method")")
       printf '%s' "$password" | jq -Rs --arg id "$node_id" --arg method "$method" --slurpfile source "$candidate_nodes" \
@@ -171,13 +197,13 @@ node_modify_flow() {
       info '加密方式已修改，并已自动生成新的安全密钥。'
       changed=1
       ;;
-    3)
-      port=$(choose_port "$node_id")
+    port)
+      port=$(choose_port "$node_id" "$protocol")
       jq --arg id "$node_id" --argjson port "$port" '.nodes[] |= if .node_id == $id then .port=$port | .updated_at=(now|todateiso8601) else . end' "$candidate_nodes" >"$candidate_nodes.next"
       mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       changed=1
       ;;
-    4)
+    ss-key)
       method=$(jq -er '.method' <<<"$node")
       printf '1. 重新生成安全随机密钥（默认）\n2. 复制另一个同加密方式节点的密钥\n0. 返回\n> '
       IFS= read -r action || die '读取输入失败。'
@@ -200,7 +226,7 @@ node_modify_flow() {
       info '节点密钥已更新；旧密钥立即失效。'
       changed=1
       ;;
-    5)
+    address)
       address_line=$(choose_address)
       address=${address_line%$'\t'*}
       address_type=${address_line##*$'\t'}
@@ -208,7 +234,7 @@ node_modify_flow() {
       mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       changed=1
       ;;
-    6)
+    quota)
       printf '请输入月流量限额（GB，0=不限；安全上限 9007199.254740991 GB）：\n> '
       IFS= read -r quota_gb || die '读取输入失败。'
       quota=$(bytes_from_gb "$quota_gb" 2>/dev/null || true)
@@ -224,7 +250,7 @@ node_modify_flow() {
       mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       changed=1
       ;;
-    7)
+    reset)
       printf '请输入新的每月重置日（1-28）：\n> '
       IFS= read -r reset_day || die '读取输入失败。'
       validate_reset_day "$reset_day" || die '重置日必须为 1-28。'
@@ -237,7 +263,7 @@ node_modify_flow() {
       mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       changed=1
       ;;
-    8)
+    bandwidth)
       printf '请输入上传限速 Mbps（0=不限）：\n> '
       IFS= read -r upload_limit || die '读取输入失败。'
       printf '请输入下载限速 Mbps（0=不限）：\n> '
@@ -249,14 +275,69 @@ node_modify_flow() {
       mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       changed=1
       ;;
-    0) rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 0 ;;
-    *) warn '无效选项。'; rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 0 ;;
+    vless-sni)
+      server_name=$(choose_reality_server_name)
+      handshake_server=$(jq -er --arg id "$node_id" '.nodes[] | select(.node_id == $id) | .reality_handshake_server' "$candidate_nodes") || die '无法读取 Reality 握手服务器。'
+      handshake_port=$(jq -er --arg id "$node_id" '.nodes[] | select(.node_id == $id) | .reality_handshake_port' "$candidate_nodes") || die '无法读取 Reality 握手端口。'
+      reality_handshake_reachable "$handshake_server" "$handshake_port" "$server_name" \
+        || warn '新 SNI 对当前握手目标无法完成 TCP/TLS 探测；将继续配置事务，稍后必须用客户端验证。'
+      jq --arg id "$node_id" --arg server_name "$server_name" '.nodes[] |= if .node_id == $id then .reality_server_name=$server_name | .updated_at=(now|todateiso8601) else . end' "$candidate_nodes" >"$candidate_nodes.next"
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+      changed=1
+      ;;
+    vless-handshake)
+      handshake_line=$(choose_reality_handshake_target)
+      handshake_server=${handshake_line%$'\t'*}
+      handshake_port=${handshake_line##*$'\t'}
+      server_name=$(jq -er --arg id "$node_id" '.nodes[] | select(.node_id == $id) | .reality_server_name' "$candidate_nodes") || die '无法读取 Reality SNI。'
+      reality_handshake_reachable "$handshake_server" "$handshake_port" "$server_name" \
+        || warn '新握手目标当前无法完成 TCP/TLS 探测；将继续配置事务，稍后必须用客户端验证。'
+      jq --arg id "$node_id" --arg server "$handshake_server" --argjson port "$handshake_port" '.nodes[] |= if .node_id == $id then .reality_handshake_server=$server | .reality_handshake_port=$port | .updated_at=(now|todateiso8601) else . end' "$candidate_nodes" >"$candidate_nodes.next"
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+      changed=1
+      ;;
+    vless-uuid)
+      prompt_yes_no '重新生成 UUID 后现有客户端配置将失效，需要重新导入。确认继续？' n || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 0; }
+      uuid=$(generate_unique_vless_uuid) || die 'sing-box 无法生成未被其他节点使用的新 VLESS UUID。'
+      printf '%s' "$uuid" | jq -eRs --arg id "$node_id" --slurpfile source "$candidate_nodes" \
+        '. as $uuid | $source[0] | .nodes[] |= if .node_id == $id then .uuid=$uuid | .updated_at=(now|todateiso8601) else . end' \
+        >"$candidate_nodes.next" || die '无法生成 VLESS UUID 候选配置。'
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+      changed=1
+      show_credentials_after=1
+      ;;
+    vless-keypair)
+      prompt_yes_no '重新生成 Reality KeyPair 后现有客户端配置将失效，需要重新导入。确认继续？' n || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 0; }
+      keypair=$(generate_unique_reality_keypair) || die 'sing-box 无法生成未被其他节点使用的新 Reality KeyPair。'
+      private_key=${keypair%$'\t'*}
+      public_key=${keypair##*$'\t'}
+      printf '%s' "$private_key" | jq -Rs --arg id "$node_id" --arg public_key "$public_key" --slurpfile source "$candidate_nodes" \
+        '. as $private_key | $source[0] | .nodes[] |= if .node_id == $id then .reality_private_key=$private_key | .reality_public_key=$public_key | .updated_at=(now|todateiso8601) else . end' \
+        >"$candidate_nodes.next" || die '无法生成 Reality KeyPair 候选配置。'
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+      changed=1
+      show_credentials_after=1
+      ;;
+    vless-short)
+      prompt_yes_no '重新生成 Short ID 后现有客户端配置将失效，需要重新导入。确认继续？' n || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 0; }
+      short_id=$(generate_unique_reality_short_id) || die '无法安全生成未被其他节点使用的新 Reality Short ID。'
+      printf '%s' "$short_id" | jq -eRs --arg id "$node_id" --slurpfile source "$candidate_nodes" \
+        '. as $short_id | $source[0] | .nodes[] |= if .node_id == $id then .reality_short_id=$short_id | .updated_at=(now|todateiso8601) else . end' \
+        >"$candidate_nodes.next" || die '无法生成 Reality Short ID 候选配置。'
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+      changed=1
+      show_credentials_after=1
+      ;;
   esac
 
   if (( changed == 0 )); then rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 0; fi
   local transaction_status=0
   if apply_state_transaction "$candidate_nodes" "$candidate_traffic" "$candidate_history" "modify-node-$node_id"; then
     success '节点修改成功。'
+    if (( show_credentials_after == 1 )); then
+      show_node_credentials "$node_id" \
+        || warn 'VLESS 身份已经更新，但新客户端凭据未完整显示；请从“显示节点链接 / 二维码”重新查看。'
+    fi
   else
     error '节点修改失败，已自动恢复上一版本配置。'
     transaction_status=1
@@ -328,11 +409,12 @@ traffic_stats_flow() {
 
 traffic_quota_flow() {
   acquire_manager_lock
-  local node_id node quota_gb quota reset_day candidate_nodes candidate_traffic candidate_history traffic_source
+  local node_id node quota_gb quota reset_day candidate_nodes candidate_traffic candidate_history traffic_source quota_policy
   select_node_for_flow node_id '请选择要设置流量限额的节点' || return 0
   node=$(node_by_id "$node_id")
+  quota_policy=$(quota_policy_description) || die '无法读取全局配额策略。'
   printf '请输入月流量限额（GB，0=不限；安全上限 9007199.254740991 GB）：\n'
-  printf '自动停用默认只按下载流量判断，以降低未认证 ingress 的影响；端口级统计仍非认证账单。\n> '
+  printf '当前自动停用策略：%s；端口级统计仍非认证账单。\n> ' "$quota_policy"
   IFS= read -r quota_gb || die '读取输入失败。'
   quota=$(bytes_from_gb "$quota_gb" 2>/dev/null || true)
   validate_safe_uint "$quota" || die '请输入 0-9007199.254740991 范围内的非负 GB 数值，例如 500 或 0。'
@@ -646,7 +728,7 @@ main_menu() {
       || die '无法汇总节点流量。'
     singbox_summary=$(singbox_status_summary) || die '无法查询 sing-box 状态。'
     total_text=$(format_bytes "$total") || die '无法格式化节点流量。'
-    printf '\n================================\n          REM SS Manager\n================================\n\nSing-box：%s\n节点数量：%s\n本周期总流量：%s\n\n' "$singbox_summary" "$count" "$total_text"
+    printf '\n================================\n       REM Proxy Manager\n================================\n\nSing-box：%s\n节点数量：%s\n本周期总流量：%s\n\n' "$singbox_summary" "$count" "$total_text"
     printf '1. 添加节点\n2. 删除节点\n3. 修改节点\n4. 查看节点\n5. 节点详细信息\n6. 显示节点链接 / 二维码\n7. 启用 / 停用节点\n\n8. 流量统计\n9. 流量限额\n10. 流量重置\n11. 上传 / 下载限速\n\n12. Sing-box 管理\n13. 更新管理\n14. 备份与恢复\n15. 系统设置\n16. 卸载\n\n0. 退出\n> '
     local choice
     IFS= read -r choice || exit 0

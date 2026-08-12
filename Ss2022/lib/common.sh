@@ -5,6 +5,10 @@
 
 set -Eeuo pipefail
 IFS=$'\n\t'
+# Every module handles credentials or transaction evidence.  Explicit install
+# modes still publish public service files where needed; implicit redirections
+# must never create group/world-readable temporary JSON.
+umask 077
 
 COMMON_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$COMMON_DIR/.." && pwd)"
@@ -20,7 +24,7 @@ if [[ -r "$VERSION_FILE" ]]; then
   IFS= read -r MANAGER_VERSION <"$VERSION_FILE" || true
   MANAGER_VERSION=${MANAGER_VERSION//$'\r'/}
 fi
-MANAGER_VERSION="${MANAGER_VERSION:-1.0.20}"
+MANAGER_VERSION="${MANAGER_VERSION:-1.1.0-dev.1}"
 [[ "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
   printf 'Invalid manager VERSION: %s\n' "$MANAGER_VERSION" >&2
   exit 1
@@ -180,10 +184,151 @@ load_json_or_default() {
 
 initialize_state_files() {
   ensure_runtime_dirs || return 1
-  load_json_or_default "$NODES_FILE" '{"schema_version":1,"nodes":[]}' || return 1
+  load_json_or_default "$NODES_FILE" '{"schema_version":2,"nodes":[]}' || return 1
   load_json_or_default "$TRAFFIC_FILE" '{"schema_version":1,"nodes":{}}' || return 1
   load_json_or_default "$HISTORY_FILE" '{"schema_version":1,"cycles":{}}' || return 1
   load_json_or_default "$INTERFACES_FILE" '{"schema_version":1,"interfaces":[]}' || return 1
+  migrate_nodes_schema_if_needed || return 1
+}
+
+# Schema 1 was the SS2022-only format.  Keep accepting it for validation and
+# backups, but publish one schema-2 document before any menu or transaction
+# operation can edit it.  The migration is deliberately lossless: every old
+# field is retained and only the protocol discriminator is added.
+migrate_nodes_schema_if_needed() {
+  [[ -f "$NODES_FILE" && ! -L "$NODES_FILE" ]] || return 1
+  local schema candidate original candidate_config=''
+  local migration_transaction=0 active_status=0 service_was_active=0
+  schema=$(jq -er '.schema_version' "$NODES_FILE") || return 1
+  [[ "$schema" == 1 ]] || { [[ "$schema" == 2 ]] && return 0; return 1; }
+
+  declare -F backup_create_snapshot >/dev/null 2>&1 || {
+    error '节点数据库迁移所需的备份模块未加载；未修改节点数据。'
+    return 1
+  }
+  backup_create_snapshot 'schema-1-to-2-migration' >/dev/null || {
+    error '旧版节点数据库迁移前自动备份失败；未修改节点数据。'
+    return 1
+  }
+  original=$(runtime_temp_file nodes.schema1-original) || return 1
+  install -m 600 -- "$NODES_FILE" "$original" || { rm -f -- "$original"; return 1; }
+  candidate=$(runtime_temp_file nodes.schema2) || { rm -f -- "$original"; return 1; }
+  jq ' .schema_version = 2
+      | .nodes |= map(. + {protocol:"shadowsocks"}) ' "$NODES_FILE" >"$candidate" || {
+    rm -f -- "$candidate" "$original"
+    return 1
+  }
+  validate_nodes_file_semantic "$candidate" || {
+    rm -f -- "$candidate" "$original"
+    error '旧版节点数据库迁移后语义校验失败；原文件保持不变。'
+    return 1
+  }
+  if ! validate_traffic_file_semantic "$TRAFFIC_FILE" "$candidate" \
+    || ! validate_history_file_semantic "$HISTORY_FILE"; then
+    rm -f -- "$candidate" "$original"
+    error '旧版节点数据库迁移后的流量或历史关联校验失败；原文件保持不变。'
+    return 1
+  fi
+  if [[ "${INSTALL_TRANSACTION_ACTIVE:-0}" == 1 ]]; then
+    # install.sh checks the complete migrated configuration with the selected
+    # managed sing-box binary before its outer transaction can commit.  Do not
+    # trust or execute a foreign binary that the takeover flow has not reached.
+    :
+  elif [[ -x "$SING_BOX_BINARY" ]] \
+    && declare -F generate_singbox_config >/dev/null 2>&1 \
+    && declare -F singbox_check_config >/dev/null 2>&1; then
+    candidate_config=$(runtime_temp_file config.schema2-migration) || {
+      rm -f -- "$candidate" "$original"
+      return 1
+    }
+    if ! generate_singbox_config "$candidate" "$candidate_config" \
+      || ! singbox_check_config "$candidate_config" >/dev/null 2>&1; then
+      rm -f -- "$candidate" "$original" "$candidate_config"
+      error '旧版节点数据库迁移后的完整 sing-box 配置检查失败；原文件保持不变。'
+      return 1
+    fi
+  else
+    rm -f -- "$candidate" "$original"
+    error '节点数据库迁移时无法调用受管 sing-box 完成候选配置检查；原文件保持不变。'
+    return 1
+  fi
+  if [[ "${INSTALL_TRANSACTION_ACTIVE:-0}" != 1 ]]; then
+    declare -F state_transaction_begin >/dev/null 2>&1 \
+      && declare -F state_transaction_set_phase >/dev/null 2>&1 \
+      && declare -F state_transaction_rollback_after_failure >/dev/null 2>&1 \
+      && declare -F state_transaction_clear >/dev/null 2>&1 \
+      && declare -F singbox_is_active >/dev/null 2>&1 || {
+        rm -f -- "$candidate" "$original" "$candidate_config"
+        error '节点数据库迁移所需的持久状态事务模块未加载；原文件保持不变。'
+        return 1
+      }
+    singbox_is_active || active_status=$?
+    if (( active_status == 0 )); then
+      service_was_active=1
+    elif (( active_status != 1 )); then
+      rm -f -- "$candidate" "$original" "$candidate_config"
+      error '无法可靠查询 sing-box 原运行状态；节点数据库未迁移。'
+      return 1
+    fi
+    state_transaction_begin 'schema-1-to-2-migration' "$service_was_active" || {
+      rm -f -- "$candidate" "$original" "$candidate_config"
+      error '无法建立节点数据库迁移的持久恢复事务；原文件保持不变。'
+      return 1
+    }
+    migration_transaction=1
+    if ! state_transaction_set_phase committing_state; then
+      state_transaction_rollback_after_failure || true
+      rm -f -- "$candidate" "$original" "$candidate_config"
+      error '无法持久记录节点数据库迁移阶段；已恢复迁移前状态。'
+      return 1
+    fi
+  fi
+  if ! atomic_json_write "$candidate" "$NODES_FILE" 600; then
+    error '旧版节点数据库迁移提交失败，正在恢复迁移前文件。'
+    if (( migration_transaction == 1 )); then
+      if ! state_transaction_rollback_after_failure; then
+        rm -f -- "$candidate" "$original" "$candidate_config"
+        error '节点数据库迁移持久事务自动恢复失败；恢复证据已保留，请停止操作。'
+        return 1
+      fi
+    elif ! atomic_json_write "$original" "$NODES_FILE" 600; then
+      rm -f -- "$candidate" "$original" "$candidate_config"
+      error '节点数据库迁移前文件自动恢复失败；迁移前快照已保留，请停止操作并使用备份恢复。'
+      return 1
+    fi
+    rm -f -- "$candidate" "$original" "$candidate_config"
+    return 1
+  fi
+  if (( migration_transaction == 1 )); then
+    if ! state_transaction_set_phase committed; then
+      state_transaction_rollback_after_failure || true
+      rm -f -- "$candidate" "$original" "$candidate_config"
+      error '节点数据库迁移完成标记无法持久提交；已尝试恢复迁移前状态。'
+      return 1
+    fi
+    state_transaction_clear \
+      || warn "节点数据库迁移已提交，但事务日志暂未清理；下次启动会仅清理 committed 日志：$STATE_TRANSACTION_DIR"
+  fi
+  rm -f -- "$candidate" "$original" "$candidate_config" \
+    || warn '节点数据库已经迁移，但受保护的运行时候选文件暂未清理；系统重启后 /run 会自动清空。'
+  info '已将旧版 SS2022 节点数据库迁移为 schema 2；Node ID、密钥、流量和限额均保持不变。'
+}
+
+nodes_schema_upgrade_copy() {
+  local source=$1 destination=$2 schema
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  schema=$(jq -er '.schema_version' "$source") || return 1
+  case "$schema" in
+    1)
+      jq '.schema_version = 2 | .nodes |= map(. + {protocol:"shadowsocks"})' "$source" >"$destination" || return 1
+      ;;
+    2)
+      install -m 600 -- "$source" "$destination" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  chmod 600 -- "$destination" || return 1
+  validate_nodes_file_semantic "$destination"
 }
 
 validate_installed_state_files() {
@@ -556,13 +701,12 @@ validate_nodes_file_semantic() {
     def iso: type == "string" and ((try fromdateiso8601 catch null) != null);
     def uint: type == "number" and . >= 0 and . <= $max and floor == .;
     def limit: type == "number" and . >= 0 and . <= 1000000;
-    .schema_version == 1 and (.nodes | type == "array")
-    and all(.nodes[];
-      (keys | sort) == (["address","address_type","created_at","download_limit_mbps","last_reset_at","method","name","next_reset_at","node_id","password","port","quota_bytes","reset_day","status","status_reason","updated_at","upload_limit_mbps"] | sort)
-      and (.node_id | type == "string" and test("^[a-f0-9]{32}$"))
-      and (.name | type == "string")
-      and (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm")
-      and (.password | type == "string")
+    def common_keys: ["address","address_type","created_at","download_limit_mbps","last_reset_at","name","next_reset_at","node_id","port","quota_bytes","reset_day","status","status_reason","updated_at","upload_limit_mbps"];
+    def ss_keys: (common_keys + ["method","password","protocol"]);
+    def vless_keys: (common_keys + ["flow","protocol","reality_handshake_port","reality_handshake_server","reality_private_key","reality_public_key","reality_server_name","reality_short_id","uuid"]);
+    def valid_common:
+      (.node_id | type == "string" and test("^[a-f0-9]{32}$"))
+      and (.name | type == "string" and length >= 1 and length <= 64)
       and (.port | type == "number" and floor == . and . >= 1 and . <= 65535)
       and (.address | type == "string")
       and (.address_type == "ipv4" or .address_type == "ipv6" or .address_type == "domain")
@@ -572,20 +716,67 @@ validate_nodes_file_semantic() {
       and (.reset_day | type == "number" and floor == . and . >= 1 and . <= 28)
       and (.upload_limit_mbps | limit) and (.download_limit_mbps | limit)
       and (.created_at | iso) and (.updated_at | iso) and (.last_reset_at | iso) and (.next_reset_at | iso)
-      and (.created_at <= .updated_at) and (.last_reset_at < .next_reset_at)
-    )
+      and (.created_at <= .updated_at) and (.last_reset_at < .next_reset_at);
+    def valid_vless:
+      (.protocol == "vless")
+      and (keys | sort) == (vless_keys | sort)
+      and (.uuid | type == "string" and test("^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-8][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$"))
+      and (.flow == "xtls-rprx-vision")
+      and (.reality_private_key | type == "string" and test("^[A-Za-z0-9_-]{43}$"))
+      and (.reality_public_key | type == "string" and test("^[A-Za-z0-9_-]{43}$"))
+      and (.reality_short_id | type == "string" and test("^(?:[A-Fa-f0-9]{2}){1,8}$"))
+      and (.reality_server_name | type == "string" and length >= 1 and length <= 253)
+      and (.reality_handshake_server | type == "string" and length >= 1 and length <= 253)
+      and (.reality_handshake_port | type == "number" and floor == . and . >= 1 and . <= 65535)
+      and (.reality_private_key != .reality_public_key);
+    ((.schema_version == 1 and (.nodes | type == "array")
+      and all(.nodes[];
+        (keys | sort) == (["address","address_type","created_at","download_limit_mbps","last_reset_at","method","name","next_reset_at","node_id","password","port","quota_bytes","reset_day","status","status_reason","updated_at","upload_limit_mbps"] | sort)
+        and valid_common
+        and (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm")
+        and (.password | type == "string")
+      ))
+      or (.schema_version == 2 and (.nodes | type == "array")
+        and all(.nodes[]; valid_common and (if .protocol == "shadowsocks" then
+          (keys | sort) == (ss_keys | sort)
+          and (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm")
+          and (.password | type == "string")
+        elif .protocol == "vless" then valid_vless
+        else false end))
+      ))
     and ([.nodes[].node_id] | length == (unique | length))
     and ([.nodes[].name | ascii_downcase] | length == (unique | length))
     and ([.nodes[].port] | length == (unique | length))
+    and ([.nodes[] | select(.protocol == "vless") | (.uuid | ascii_downcase)]
+      | length == (unique | length))
+    and ([.nodes[] | select(.protocol == "vless") | .reality_private_key]
+      | length == (unique | length))
+    and ([.nodes[] | select(.protocol == "vless") | .reality_public_key]
+      | length == (unique | length))
+    and ([.nodes[] | select(.protocol == "vless") | (.reality_short_id | ascii_downcase)]
+      | length == (unique | length))
   ' "$source" >/dev/null 2>&1 || return 1
 
-  local node method detected node_lines
+  local node method detected node_lines protocol
   node_lines=$(jq -c '.nodes[]' "$source") || return 1
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     validate_name "$(jq -er '.name' <<<"$node")" || return 1
-    method=$(jq -er '.method' <<<"$node") || return 1
-    validate_base64_key "$(jq -er '.password' <<<"$node")" "$(method_key_bytes "$method")" || return 1
+    protocol=$(jq -r '.protocol // "shadowsocks"' <<<"$node") || return 1
+    if [[ "$protocol" == shadowsocks ]]; then
+      method=$(jq -er '.method' <<<"$node") || return 1
+      validate_base64_key "$(jq -er '.password' <<<"$node")" "$(method_key_bytes "$method")" || return 1
+    elif [[ "$protocol" == vless ]]; then
+      validate_uuid "$(jq -er '.uuid' <<<"$node")" || return 1
+      validate_reality_keypair \
+        "$(jq -er '.reality_private_key' <<<"$node")" \
+        "$(jq -er '.reality_public_key' <<<"$node")" || return 1
+      validate_short_id "$(jq -er '.reality_short_id' <<<"$node")" || return 1
+      validate_domain_name "$(jq -er '.reality_server_name' <<<"$node")" || return 1
+      validate_reality_handshake_server "$(jq -er '.reality_handshake_server' <<<"$node")" || return 1
+    else
+      return 1
+    fi
     detected=$(validate_address "$(jq -er '.address' <<<"$node")") || return 1
     [[ "$detected" == "$(jq -er '.address_type' <<<"$node")" ]] || return 1
   done <<<"$node_lines"
@@ -688,7 +879,11 @@ validate_bandwidth_plan_semantic() {
       and (.kind == "gact" or .kind == "police")
       and (.index | type == "number" and floor == . and . > 0 and . <= 4294967295)
       and (.cookie | type == "string" and test("^[a-f0-9]{32}$"))
-      and (.limit_mbps | type == "number" and . >= 0 and . <= 1000000))
+      and (.limit_mbps | type == "number" and . >= 0 and . <= 1000000)
+      and ((.protocols // ["tcp","udp"]) as $protocols
+        | ($protocols | type) == "array" and ($protocols | length) >= 1 and ($protocols | length) <= 2
+        and $protocols[0] == "tcp" and all($protocols[]; . == "tcp" or . == "udp")
+        and (($protocols | length) == ($protocols | unique | length))))
     and ([.actions[].index] | length == (unique | length))
     and ([.actions[] | [.node_id,.direction] | join(":")] | length == (unique | length))
   ' "$source" >/dev/null 2>&1
@@ -706,6 +901,8 @@ validate_bandwidth_plan_against_state() {
         | [ $plan.actions[] | select(.node_id == $node.node_id and .direction == $direction) ] as $matches
         | ($matches | length) == 1
         and ($matches[0].port == $node.port)
+        and (($matches[0].protocols // ["tcp","udp"]) ==
+          (if ($node.protocol // "shadowsocks") == "vless" then ["tcp"] else ["tcp","udp"] end))
         and ($matches[0].limit_mbps == (if $direction == "ingress" then $node.upload_limit_mbps else $node.download_limit_mbps end))
         and ($matches[0].kind == (if $matches[0].limit_mbps == 0 then "gact" else "police" end)))))
     and all(.actions[];
@@ -747,6 +944,224 @@ method_key_bytes() {
 
 validate_method() {
   [[ "$1" == '2022-blake3-aes-128-gcm' || "$1" == '2022-blake3-aes-256-gcm' ]]
+}
+
+validate_uuid() {
+  # Accept all standardized UUID versions through RFC 9562 v8 while requiring
+  # the RFC variant.  Current sing-box emits v4, but restored identities must
+  # not become invalid merely because a future official generator emits v7.
+  [[ "$1" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-8][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$ ]]
+}
+
+validate_reality_key() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{43}$ ]]
+}
+
+validate_reality_keypair() {
+  local private_key=$1 public_key=$2
+  validate_reality_key "$private_key" || return 1
+  validate_reality_key "$public_key" || return 1
+  # X25519 keys are base64url-encoded raw 32-byte values.  Derive the public
+  # value with the RFC 7748 Montgomery ladder using only the Python standard
+  # library.  This remains compatible with supported systems whose older
+  # OpenSSL build predates X25519.  Both keys arrive on stdin and never appear
+  # in an external process argument or log.
+  printf '%s\n%s\n' "$private_key" "$public_key" | python3 -c '
+import base64
+import sys
+
+lines = sys.stdin.read().splitlines()
+if len(lines) != 2:
+    raise SystemExit(1)
+private_text, public_text = lines
+
+def decode_canonical(value):
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except Exception:
+        raise SystemExit(1)
+    if len(decoded) != 32:
+        raise SystemExit(1)
+    if base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != value:
+        raise SystemExit(1)
+    return decoded
+
+raw_private = decode_canonical(private_text)
+expected_public = decode_canonical(public_text)
+
+# RFC 7748 section 5: X25519 scalar multiplication with base point u = 9.
+p = 2**255 - 19
+a24 = 121665
+scalar = int.from_bytes(raw_private, "little")
+scalar &= (1 << 255) - 8
+scalar |= 1 << 254
+x1 = 9
+x2, z2 = 1, 0
+x3, z3 = 9, 1
+swap = 0
+for bit_index in range(254, -1, -1):
+    bit = (scalar >> bit_index) & 1
+    swap ^= bit
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    swap = bit
+    a = (x2 + z2) % p
+    aa = (a * a) % p
+    b = (x2 - z2) % p
+    bb = (b * b) % p
+    e = (aa - bb) % p
+    c = (x3 + z3) % p
+    d = (x3 - z3) % p
+    da = (d * a) % p
+    cb = (c * b) % p
+    x3 = ((da + cb) ** 2) % p
+    z3 = (x1 * ((da - cb) ** 2)) % p
+    x2 = (aa * bb) % p
+    z2 = (e * (aa + a24 * e)) % p
+if swap:
+    x2, x3 = x3, x2
+    z2, z3 = z3, z2
+try:
+    actual_public = (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if actual_public == expected_public else 1)
+'
+}
+
+validate_short_id() {
+  [[ "$1" =~ ^([A-Fa-f0-9]{2}){1,8}$ ]]
+}
+
+normalize_domain_name() {
+  local value=$1
+  python3 - "$value" <<'PY'
+import ipaddress
+import re
+import sys
+
+value = sys.argv[1]
+if not value or value.endswith(".") or any(ord(ch) < 33 or ord(ch) == 127 for ch in value):
+    raise SystemExit(1)
+try:
+    ipaddress.ip_address(value)
+except ValueError:
+    pass
+else:
+    raise SystemExit(1)
+try:
+    normalized = value.encode("idna").decode("ascii").lower()
+except (UnicodeError, ValueError):
+    raise SystemExit(1)
+if len(normalized) > 253 or ".." in normalized:
+    raise SystemExit(1)
+labels = normalized.split(".")
+if any(not label or len(label) > 63 for label in labels):
+    raise SystemExit(1)
+if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label) for label in labels):
+    raise SystemExit(1)
+print(normalized, end="")
+PY
+}
+
+validate_domain_name() {
+  local normalized
+  normalized=$(normalize_domain_name "$1") || return 1
+  [[ "$normalized" == "$1" ]]
+}
+
+validate_reality_handshake_server() {
+  local value=$1 detected normalized
+  detected=$(validate_address "$value") || return 1
+  if [[ "$detected" == domain ]]; then
+    normalized=$(normalize_domain_name "$value") || return 1
+    [[ "$normalized" == "$value" ]] || return 1
+  fi
+  return 0
+}
+
+parse_reality_handshake_target() {
+  local value=$1
+  python3 - "$value" <<'PY'
+import ipaddress
+import re
+import sys
+
+value = sys.argv[1].strip()
+if not value or any(ord(ch) < 33 or ord(ch) == 127 for ch in value):
+    raise SystemExit(1)
+
+host = value
+port_text = "443"
+if value.startswith("["):
+    match = re.fullmatch(r"\[([^\]]+)\]:(\d+)", value)
+    if not match:
+        raise SystemExit(1)
+    host, port_text = match.groups()
+    try:
+        parsed = ipaddress.ip_address(host)
+    except ValueError:
+        raise SystemExit(1)
+    if parsed.version != 6 or "%" in host:
+        raise SystemExit(1)
+    host = parsed.compressed
+elif value.count(":") == 1:
+    host, port_text = value.rsplit(":", 1)
+elif ":" in value:
+    # An IPv6 target with an explicit port must use [address]:port.
+    raise SystemExit(1)
+
+if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+    raise SystemExit(1)
+if not host:
+    raise SystemExit(1)
+try:
+    parsed = ipaddress.ip_address(host)
+except ValueError:
+    try:
+        host = host.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        raise SystemExit(1)
+    if len(host) > 253 or host.endswith(".") or ".." in host:
+        raise SystemExit(1)
+    labels = host.split(".")
+    if any(not label or len(label) > 63 for label in labels):
+        raise SystemExit(1)
+    if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label) for label in labels):
+        raise SystemExit(1)
+else:
+    if "%" in host:
+        raise SystemExit(1)
+    host = parsed.compressed
+print(f"{host}\t{int(port_text)}", end="")
+PY
+}
+
+node_protocol() {
+  local node=${1:-}
+  jq -er '
+    (.protocol // "shadowsocks") as $protocol
+    | if $protocol == "shadowsocks" or $protocol == "vless"
+      then $protocol
+      else error("unsupported node protocol") end
+  ' <<<"$node"
+}
+
+node_transport_protocols() {
+  local protocol
+  protocol=$(node_protocol "$1") || return 1
+  case "$protocol" in
+    shadowsocks) printf 'tcp\nudp\n' ;;
+    vless) printf 'tcp\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+nodes_file_has_vless() {
+  local source=$1
+  [[ -f "$source" && ! -L "$source" ]] || return 2
+  jq -e 'any(.nodes[]?; (.protocol // "shadowsocks") == "vless")' "$source" >/dev/null 2>&1
 }
 
 bytes_from_gb() {
@@ -817,6 +1232,14 @@ status_label() {
     disabled_quota) printf '超额停用' ;;
     disabled_error) printf '错误停用' ;;
     *) printf '%s' "$1" ;;
+  esac
+}
+
+protocol_label() {
+  case "$1" in
+    shadowsocks) printf 'SS2022' ;;
+    vless) printf 'VLESS' ;;
+    *) return 1 ;;
   esac
 }
 

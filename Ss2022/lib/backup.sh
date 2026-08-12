@@ -5,26 +5,40 @@ validate_candidate_nodes() {
   local nodes_source=$1
   validate_nodes_file_semantic "$nodes_source" || die '候选节点数据库语义无效。'
 
-  local current_id current_port current_status live_port live_status port_state node_lines
+  local current_id current_port current_status current_protocol live_port live_status live_protocol port_state node_lines
   node_lines=$(jq -c '.nodes[]' "$nodes_source") || return 1
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     current_id=$(jq -er '.node_id' <<<"$node") || return 1
     current_port=$(jq -er '.port' <<<"$node") || return 1
     current_status=$(jq -er '.status' <<<"$node") || return 1
+    current_protocol=$(node_protocol "$node") || return 1
+    live_protocol=$(jq -er --arg id "$current_id" '
+      [.nodes[] | select(.node_id == $id)]
+      | if length == 0 then ""
+        elif length == 1 then (.[0].protocol // "shadowsocks")
+        else error("duplicate live node id") end
+    ' "$NODES_FILE") || return 1
+    if [[ -n "$live_protocol" && "$live_protocol" != "$current_protocol" ]]; then
+      die "Node ID $current_id 的协议不能从 $(protocol_label "$live_protocol") 转换为 $(protocol_label "$current_protocol")。"
+    fi
     # Disabled nodes do not bind their reserved port.  Do not let a service
     # that started after such a node was disabled block unrelated changes.
     [[ "$current_status" == enabled ]] || continue
     port_state=0
-    system_port_in_use "$current_port" || port_state=$?
-    (( port_state != 2 )) || die "无法可靠查询候选端口 $current_port 的 TCP/UDP 监听状态。"
+    if [[ "$current_protocol" == shadowsocks ]]; then
+      system_port_in_use "$current_port" || port_state=$?
+    else
+      system_port_in_use_for_protocol "$current_port" "$current_protocol" || port_state=$?
+    fi
+    (( port_state != 2 )) || die "无法可靠查询候选端口 $current_port 的协议监听状态。"
     if (( port_state == 0 )); then
       live_port=$(jq -r --arg id "$current_id" '.nodes[] | select(.node_id == $id) | .port' "$NODES_FILE") || return 1
       live_status=$(jq -r --arg id "$current_id" '.nodes[] | select(.node_id == $id) | .status' "$NODES_FILE") || return 1
       if [[ "$live_status" != enabled || "$live_port" != "$current_port" ]]; then
         die "候选端口 $current_port 已被系统其他服务占用。"
       fi
-      if ! singbox_is_active || ! singbox_owns_node_port "$current_port"; then
+      if ! singbox_is_active || ! singbox_owns_node_port "$current_port" '' "$current_protocol"; then
         die "候选端口 $current_port 虽与原节点相同，但当前监听者不是唯一的 sing-box 进程。"
       fi
     fi
@@ -66,6 +80,13 @@ backup_create_snapshot() {
   install -m 600 -- "$NODES_FILE" "$preparing/nodes.json" || { rm -rf -- "$preparing"; return 1; }
   install -m 600 -- "$TRAFFIC_FILE" "$preparing/traffic.json" || { rm -rf -- "$preparing"; return 1; }
   install -m 600 -- "$HISTORY_FILE" "$preparing/traffic-history.json" || { rm -rf -- "$preparing"; return 1; }
+  if [[ -e "$MANAGER_STATE" || -L "$MANAGER_STATE" ]]; then
+    [[ -f "$MANAGER_STATE" && ! -L "$MANAGER_STATE" ]] \
+      && validate_manager_state_semantic "$MANAGER_STATE" \
+      || { error 'manager 状态不是可备份的常规有效文件。'; rm -rf -- "$preparing"; return 1; }
+    install -m 600 -- "$MANAGER_STATE" "$preparing/manager.json" \
+      || { rm -rf -- "$preparing"; return 1; }
+  fi
   if [[ -e "$SING_BOX_CONFIG" || -L "$SING_BOX_CONFIG" ]]; then
     [[ -f "$SING_BOX_CONFIG" && ! -L "$SING_BOX_CONFIG" ]] || {
       error 'sing-box 配置不是常规文件或为符号链接，拒绝在常规备份中跟随。'
@@ -87,7 +108,14 @@ backup_create_snapshot() {
       || { rm -rf -- "$preparing"; return 1; }
   fi
   created_at=$(timestamp_iso) || { rm -rf -- "$preparing"; return 1; }
-  sing_box_version=$(singbox_binary_version 2>/dev/null || true)
+  # Snapshot metadata is informational.  Read the already-validated manager
+  # record instead of executing the binary here: during an install takeover,
+  # schema migration can run before a foreign sing-box file has been replaced
+  # and had its ownership/digest established.
+  sing_box_version=''
+  if [[ -f "$MANAGER_STATE" && ! -L "$MANAGER_STATE" ]]; then
+    sing_box_version=$(manager_state_get sing_box_version '') || { rm -rf -- "$preparing"; return 1; }
+  fi
   jq -n \
     --arg reason "$reason" \
     --arg created_at "$created_at" \
@@ -113,7 +141,7 @@ backup_snapshot_is_managed() {
     [[ -f "$backup/$required" && ! -L "$backup/$required" ]] || return 1
   done
   local optional
-  for optional in config.json sing-box; do
+  for optional in config.json sing-box manager.json; do
     if [[ -e "$backup/$optional" || -L "$backup/$optional" ]]; then
       [[ -f "$backup/$optional" && ! -L "$backup/$optional" ]] || return 1
     fi
@@ -130,6 +158,9 @@ backup_snapshot_is_managed() {
   validate_nodes_file_semantic "$backup/nodes.json" || return 1
   validate_traffic_file_semantic "$backup/traffic.json" "$backup/nodes.json" || return 1
   validate_history_file_semantic "$backup/traffic-history.json" || return 1
+  if [[ -f "$backup/manager.json" ]]; then
+    validate_manager_state_semantic "$backup/manager.json" || return 1
+  fi
 }
 
 backup_managed_names() {
@@ -756,7 +787,7 @@ transaction_runtime_health_check() {
     # still receives the official parser check, while process/port checks are
     # intentionally skipped because no process is expected.
     singbox_confirm_inactive || { error 'sing-box 在保持停止的事务中被意外启动或状态无法确认。'; return 1; }
-    singbox_check_config "$SING_BOX_CONFIG" >/dev/null
+    singbox_check_config "$SING_BOX_CONFIG" >/dev/null 2>&1
   fi
 }
 
@@ -921,12 +952,21 @@ backup_restore_flow() {
   [[ "$choice" == 0 ]] && return 0
   [[ "$choice" =~ ^[1-9][0-9]*$ && choice -ge 1 && choice -le ${#backups[@]} ]] || die '无效的备份序号。'
   local selected_name=${backups[$((choice-1))]}
-  local selected="$BACKUP_DIR/$selected_name" restore_reason
+  local selected="$BACKUP_DIR/$selected_name" restore_reason restore_nodes
   backup_snapshot_is_managed "$selected" || die '备份不完整、语义无效或不属于 Ss2022。'
   restore_reason=$(backup_restore_reason "$selected_name") || die '无法生成安全的恢复事务标识。'
   prompt_yes_no "确认恢复备份 $selected_name？当前状态会先自动再备份" n || return 0
   traffic_collect_no_lock || return 1
-  apply_state_transaction "$selected/nodes.json" "$selected/traffic.json" "$selected/traffic-history.json" "$restore_reason" 0 || die '恢复失败，已自动回滚。'
+  restore_nodes=$(runtime_temp_file nodes.restore) || die '无法创建恢复节点候选文件。'
+  nodes_schema_upgrade_copy "$selected/nodes.json" "$restore_nodes" || {
+    rm -f -- "$restore_nodes"
+    die '备份节点数据库无法安全迁移到当前 schema。'
+  }
+  apply_state_transaction "$restore_nodes" "$selected/traffic.json" "$selected/traffic-history.json" "$restore_reason" 0 || {
+    rm -f -- "$restore_nodes"
+    die '恢复失败，已自动回滚。'
+  }
+  rm -f -- "$restore_nodes" || warn '备份已恢复，但节点候选暂存文件清理失败。'
   success '备份恢复完成。'
 }
 

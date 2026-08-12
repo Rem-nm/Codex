@@ -224,6 +224,16 @@ quota_billable_bytes() {
   fi
 }
 
+quota_policy_description() {
+  local include_upload
+  include_upload=$(manager_state_get quota_include_unauthenticated_upload false) || return 1
+  case "$include_upload" in
+    false) printf '仅下载（全局默认策略）' ;;
+    true) printf '上传 + 下载（全局策略）' ;;
+    *) return 1 ;;
+  esac
+}
+
 traffic_sync_quota_status() {
   local nodes_source=$1 traffic_source=$2 node_id=$3 quota=$4 output_file=$5
   validate_safe_uint "$quota" || return 1
@@ -250,8 +260,15 @@ traffic_sync_quota_status() {
 }
 
 tc_action_counter_json() {
-  local kind=$1 index=$2 cookie=$3 output
-  output=$(tc -s -j actions get action "$kind" index "$index" 2>/dev/null) || return 1
+  local kind=$1 index=$2 cookie=$3 output status=0
+  output=$(tc -s -j actions get action "$kind" index "$index" 2>&1) || status=$?
+  if (( status != 0 )); then
+    # Ubuntu 18.04's iproute2 has no usable `actions get action` parser, but
+    # its list operation still returns the same cookie and statistics fields
+    # (in legacy text form, normalized by tc_action_legacy_json).
+    grep -qi 'command "action" is unknown' <<<"$output" || return 1
+    output=$(tc -s -j actions ls action "$kind" 2>/dev/null) || return 1
+  fi
   [[ -n "$output" ]] || return 1
   tc_action_counter_from_json "$output" "$kind" "$index" "$cookie"
 }

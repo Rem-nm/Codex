@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+test_tmp=$(mktemp -d)
+trap 'rm -rf -- "$test_tmp"' EXIT
 
 # shellcheck disable=SC1091
 source "$ROOT/lib/common.sh"
@@ -109,6 +111,36 @@ grep -qx openrc <<<"$apk_packages"
 grep -q 'apk add --no-cache procps-ng' "$ROOT/lib/system.sh"
 grep -q 'apk add --no-cache procps' "$ROOT/lib/system.sh"
 grep -q 'apk info -e' "$ROOT/lib/system.sh"
+
+# Package-manager processes need the conventional umask, while the manager's
+# credential-writing parent must retain 077 on both success and failure.
+(
+  detect_host() { PACKAGE_MANAGER=apt-get; INIT_SYSTEM=systemd; }
+  package_list() { printf '%s\n' ca-certificates; }
+  runtime_commands_present() { umask >"$test_tmp/package-umask-success"; return 0; }
+  require_cmd() { :; }
+  umask 077
+  install_packages
+  assert_equal 0077 "$(umask)" 'successful package install changed the manager umask'
+  assert_equal 0022 "$(<"$test_tmp/package-umask-success")" 'package manager did not receive umask 022'
+)
+(
+  # Values are consumed by install_packages from the sourced system module.
+  # shellcheck disable=SC2034
+  detect_host() { PACKAGE_MANAGER=apk; INIT_SYSTEM=openrc; }
+  package_list() { printf '%s\n' qrencode; }
+  apk() {
+    umask >"$test_tmp/package-umask-failure"
+    return 1
+  }
+  umask 077
+  if install_packages; then
+    printf 'assertion failed: simulated APK failure unexpectedly succeeded\n' >&2
+    exit 1
+  fi
+  assert_equal 0077 "$(umask)" 'failed package install changed the manager umask'
+  assert_equal 0022 "$(<"$test_tmp/package-umask-failure")" 'failing package manager did not receive umask 022'
+)
 
 (
   HOST_OS_ID=debian

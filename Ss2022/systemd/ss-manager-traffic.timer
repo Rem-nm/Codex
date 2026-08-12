@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Ss2022 traffic accounting every minute
+
+[Timer]
+# Managed by Ss2022
+OnBootSec=1min
+OnUnitActiveSec=60s
+Unit=ss-manager-traffic.service
+
+[Install]
+WantedBy=timers.target

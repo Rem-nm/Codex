@@ -1,0 +1,39 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+# Managed by Ss2022
+# shellcheck disable=SC2034
+
+name="sing-box"
+description="sing-box managed by Ss2022"
+supervisor="supervise-daemon"
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+pidfile="/run/ss-manager/sing-box-supervisor.pid"
+respawn_delay=2
+respawn_max=0
+retry="TERM/10/KILL/5"
+rc_ulimit="-n 1048576"
+umask=077
+
+depend() {
+  after net
+}
+
+checkconfig() {
+  "$command" check -c /etc/sing-box/config.json
+}
+
+start_pre() {
+  # The installer/menu holds manager lock fd 9 while starting services. Do not
+  # let OpenRC's supervisor inherit that lock, or every later menu action
+  # would appear to be running concurrently forever.
+  exec 9>&-
+  checkpath --directory --mode 0700 /run/ss-manager
+  checkconfig
+}
+
+stop_pre() {
+  if [ "$RC_CMD" = restart ]; then
+    checkconfig
+  fi
+}

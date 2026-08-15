@@ -126,9 +126,9 @@ node_delete_flow() {
   prepare_state_candidate_paths delete candidate_nodes candidate_traffic candidate_history \
     || die '无法创建删除事务候选文件。'
   jq --arg id "$node_id" '.nodes |= map(select(.node_id != $id))' "$NODES_FILE" >"$candidate_nodes"
-  if [[ "$protocol" == hysteria2 ]]; then
-    candidate_certs=$(hysteria2_make_candidate_cert_root) || die '无法创建 Hysteria2 证书删除候选目录。'
-    hysteria2_remove_candidate_node "$candidate_certs" "$node_id" || { rm -rf -- "$candidate_certs"; die '无法移除 Hysteria2 节点证书。'; }
+  if tls_protocol_uses_managed_certificate "$protocol"; then
+    candidate_certs=$(tls_make_candidate_cert_root) || die '无法创建 TLS 证书删除候选目录。'
+    tls_remove_candidate_node "$candidate_certs" "$node_id" || { rm -rf -- "$candidate_certs"; die '无法移除节点 TLS 证书。'; }
   fi
   traffic_candidate_remove_node "$node_id" >"$candidate_traffic"
   if [[ "$keep_history" == y ]]; then
@@ -161,8 +161,10 @@ node_modify_flow() {
     printf '1. 名称\n2. 加密方式（会自动生成符合新算法的密钥）\n3. 端口\n4. 修改密钥（重新生成或复制同算法节点）\n5. 节点地址\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n0. 返回\n> '
   elif [[ "$protocol" == vless ]]; then
     printf '1. 名称\n2. 端口\n3. 节点地址\n4. Reality Server Name / SNI\n5. Reality 握手目标\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n9. 重新生成 UUID\n10. 重新生成 Reality KeyPair\n11. 重新生成 Short ID\n0. 返回\n> '
-  else
+  elif [[ "$protocol" == hysteria2 ]]; then
     printf '1. 名称\n2. 端口\n3. 节点地址\n4. 修改密码\n5. 重新生成自签名证书\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n0. 返回\n> '
+  else
+    printf '1. 名称\n2. 端口\n3. 节点地址\n4. 重新生成 UUID / Password\n5. 重新生成自签名证书\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n0. 返回\n> '
   fi
   IFS= read -r field || die '读取输入失败。'
   if [[ "$protocol" == shadowsocks ]]; then
@@ -178,10 +180,16 @@ node_modify_flow() {
       9) field=vless-uuid ;; 10) field=vless-keypair ;; 11) field=vless-short ;;
       0) return 0 ;; *) warn '无效选项。'; return 0 ;;
     esac
-  else
+  elif [[ "$protocol" == hysteria2 ]]; then
     case "$field" in
       1) field=name ;; 2) field=port ;; 3) field=address ;; 4) field=hy2-password ;;
       5) field=hy2-cert ;; 6) field=quota ;; 7) field=reset ;; 8) field=bandwidth ;;
+      0) return 0 ;; *) warn '无效选项。'; return 0 ;;
+    esac
+  else
+    case "$field" in
+      1) field=name ;; 2) field=port ;; 3) field=address ;; 4) field=tuic-auth ;;
+      5) field=tuic-cert ;; 6) field=quota ;; 7) field=reset ;; 8) field=bandwidth ;;
       0) return 0 ;; *) warn '无效选项。'; return 0 ;;
     esac
   fi
@@ -190,9 +198,6 @@ node_modify_flow() {
   install -m 600 -- "$NODES_FILE" "$candidate_nodes"
   install -m 600 -- "$TRAFFIC_FILE" "$candidate_traffic"
   install -m 600 -- "$HISTORY_FILE" "$candidate_history"
-  if [[ "$protocol" == hysteria2 ]]; then
-    candidate_certs=$(hysteria2_make_candidate_cert_root) || die '无法创建 Hysteria2 证书候选目录。'
-  fi
   case "$field" in
     name)
       requested=$(read_nonempty '请输入新的节点名称：')
@@ -359,11 +364,43 @@ node_modify_flow() {
       prompt_yes_no '重新生成 TLS 证书后，证书 SHA-256 Pin 将改变，现有客户端保存的指纹将失效，需要重新获取分享链接或重新扫描二维码。确认继续？' n \
         || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; [[ -z "$candidate_certs" ]] || rm -rf -- "$candidate_certs"; return 0; }
       server_name=$(jq -er --arg id "$node_id" '.nodes[] | select(.node_id == $id) | .tls_server_name' "$candidate_nodes") || die '无法读取 Hysteria2 TLS SNI。'
-      certificate_pin=$(hysteria2_generate_certificate "$candidate_certs" "$node_id" "$server_name") \
-        || die '无法重新生成 Hysteria2 自签名证书。'
+      candidate_certs=$(tls_make_candidate_cert_root) || die '无法创建 Hysteria2 证书候选目录。'
+      certificate_pin=$(tls_generate_certificate "$candidate_certs" "$node_id" "$server_name") \
+        || { rm -rf -- "$candidate_certs"; die '无法重新生成 Hysteria2 自签名证书。'; }
       jq --arg id "$node_id" --arg pin "$certificate_pin" \
         '.nodes[] |= if .node_id == $id then .certificate_sha256=$pin | .updated_at=(now|todateiso8601) else . end' \
-        "$candidate_nodes" >"$candidate_nodes.next" || die '无法写入 Hysteria2 证书候选配置。'
+        "$candidate_nodes" >"$candidate_nodes.next" \
+        || { rm -rf -- "$candidate_certs"; die '无法写入 Hysteria2 证书候选配置。'; }
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+      changed=1
+      show_credentials_after=1
+      ;;
+    tuic-auth)
+      prompt_yes_no '重新生成 TUIC UUID / Password 后，现有客户端节点将立即失效，需要重新获取分享链接或扫描二维码。确认继续？' n \
+        || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; [[ -z "$candidate_certs" ]] || rm -rf -- "$candidate_certs"; return 0; }
+      uuid=$(generate_unique_tuic_uuid) || die 'sing-box 无法生成未被其他节点使用的新 TUIC UUID。'
+      password=$(generate_unique_tuic_password) || die '无法生成未被其他节点使用的新 TUIC Password。'
+      printf '%s\n%s' "$uuid" "$password" | jq -eRs --arg id "$node_id" --slurpfile source "$candidate_nodes" \
+        'split("\n") as $credentials
+          | if ($credentials | length) != 2 then error("invalid TUIC credential record") else
+              $source[0] | .nodes[] |= if .node_id == $id then .uuid=$credentials[0] | .password=$credentials[1] | .updated_at=(now|todateiso8601) else . end
+            end' \
+        >"$candidate_nodes.next" || die '无法生成 TUIC 认证信息候选配置。'
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+      changed=1
+      show_credentials_after=1
+      ;;
+    tuic-cert)
+      prompt_yes_no '重新生成 TLS 证书后，证书 SHA-256 Pin 将改变，现有客户端保存的指纹将失效，需要重新获取分享信息。确认继续？' n \
+        || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; [[ -z "$candidate_certs" ]] || rm -rf -- "$candidate_certs"; return 0; }
+      server_name=$(jq -er --arg id "$node_id" '.nodes[] | select(.node_id == $id) | .tls_server_name' "$candidate_nodes") || die '无法读取 TUIC TLS SNI。'
+      candidate_certs=$(tls_make_candidate_cert_root) || die '无法创建 TUIC 证书候选目录。'
+      certificate_pin=$(tls_generate_certificate "$candidate_certs" "$node_id" "$server_name") \
+        || { rm -rf -- "$candidate_certs"; die '无法重新生成 TUIC 自签名证书。'; }
+      jq --arg id "$node_id" --arg pin "$certificate_pin" \
+        '.nodes[] |= if .node_id == $id then .certificate_sha256=$pin | .updated_at=(now|todateiso8601) else . end' \
+        "$candidate_nodes" >"$candidate_nodes.next" \
+        || { rm -rf -- "$candidate_certs"; die '无法写入 TUIC 证书候选配置。'; }
       mv -f -- "$candidate_nodes.next" "$candidate_nodes"
       changed=1
       show_credentials_after=1
@@ -380,7 +417,7 @@ node_modify_flow() {
     success '节点修改成功。'
     if (( show_credentials_after == 1 )); then
       show_node_credentials "$node_id" \
-        || warn 'VLESS 身份已经更新，但新客户端凭据未完整显示；请从“显示节点链接 / 二维码”重新查看。'
+        || warn '节点认证信息已经更新，但新客户端凭据未完整显示；请从“显示节点链接 / 二维码”重新查看。'
     fi
   else
     error '节点修改失败，已自动恢复上一版本配置。'

@@ -443,6 +443,25 @@ generate_singbox_config() {
           key_path: ($certs_root + "/" + $node.node_id + "/key.pem")
         }
       };
+    def tuic_inbound($node; $listen; $tag):
+      {
+        type: "tuic",
+        tag: $tag,
+        listen: $listen,
+        listen_port: $node.port,
+        users: [{uuid:$node.uuid, password:$node.password}],
+        congestion_control: $node.congestion_control,
+        auth_timeout: $node.auth_timeout,
+        zero_rtt_handshake: $node.zero_rtt_handshake,
+        heartbeat: $node.heartbeat,
+        tls: {
+          enabled: true,
+          server_name: $node.tls_server_name,
+          alpn: ["h3"],
+          certificate_path: ($certs_root + "/" + $node.node_id + "/cert.pem"),
+          key_path: ($certs_root + "/" + $node.node_id + "/key.pem")
+        }
+      };
     def inbound($node; $listen; $tag):
       if ($node.protocol // "shadowsocks") == "shadowsocks" then
         ss_inbound($node; $listen; $tag)
@@ -450,6 +469,8 @@ generate_singbox_config() {
         vless_inbound($node; $listen; $tag)
       elif $node.protocol == "hysteria2" then
         hysteria2_inbound($node; $listen; $tag)
+      elif $node.protocol == "tuic" then
+        tuic_inbound($node; $listen; $tag)
       else
         error("unsupported node protocol")
       end;
@@ -457,6 +478,7 @@ generate_singbox_config() {
       if ($node.protocol // "shadowsocks") == "shadowsocks" then "ss"
       elif $node.protocol == "vless" then "vless"
       elif $node.protocol == "hysteria2" then "hy2"
+      elif $node.protocol == "tuic" then "tuic"
       else error("unsupported node protocol") end;
     [
       .nodes[]
@@ -626,7 +648,7 @@ singbox_owns_node_port() {
     vless)
       port_listener_owned_by_pid tcp "$port" "$pid" any
       ;;
-    hysteria2)
+    hysteria2|tuic)
       port_listener_owned_by_pid udp "$port" "$pid" any
       ;;
     *) return 1 ;;
@@ -657,7 +679,7 @@ singbox_health_check_once() {
         port_listener_owned_by_pid tcp "$port" "$main_pid" "$family" \
           || { error "预期 $family TCP 端口未由 sing-box 监听：$port"; return 1; }
       fi
-      if [[ "$protocol" == shadowsocks || "$protocol" == hysteria2 ]]; then
+      if [[ "$protocol" == shadowsocks || "$protocol" == hysteria2 || "$protocol" == tuic ]]; then
         port_listener_owned_by_pid udp "$port" "$main_pid" "$family" \
           || { error "预期 $family UDP 端口未由 sing-box 监听：$port"; return 1; }
       fi

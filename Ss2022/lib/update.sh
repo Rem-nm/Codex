@@ -77,7 +77,7 @@ singbox_update_flow() {
   singbox_update_transaction_begin || return 1
   backup_create_snapshot "sing-box-update-$target" >/dev/null || return 1
   install_singbox_from_release "$target"
-  local vless_status=0
+  local vless_status=0 tuic_status=0
   nodes_file_has_vless "$NODES_FILE" || vless_status=$?
   if (( vless_status > 1 )); then
     error '无法可靠读取节点协议；将由持久事务恢复旧版 sing-box。'
@@ -85,6 +85,15 @@ singbox_update_flow() {
   fi
   if (( vless_status == 0 )) && ! vless_generation_capabilities_available; then
     error '新版 sing-box 或本机安全随机源无法完成 VLESS UUID、Reality KeyPair、Short ID 生成/校验；将由持久事务恢复旧版。'
+    return 1
+  fi
+  nodes_file_has_tuic "$NODES_FILE" || tuic_status=$?
+  if (( tuic_status > 1 )); then
+    error '无法可靠读取 TUIC 节点；将由持久事务恢复旧版 sing-box。'
+    return 1
+  fi
+  if (( tuic_status == 0 )) && ! tuic_generation_capabilities_available; then
+    error '新版 sing-box 或本机安全随机源无法完成 TUIC UUID、Password 生成/校验；将由持久事务恢复旧版。'
     return 1
   fi
   if (( old_active == 1 )) && { ! singbox_restart || ! singbox_health_check "$NODES_FILE"; }; then

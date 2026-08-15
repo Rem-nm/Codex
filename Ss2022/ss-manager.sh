@@ -63,13 +63,22 @@ manager_update_preflight() {
     rm -f -- "$candidate_nodes" "$candidate_config"
     return 1
   fi
-  local vless_status=0
+  local vless_status=0 tuic_status=0
   nodes_file_has_vless "$candidate_nodes" || vless_status=$?
   if (( vless_status > 1 )); then
     rm -f -- "$candidate_nodes" "$candidate_config"
     return 1
   fi
   if (( vless_status == 0 )) && ! vless_generation_capabilities_available; then
+    rm -f -- "$candidate_nodes" "$candidate_config"
+    return 1
+  fi
+  nodes_file_has_tuic "$candidate_nodes" || tuic_status=$?
+  if (( tuic_status > 1 )); then
+    rm -f -- "$candidate_nodes" "$candidate_config"
+    return 1
+  fi
+  if (( tuic_status == 0 )) && ! tuic_generation_capabilities_available; then
     rm -f -- "$candidate_nodes" "$candidate_config"
     return 1
   fi

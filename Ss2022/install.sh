@@ -272,6 +272,12 @@ nodes_file_has_vless "$NODES_FILE" || installed_vless_status=$?
 if (( installed_vless_status == 0 )) && ! vless_generation_capabilities_available; then
   die '当前 sing-box 或本机安全随机源无法完成 VLESS UUID、Reality KeyPair、Short ID 生成/校验；安装事务将恢复安装前状态。'
 fi
+installed_tuic_status=0
+nodes_file_has_tuic "$NODES_FILE" || installed_tuic_status=$?
+(( installed_tuic_status <= 1 )) || die '无法可靠读取现有 TUIC 节点；安装事务将恢复安装前状态。'
+if (( installed_tuic_status == 0 )) && ! tuic_generation_capabilities_available; then
+  die '当前 sing-box 或本机安全随机源无法完成 TUIC UUID、Password 生成/校验；安装事务将恢复安装前状态。'
+fi
 
 detect_listen_mode || die '监听模式探测/状态提交失败。'
 detect_traffic_interfaces || die '默认路由接口探测/状态提交失败。'

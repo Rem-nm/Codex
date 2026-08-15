@@ -162,7 +162,7 @@ validate_nodes_file_semantic "$legacy_nodes" || fail_test 'valid schema-1 SS2022
 
 upgraded_nodes="$TEST_TMP/nodes-schema2-ss.json"
 nodes_schema_upgrade_copy "$legacy_nodes" "$upgraded_nodes" || fail_test 'schema-1 SS2022 upgrade failed'
-assert_equal 3 "$(jq -r '.schema_version' "$upgraded_nodes")" 'node schema was not upgraded to version 3'
+assert_equal 4 "$(jq -r '.schema_version' "$upgraded_nodes")" 'node schema was not upgraded to version 4'
 assert_equal shadowsocks "$(jq -r '.nodes[0].protocol' "$upgraded_nodes")" 'legacy node protocol discriminator was not added'
 jq -e --slurpfile old "$legacy_nodes" '
   .nodes[0] as $new
@@ -184,8 +184,8 @@ backup_create_snapshot() {
 }
 INSTALL_TRANSACTION_ACTIVE=1
 migrate_nodes_schema_if_needed || fail_test 'automatic schema migration failed'
-assert_equal schema-1-to-3-migration "$migration_backup_reason" 'automatic migration did not request its pre-migration snapshot'
-assert_equal 3 "$(jq -r '.schema_version' "$NODES_FILE")" 'automatic migration did not publish schema 3'
+assert_equal schema-1-to-4-migration "$migration_backup_reason" 'automatic migration did not request its pre-migration snapshot'
+assert_equal 4 "$(jq -r '.schema_version' "$NODES_FILE")" 'automatic migration did not publish schema 4'
 jq -e --slurpfile old "$legacy_nodes" '(.nodes[0] | del(.protocol)) == $old[0].nodes[0]' "$NODES_FILE" >/dev/null \
   || fail_test 'automatic migration changed an existing SS2022 node'
 
@@ -222,6 +222,15 @@ validate_nodes_file_semantic "$mixed_nodes" || fail_test 'valid mixed SS2022/VLE
 assert_equal 2 "$(jq '.nodes | length' "$mixed_nodes")" 'mixed node database lost a node'
 assert_equal "$node_id_ss" "$(jq -r '.nodes[0].node_id' "$mixed_nodes")" 'SS2022 Node ID changed'
 assert_equal "$node_id_vless" "$(jq -r '.nodes[1].node_id' "$mixed_nodes")" 'VLESS Node ID changed'
+
+legacy_schema2="$TEST_TMP/nodes-schema2-mixed.json"
+upgraded_schema4="$TEST_TMP/nodes-schema4-from-2.json"
+jq '.schema_version=2' "$mixed_nodes" >"$legacy_schema2"
+validate_nodes_file_semantic "$legacy_schema2" || fail_test 'valid schema-2 SS2022/VLESS data was rejected'
+nodes_schema_upgrade_copy "$legacy_schema2" "$upgraded_schema4" || fail_test 'schema-2 to schema-4 migration failed'
+jq -e --slurpfile old "$legacy_schema2" '
+  .schema_version == 4 and (.nodes == $old[0].nodes)
+' "$upgraded_schema4" >/dev/null || fail_test 'schema-2 migration changed SS2022/VLESS identity data'
 
 bad_pair="$TEST_TMP/nodes-bad-pair.json"
 jq '.nodes[1].reality_public_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"' "$mixed_nodes" >"$bad_pair"

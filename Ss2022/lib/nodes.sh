@@ -63,16 +63,16 @@ system_port_in_use_for_protocol() {
   local pattern="(^|:)${port}$"
   case "$protocol" in
     shadowsocks|vless) tcp_listeners=$(ss -H -ltn 2>/dev/null) || return 2 ;;
-    hysteria2) ;;
+    hysteria2|tuic) ;;
     *) return 2 ;;
   esac
-  if [[ "$protocol" == shadowsocks || "$protocol" == hysteria2 ]]; then
+  if [[ "$protocol" == shadowsocks || "$protocol" == hysteria2 || "$protocol" == tuic ]]; then
     udp_listeners=$(ss -H -lun 2>/dev/null) || return 2
   fi
-  if [[ "$protocol" != hysteria2 ]] && awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' <<<"$tcp_listeners"; then
+  if [[ "$protocol" != hysteria2 && "$protocol" != tuic ]] && awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' <<<"$tcp_listeners"; then
     return 0
   fi
-  if [[ "$protocol" == shadowsocks || "$protocol" == hysteria2 ]]; then
+  if [[ "$protocol" == shadowsocks || "$protocol" == hysteria2 || "$protocol" == tuic ]]; then
     awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' <<<"$udp_listeners" && return 0
   fi
   return 1
@@ -93,7 +93,7 @@ port_available() {
       protocol=shadowsocks
     fi
   fi
-  [[ "$protocol" == shadowsocks || "$protocol" == vless || "$protocol" == hysteria2 ]] || return 2
+  [[ "$protocol" == shadowsocks || "$protocol" == vless || "$protocol" == hysteria2 || "$protocol" == tuic ]] || return 2
   local database_status=0
   validate_port "$port" || return 1
   node_port_in_database "$port" "$exclude_id" || database_status=$?
@@ -164,7 +164,7 @@ choose_port() {
       (( availability_status != 2 )) || die '无法可靠查询系统监听端口，已停止选择端口。'
       if [[ "$protocol" == shadowsocks ]]; then
         warn "端口 $port 的 TCP 或 UDP 已被占用，或与已有节点冲突；不会覆盖。"
-      elif [[ "$protocol" == hysteria2 ]]; then
+      elif [[ "$protocol" == hysteria2 || "$protocol" == tuic ]]; then
         warn "端口 $port 的 UDP 已被占用，或与已有节点冲突；不会覆盖。"
       else
         warn "端口 $port 的 TCP 已被占用，或与已有节点冲突；不会覆盖。"
@@ -191,7 +191,7 @@ choose_method() {
 choose_protocol() {
   local choice
   while true; do
-    printf '%s\n\n1. Shadowsocks 2022\n2. VLESS + REALITY + Vision\n3. Hysteria2\n' '请选择协议：' >&2
+    printf '%s\n\n1. Shadowsocks 2022\n2. VLESS + REALITY + Vision\n3. Hysteria2\n4. TUIC\n' '请选择协议：' >&2
     printf '> ' >&2
     IFS= read -r choice || die '读取输入失败。'
     [[ -z "$choice" ]] && choice=1
@@ -199,7 +199,8 @@ choose_protocol() {
       1) printf 'shadowsocks'; return 0 ;;
       2) printf 'vless'; return 0 ;;
       3) printf 'hysteria2'; return 0 ;;
-      *) warn '请选择 1、2 或 3。' ;;
+      4) printf 'tuic'; return 0 ;;
+      *) warn '请选择 1、2、3 或 4。' ;;
     esac
   done
 }
@@ -318,11 +319,24 @@ vless_uuid_in_database() {
   # UUID is a client authentication credential. Read existing values from the
   # protected database and compare inside Bash instead of placing the new UUID
   # in jq's externally observable argument vector.
-  existing_values=$(jq -er '[.nodes[]? | select((.protocol // "shadowsocks") == "vless") | .uuid] | join("\n")' "$NODES_FILE") \
+  existing_values=$(jq -er '[.nodes[]? | select(.protocol == "vless" or .protocol == "tuic") | .uuid] | join("\n")' "$NODES_FILE") \
     || return 2
   while IFS= read -r existing; do
     [[ -n "$existing" ]] || continue
     validate_uuid "$existing" || return 2
+    [[ "${existing,,}" == "${value,,}" ]] && return 0
+  done <<<"$existing_values"
+  return 1
+}
+
+tuic_password_in_database() {
+  local value=$1 existing_values existing
+  validate_tuic_password "$value" || return 2
+  existing_values=$(jq -er '[.nodes[]? | select(.protocol == "tuic") | .password] | join("\n")' "$NODES_FILE") \
+    || return 2
+  while IFS= read -r existing; do
+    [[ -n "$existing" ]] || continue
+    validate_tuic_password "$existing" || return 2
     [[ "${existing,,}" == "${value,,}" ]] && return 0
   done <<<"$existing_values"
   return 1
@@ -359,6 +373,25 @@ generate_unique_vless_uuid() {
     generated=$(generate_vless_uuid) || return 1
     status=0
     vless_uuid_in_database "$generated" || status=$?
+    if (( status == 1 )); then
+      printf '%s' "$generated" || return 1
+      return 0
+    fi
+    (( status == 0 )) || return 1
+  done
+  return 1
+}
+
+generate_unique_tuic_uuid() {
+  generate_unique_vless_uuid
+}
+
+generate_unique_tuic_password() {
+  local generated status attempt
+  for ((attempt=1; attempt<=64; attempt++)); do
+    generated=$(generate_tuic_password) || return 1
+    status=0
+    tuic_password_in_database "$generated" || status=$?
     if (( status == 1 )); then
       printf '%s' "$generated" || return 1
       return 0
@@ -412,6 +445,14 @@ vless_generation_capabilities_available() {
   validate_uuid "$generated_uuid" \
     && validate_reality_keypair "$generated_private" "$generated_public" \
     && validate_short_id "$generated_short_id"
+}
+
+tuic_generation_capabilities_available() {
+  # Exercise the exact credential generators used by TUIC create/rotate flows.
+  local generated_uuid generated_password
+  generated_uuid=$(generate_vless_uuid) || return 1
+  generated_password=$(generate_tuic_password) || return 1
+  validate_uuid "$generated_uuid" && validate_tuic_password "$generated_password"
 }
 
 reality_handshake_reachable() {
@@ -533,6 +574,34 @@ node_new_hysteria2_record() {
     '. as $password | {node_id:$node_id,name:$name,protocol:"hysteria2",password:$password,tls_server_name:$server_name,certificate_sha256:$pin,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}'
 }
 
+node_new_tuic_record() {
+  local name=$1 port=$2 address=$3 address_type=$4 node_id=$5 uuid=$6 password=$7 server_name=$8 pin=$9
+  local now reset_at next_reset
+  now=$(timestamp_iso) || return 1
+  reset_at=$(timestamp_iso) || return 1
+  next_reset=$(calculate_next_reset_at "$reset_at" "$DEFAULT_RESET_DAY") || return 1
+  # Keep both client authentication values out of jq's argument vector.
+  printf '%s\n%s' "$uuid" "$password" | jq -eRs \
+    --arg node_id "$node_id" \
+    --arg name "$name" \
+    --arg address "$address" \
+    --arg address_type "$address_type" \
+    --arg server_name "$server_name" \
+    --arg pin "$pin" \
+    --arg now "$now" \
+    --arg reset_at "$reset_at" \
+    --arg next_reset "$next_reset" \
+    --argjson port "$port" \
+    --argjson quota "$DEFAULT_QUOTA_BYTES" \
+    --argjson reset_day "$DEFAULT_RESET_DAY" \
+    --argjson upload_limit "$DEFAULT_UPLOAD_LIMIT_MBPS" \
+    --argjson download_limit "$DEFAULT_DOWNLOAD_LIMIT_MBPS" \
+    'split("\n") as $credentials
+      | if ($credentials | length) != 2 then error("invalid TUIC credential record") else
+          {node_id:$node_id,name:$name,protocol:"tuic",uuid:$credentials[0],password:$credentials[1],congestion_control:"bbr",auth_timeout:"3s",zero_rtt_handshake:false,heartbeat:"10s",tls_server_name:$server_name,certificate_sha256:$pin,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}
+        end'
+}
+
 node_add_flow() {
   acquire_manager_lock
   local requested name protocol method port address_line address address_type node_id password record_file candidate traffic_candidate candidate_history
@@ -570,29 +639,41 @@ node_add_flow() {
     short_id=$(generate_unique_reality_short_id) || { rm -f -- "$record_file"; die '无法安全生成未被其他节点使用的有效 Reality Short ID。'; }
     node_new_vless_record "$name" "$port" "$address" "$address_type" "$node_id" "$uuid" "$private_key" "$public_key" "$short_id" "$server_name" "$handshake_server" "$handshake_port" >"$record_file" \
       || { rm -f -- "$record_file"; die '无法创建 VLESS 节点记录。'; }
-  else
-    server_name=$(hysteria2_server_name_for_node "$node_id") \
+  elif [[ "$protocol" == hysteria2 ]]; then
+    server_name=$(tls_server_name_for_node hysteria2 "$node_id") \
       || { rm -f -- "$record_file"; die '无法生成 Hysteria2 TLS Server Name。'; }
     info "Hysteria2 TLS Server Name：$server_name"
-    candidate_certs=$(hysteria2_make_candidate_cert_root) || { rm -f -- "$record_file"; die '无法创建 Hysteria2 证书候选目录。'; }
+    candidate_certs=$(tls_make_candidate_cert_root) || { rm -f -- "$record_file"; die '无法创建 Hysteria2 证书候选目录。'; }
     password=$(generate_hysteria2_password) || { rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法生成 Hysteria2 密码。'; }
-    certificate_pin=$(hysteria2_generate_certificate "$candidate_certs" "$node_id" "$server_name") || {
+    certificate_pin=$(tls_generate_certificate "$candidate_certs" "$node_id" "$server_name") || {
       rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法生成 Hysteria2 自签名证书。';
     }
     node_new_hysteria2_record "$name" "$port" "$address" "$address_type" "$node_id" "$password" "$server_name" "$certificate_pin" >"$record_file" \
       || { rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法创建 Hysteria2 节点记录。'; }
+  else
+    server_name=$(tls_server_name_for_node tuic "$node_id") \
+      || { rm -f -- "$record_file"; die '无法生成 TUIC TLS Server Name。'; }
+    info "TUIC TLS Server Name：$server_name"
+    candidate_certs=$(tls_make_candidate_cert_root) || { rm -f -- "$record_file"; die '无法创建 TUIC 证书候选目录。'; }
+    uuid=$(generate_unique_tuic_uuid) || { rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die 'sing-box 无法生成未被其他节点使用的有效 TUIC UUID。'; }
+    password=$(generate_unique_tuic_password) || { rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法生成未被其他节点使用的 TUIC 密码。'; }
+    certificate_pin=$(tls_generate_certificate "$candidate_certs" "$node_id" "$server_name") || {
+      rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法生成 TUIC 自签名证书。';
+    }
+    node_new_tuic_record "$name" "$port" "$address" "$address_type" "$node_id" "$uuid" "$password" "$server_name" "$certificate_pin" >"$record_file" \
+      || { rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法创建 TUIC 节点记录。'; }
   fi
-  chmod 600 -- "$record_file" || { rm -f -- "$record_file"; die '无法保护节点记录暂存文件。'; }
-  candidate=$(runtime_temp_file nodes.candidate) || { rm -f -- "$record_file"; die '无法创建节点候选暂存文件。'; }
+  chmod 600 -- "$record_file" || { [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法保护节点记录暂存文件。'; }
+  candidate=$(runtime_temp_file nodes.candidate) || { [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法创建节点候选暂存文件。'; }
   jq --slurpfile record "$record_file" '.nodes += [$record[0]]' "$NODES_FILE" >"$candidate" \
-    || { rm -f -- "$record_file" "$candidate"; die '无法生成节点候选数据库。'; }
-  rm -f -- "$record_file" || { rm -f -- "$candidate"; die '无法清理节点密钥暂存文件。'; }
-  traffic_candidate=$(runtime_temp_file traffic.add) || { rm -f -- "$candidate"; die '无法创建流量候选暂存文件。'; }
-  candidate_history=$(runtime_temp_file history.add) || { rm -f -- "$candidate" "$traffic_candidate"; die '无法创建历史候选暂存文件。'; }
+    || { [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"; rm -f -- "$record_file" "$candidate"; die '无法生成节点候选数据库。'; }
+  rm -f -- "$record_file" || { [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"; rm -f -- "$candidate"; die '无法清理节点密钥暂存文件。'; }
+  traffic_candidate=$(runtime_temp_file traffic.add) || { [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"; rm -f -- "$candidate"; die '无法创建流量候选暂存文件。'; }
+  candidate_history=$(runtime_temp_file history.add) || { [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"; rm -f -- "$candidate" "$traffic_candidate"; die '无法创建历史候选暂存文件。'; }
   traffic_candidate_add_node "$node_id" "$DEFAULT_QUOTA_BYTES" "$DEFAULT_RESET_DAY" >"$traffic_candidate" \
-    || { rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"; die '无法生成新节点流量状态。'; }
+    || { [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"; rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"; die '无法生成新节点流量状态。'; }
   install -m 600 -- "$HISTORY_FILE" "$candidate_history" \
-    || { rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"; die '无法复制流量历史候选状态。'; }
+    || { [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"; rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"; die '无法复制流量历史候选状态。'; }
   apply_state_transaction "$candidate" "$traffic_candidate" "$candidate_history" "add-node-$node_id" 1 "${candidate_certs:-}" || {
     [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"
     rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"
@@ -601,7 +682,7 @@ node_add_flow() {
   rm -f -- "$candidate" "$traffic_candidate" "$candidate_history" \
     || warn '节点已经创建，但运行时候选文件清理失败。'
   [[ -z "${candidate_certs:-}" ]] || {
-    [[ ! -e "$candidate_certs" ]] || warn 'Hysteria2 证书候选目录已经发布，但暂存目录清理失败。'
+    [[ ! -e "$candidate_certs" ]] || warn 'TLS 证书候选目录已经发布，但暂存目录清理失败。'
   }
   success "节点创建成功。"
   show_node_credentials "$node_id" || warn '节点已经创建，但凭据展示未完整完成；可稍后从菜单重新显示。'
@@ -720,9 +801,9 @@ node_show_detail() {
       "$handshake_display" "$handshake_port" \
       "$(jq -er '.reality_public_key' <<<"$node")" \
       "$(jq -er '.reality_short_id' <<<"$node")"
-  else
-    cert_path=$(hysteria2_cert_path "$CERTS_DIR" "$node_id") || die '无法推导 Hysteria2 证书路径。'
-    hysteria2_validate_certificate_files "$CERTS_DIR" "$node_id" \
+  elif [[ "$protocol" == hysteria2 ]]; then
+    cert_path=$(tls_cert_path "$CERTS_DIR" "$node_id") || die '无法推导 Hysteria2 证书路径。'
+    tls_validate_certificate_files "$CERTS_DIR" "$node_id" \
       "$(jq -er '.tls_server_name' <<<"$node")" "$(jq -er '.certificate_sha256' <<<"$node")" \
       || die 'Hysteria2 证书、私钥或 Pin 校验失败；请先使用备份恢复。'
     cert_dates=$(openssl x509 -in "$cert_path" -noout -startdate -enddate 2>/dev/null) \
@@ -738,6 +819,30 @@ node_show_detail() {
       "$(jq -er '.certificate_sha256' <<<"$node")" "$cert_start" "$cert_end"
     if ! openssl x509 -in "$cert_path" -checkend $((30 * 86400)) -noout >/dev/null 2>&1; then
       warn 'Hysteria2 证书将在 30 天内到期；项目不会自动轮换，请手动确认是否重新生成。'
+    fi
+  else
+    cert_path=$(tls_cert_path "$CERTS_DIR" "$node_id") || die '无法推导 TUIC 证书路径。'
+    tls_validate_certificate_files "$CERTS_DIR" "$node_id" \
+      "$(jq -er '.tls_server_name' <<<"$node")" "$(jq -er '.certificate_sha256' <<<"$node")" \
+      || die 'TUIC 证书、私钥或 Pin 校验失败；请先使用备份恢复。'
+    cert_dates=$(openssl x509 -in "$cert_path" -noout -startdate -enddate 2>/dev/null) \
+      || die '无法读取 TUIC 证书有效期。'
+    cert_start=${cert_dates#*notBefore=}
+    cert_start=${cert_start%%$'\n'*}
+    cert_end=${cert_dates#*notAfter=}
+    cert_end=${cert_end%%$'\n'*}
+    printf '端口：%s（UDP / QUIC）\n模式：TUIC v5\nTLS：Self-Signed\nUUID：%s\n密码：%s\nTLS SNI：%s\n证书 Pin（叶证书 DER SHA-256）：%s\n证书有效期：%s 至 %s\nQUIC 拥塞控制：%s\n认证超时：%s\n心跳：%s\n0-RTT：%s\n' \
+      "$port" \
+      "$(jq -er '.uuid' <<<"$node")" \
+      "$(jq -er '.password' <<<"$node")" \
+      "$(jq -er '.tls_server_name' <<<"$node")" \
+      "$(jq -er '.certificate_sha256' <<<"$node")" "$cert_start" "$cert_end" \
+      "$(jq -er '.congestion_control' <<<"$node")" \
+      "$(jq -er '.auth_timeout' <<<"$node")" \
+      "$(jq -er '.heartbeat' <<<"$node")" \
+      "$(jq -er 'if .zero_rtt_handshake then "开启" else "关闭" end' <<<"$node")"
+    if ! openssl x509 -in "$cert_path" -checkend $((30 * 86400)) -noout >/dev/null 2>&1; then
+      warn 'TUIC 证书将在 30 天内到期；项目不会自动轮换，请手动确认是否重新生成。'
     fi
   fi
   printf '状态：%s\n' "$status_text"

@@ -85,6 +85,39 @@ node_hysteria2_uri() {
     "$encoded_password" "$host" "$port" "$encoded_sni" "$encoded_pin" "$encoded_name"
 }
 
+node_tuic_uri() {
+  local node=$1 node_id uuid password address address_type port name sni pin congestion host
+  local encoded_uuid encoded_password encoded_sni encoded_congestion encoded_name
+  [[ "$(node_protocol "$node")" == tuic ]] || return 1
+  node_id=$(jq -er '.node_id' <<<"$node") || return 1
+  uuid=$(jq -er '.uuid' <<<"$node") || return 1
+  password=$(jq -er '.password' <<<"$node") || return 1
+  address=$(jq -er '.address' <<<"$node") || return 1
+  address_type=$(jq -er '.address_type' <<<"$node") || return 1
+  port=$(jq -er '.port' <<<"$node") || return 1
+  name=$(jq -er '.name' <<<"$node") || return 1
+  sni=$(jq -er '.tls_server_name' <<<"$node") || return 1
+  pin=$(jq -er '.certificate_sha256' <<<"$node") || return 1
+  congestion=$(jq -er '.congestion_control' <<<"$node") || return 1
+  validate_uuid "$uuid" || return 1
+  validate_tuic_password "$password" || return 1
+  validate_domain_name "$sni" || return 1
+  validate_certificate_sha256 "$pin" || return 1
+  [[ "$congestion" == bbr ]] || return 1
+  tls_validate_certificate_files "$CERTS_DIR" "$node_id" "$sni" "$pin" || return 1
+  host=$(node_uri_host "$address" "$address_type") || return 1
+  encoded_uuid=$(url_encode "$uuid") || return 1
+  encoded_password=$(url_encode "$password") || return 1
+  encoded_sni=$(url_encode "$sni") || return 1
+  encoded_congestion=$(url_encode "$congestion") || return 1
+  encoded_name=$(url_encode "$name") || return 1
+  # The interoperable TUIC v5 URI convention has no portable certificate-pin
+  # query key. Keep the verified leaf digest as a separately displayed value
+  # instead of inventing a parameter that clients may silently ignore.
+  printf 'tuic://%s:%s@%s:%s?congestion_control=%s&alpn=h3&sni=%s&allow_insecure=1&udp_relay_mode=native#%s' \
+    "$encoded_uuid" "$encoded_password" "$host" "$port" "$encoded_congestion" "$encoded_sni" "$encoded_name"
+}
+
 node_share_uri() {
   local node=$1 protocol
   protocol=$(node_protocol "$node") || return 1
@@ -92,6 +125,7 @@ node_share_uri() {
     shadowsocks) node_sip002_uri "$node" ;;
     vless) node_vless_uri "$node" ;;
     hysteria2) node_hysteria2_uri "$node" ;;
+    tuic) node_tuic_uri "$node" ;;
     *) return 1 ;;
   esac
 }
@@ -145,13 +179,21 @@ show_node_credentials() {
     printf 'Short ID：%s\n' "$(jq -er '.reality_short_id' <<<"$node")"
     printf 'TCP 状态：%s\n' "$runtime_status"
     printf '\n[VLESS URI]\n%s\n' "$uri"
-  else
+  elif [[ "$protocol" == hysteria2 ]]; then
     printf '端口：%s（UDP）\n模式：TLS + Hysteria2\n密码：%s\nSNI：%s\n证书 Pin（SHA-256）：%s\n' \
       "$port" "$(jq -er '.password' <<<"$node")" \
       "$(jq -er '.tls_server_name' <<<"$node")" \
       "$(jq -er '.certificate_sha256' <<<"$node")"
     printf 'UDP 状态：%s\n' "$runtime_status"
     printf '\n[Hysteria2 URI]\n%s\n' "$uri"
+  else
+    printf '端口：%s（UDP / QUIC）\n模式：TUIC v5\nTLS：Self-Signed\nUUID：%s\nPassword：%s\nSNI：%s\n证书 Pin（叶证书 DER SHA-256）：%s\nQUIC 拥塞控制：%s\n0-RTT：关闭\n' \
+      "$port" "$(jq -er '.uuid' <<<"$node")" "$(jq -er '.password' <<<"$node")" \
+      "$(jq -er '.tls_server_name' <<<"$node")" "$(jq -er '.certificate_sha256' <<<"$node")" \
+      "$(jq -er '.congestion_control' <<<"$node")"
+    printf 'UDP 状态：%s\n' "$runtime_status"
+    printf '\n[TUIC v5 URI]\n%s\n' "$uri"
+    printf '说明：通用 TUIC URI 没有可移植的证书 Pin 参数；上方 Pin 供支持证书固定的客户端手动核对。\n'
   fi
   printf '\n[Base64 节点信息（上方标准 URI 的 Base64）]\n%s\n' "$base64_uri"
   printf '\n[二维码]\n'
@@ -165,7 +207,7 @@ show_node_credentials() {
   if [[ "$protocol" == shadowsocks ]]; then
     printf '\n请检查服务器防火墙、安全组或云厂商防火墙是否放行 TCP/UDP 端口。\n'
   else
-    [[ "$protocol" == hysteria2 ]] && printf '\n请检查服务器防火墙、安全组或云厂商防火墙是否放行 UDP 端口。\n' \
+    [[ "$protocol" == hysteria2 || "$protocol" == tuic ]] && printf '\n请检查服务器防火墙、安全组或云厂商防火墙是否放行 UDP 端口。\n' \
       || printf '\n请检查服务器防火墙、安全组或云厂商防火墙是否放行 TCP 端口。\n'
   fi
   printf '\n请妥善保管以上客户端凭据、链接和二维码，不要提交到 GitHub 或普通日志。\n'

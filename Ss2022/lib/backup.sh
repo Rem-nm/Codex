@@ -77,15 +77,15 @@ backup_create_snapshot() {
     rm -rf -- "$preparing"
     return 1
   fi
-  validate_hysteria2_certificate_state "$NODES_FILE" "$CERTS_DIR" || {
-    error '当前 Hysteria2 证书目录无效，拒绝创建不可恢复的备份。'
+  validate_tls_certificate_state "$NODES_FILE" "$CERTS_DIR" || {
+    error '当前 HY2/TUIC TLS 证书目录无效，拒绝创建不可恢复的备份。'
     rm -rf -- "$preparing"
     return 1
   }
   install -m 600 -- "$NODES_FILE" "$preparing/nodes.json" || { rm -rf -- "$preparing"; return 1; }
   install -m 600 -- "$TRAFFIC_FILE" "$preparing/traffic.json" || { rm -rf -- "$preparing"; return 1; }
   install -m 600 -- "$HISTORY_FILE" "$preparing/traffic-history.json" || { rm -rf -- "$preparing"; return 1; }
-  if [[ -d "$CERTS_DIR" && ! -L "$CERTS_DIR" ]] && jq -e 'any(.nodes[]?; .protocol == "hysteria2")' "$NODES_FILE" >/dev/null 2>&1; then
+  if [[ -d "$CERTS_DIR" && ! -L "$CERTS_DIR" ]] && nodes_file_has_managed_tls "$NODES_FILE"; then
     cp -a -- "$CERTS_DIR" "$preparing/certs" || { rm -rf -- "$preparing"; return 1; }
     chmod 700 -- "$preparing/certs" || { rm -rf -- "$preparing"; return 1; }
     find "$preparing/certs" -type d -exec chmod 700 {} +
@@ -182,7 +182,7 @@ backup_snapshot_is_managed() {
   validate_nodes_file_semantic "$backup/nodes.json" || return 1
   validate_traffic_file_semantic "$backup/traffic.json" "$backup/nodes.json" || return 1
   validate_history_file_semantic "$backup/traffic-history.json" || return 1
-  validate_hysteria2_certificate_state "$backup/nodes.json" "$backup/certs" || return 1
+  validate_tls_certificate_state "$backup/nodes.json" "$backup/certs" || return 1
   if [[ -f "$backup/manager.json" ]]; then
     validate_manager_state_semantic "$backup/manager.json" || return 1
   fi
@@ -343,7 +343,7 @@ state_transaction_restore() {
   # TLS material remains only partially restored.
   if [[ "$had_certs" == true ]]; then
     [[ -d "$STATE_TRANSACTION_DIR/certs" && ! -L "$STATE_TRANSACTION_DIR/certs" ]] || return 1
-    validate_hysteria2_certificate_state "$STATE_TRANSACTION_DIR/nodes.json" "$STATE_TRANSACTION_DIR/certs" || return 1
+    validate_tls_certificate_state "$STATE_TRANSACTION_DIR/nodes.json" "$STATE_TRANSACTION_DIR/certs" || return 1
   fi
   atomic_json_write "$STATE_TRANSACTION_DIR/nodes.json" "$NODES_FILE" 600 || return 1
   atomic_json_write "$STATE_TRANSACTION_DIR/traffic.json" "$TRAFFIC_FILE" 600 || return 1
@@ -879,11 +879,11 @@ apply_state_transaction() {
   if [[ -n "$candidate_certs" ]]; then
     [[ "$candidate_certs" == "$CONFIG_DIR/.certs-candidate."* && -d "$candidate_certs" && ! -L "$candidate_certs" ]] \
       || { rm -f -- "$merged_traffic"; return 1; }
-  elif jq -e 'any(.nodes[]?; .protocol == "hysteria2")' "$candidate_nodes" >/dev/null 2>&1; then
+  elif nodes_file_has_managed_tls "$candidate_nodes"; then
     candidate_certs="$CERTS_DIR"
   fi
-  validate_hysteria2_certificate_state "$candidate_nodes" "${candidate_certs:-$CERTS_DIR}" \
-    || { rm -f -- "$merged_traffic"; error '候选 Hysteria2 证书目录或 Pin 无效。'; return 1; }
+  validate_tls_certificate_state "$candidate_nodes" "${candidate_certs:-$CERTS_DIR}" \
+    || { rm -f -- "$merged_traffic"; error '候选 HY2/TUIC TLS 证书目录或 Pin 无效。'; return 1; }
 
   local candidate_config
   candidate_config=$(runtime_temp_file config.candidate) || { rm -f -- "$merged_traffic"; return 1; }
@@ -913,8 +913,8 @@ apply_state_transaction() {
     return 1
   fi
   if [[ -n "$candidate_certs" && "$candidate_certs" == "$CONFIG_DIR/.certs-candidate."* ]]; then
-    hysteria2_publish_candidate_cert_root "$candidate_certs" || {
-      error 'Hysteria2 证书候选目录无法提交，正在恢复事务前状态。'
+    tls_publish_candidate_cert_root "$candidate_certs" || {
+      error 'TLS 证书候选目录无法提交，正在恢复事务前状态。'
       state_transaction_rollback_after_failure || true
       rm -f -- "$candidate_config" "$merged_traffic"
       return 1
@@ -1050,11 +1050,15 @@ backup_restore_flow() {
     rm -f -- "$restore_nodes"
     die '备份节点数据库无法安全迁移到当前 schema。'
   }
-  if jq -e 'any(.nodes[]?; .protocol == "hysteria2")' "$restore_nodes" >/dev/null 2>&1; then
-    [[ -d "$selected/certs" && ! -L "$selected/certs" ]] || { rm -f -- "$restore_nodes"; die '备份缺少 Hysteria2 证书目录，拒绝恢复。'; }
-    restore_certs=$(hysteria2_make_candidate_cert_root) || { rm -f -- "$restore_nodes"; die '无法创建恢复证书候选目录。'; }
-    rm -rf -- "$restore_certs" || { rm -f -- "$restore_nodes"; die '无法清空恢复证书候选目录。'; }
-    ensure_dir "$restore_certs" 700 || { rm -f -- "$restore_nodes"; die '无法重建恢复证书候选目录。'; }
+  # Always publish a certificate candidate that mirrors the selected backup.
+  # In particular, restoring a pre-TLS snapshot over a live HY2/TUIC node must
+  # remove the now-orphaned live key instead of validating it against the old
+  # node database and refusing an otherwise valid restore.
+  restore_certs=$(tls_make_candidate_cert_root) || { rm -f -- "$restore_nodes"; die '无法创建恢复证书候选目录。'; }
+  rm -rf -- "$restore_certs" || { rm -f -- "$restore_nodes"; die '无法清空恢复证书候选目录。'; }
+  ensure_dir "$restore_certs" 700 || { rm -f -- "$restore_nodes"; die '无法重建恢复证书候选目录。'; }
+  if nodes_file_has_managed_tls "$restore_nodes"; then
+    [[ -d "$selected/certs" && ! -L "$selected/certs" ]] || { rm -rf -- "$restore_certs"; rm -f -- "$restore_nodes"; die '备份缺少 HY2/TUIC TLS 证书目录，拒绝恢复。'; }
     cp -a -- "$selected/certs/." "$restore_certs/" || { rm -rf -- "$restore_certs"; rm -f -- "$restore_nodes"; die '无法复制备份证书。'; }
   fi
   apply_state_transaction "$restore_nodes" "$selected/traffic.json" "$selected/traffic-history.json" "$restore_reason" 0 "$restore_certs" || {

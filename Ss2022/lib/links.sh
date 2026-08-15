@@ -61,12 +61,37 @@ node_vless_uri() {
     "$uuid" "$host" "$port" "$encoded_sni" "$encoded_public_key" "$encoded_short_id" "$encoded_name"
 }
 
+node_hysteria2_uri() {
+  local node=$1 node_id password address address_type port name sni pin host encoded_password encoded_sni encoded_pin encoded_name
+  [[ "$(node_protocol "$node")" == hysteria2 ]] || return 1
+  password=$(jq -er '.password' <<<"$node") || return 1
+  address=$(jq -er '.address' <<<"$node") || return 1
+  address_type=$(jq -er '.address_type' <<<"$node") || return 1
+  port=$(jq -er '.port' <<<"$node") || return 1
+  name=$(jq -er '.name' <<<"$node") || return 1
+  sni=$(jq -er '.tls_server_name' <<<"$node") || return 1
+  pin=$(jq -er '.certificate_sha256' <<<"$node") || return 1
+  node_id=$(jq -er '.node_id' <<<"$node") || return 1
+  validate_hysteria_password "$password" || return 1
+  validate_domain_name "$sni" || return 1
+  validate_certificate_sha256 "$pin" || return 1
+  hysteria2_validate_certificate_files "$CERTS_DIR" "$node_id" "$sni" "$pin" || return 1
+  host=$(node_uri_host "$address" "$address_type") || return 1
+  encoded_password=$(url_encode "$password") || return 1
+  encoded_sni=$(url_encode "$sni") || return 1
+  encoded_pin=$(url_encode "$pin") || return 1
+  encoded_name=$(url_encode "$name") || return 1
+  printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1&pinSHA256=%s#%s' \
+    "$encoded_password" "$host" "$port" "$encoded_sni" "$encoded_pin" "$encoded_name"
+}
+
 node_share_uri() {
   local node=$1 protocol
   protocol=$(node_protocol "$node") || return 1
   case "$protocol" in
     shadowsocks) node_sip002_uri "$node" ;;
     vless) node_vless_uri "$node" ;;
+    hysteria2) node_hysteria2_uri "$node" ;;
     *) return 1 ;;
   esac
 }
@@ -110,7 +135,7 @@ show_node_credentials() {
     printf '密钥：%s\n' "$(jq -er '.password' <<<"$node")"
     printf 'TCP 状态：%s\nUDP 状态：%s\n' "$runtime_status" "$runtime_status"
     printf '\n[Shadowsocks URI / SIP002]\n%s\n' "$uri"
-  else
+  elif [[ "$protocol" == vless ]]; then
     printf '端口：%s（TCP）\n' "$port"
     printf '模式：REALITY + Vision\n'
     printf 'UUID：%s\n' "$(jq -er '.uuid' <<<"$node")"
@@ -120,6 +145,13 @@ show_node_credentials() {
     printf 'Short ID：%s\n' "$(jq -er '.reality_short_id' <<<"$node")"
     printf 'TCP 状态：%s\n' "$runtime_status"
     printf '\n[VLESS URI]\n%s\n' "$uri"
+  else
+    printf '端口：%s（UDP）\n模式：TLS + Hysteria2\n密码：%s\nSNI：%s\n证书 Pin（SHA-256）：%s\n' \
+      "$port" "$(jq -er '.password' <<<"$node")" \
+      "$(jq -er '.tls_server_name' <<<"$node")" \
+      "$(jq -er '.certificate_sha256' <<<"$node")"
+    printf 'UDP 状态：%s\n' "$runtime_status"
+    printf '\n[Hysteria2 URI]\n%s\n' "$uri"
   fi
   printf '\n[Base64 节点信息（上方标准 URI 的 Base64）]\n%s\n' "$base64_uri"
   printf '\n[二维码]\n'
@@ -133,7 +165,8 @@ show_node_credentials() {
   if [[ "$protocol" == shadowsocks ]]; then
     printf '\n请检查服务器防火墙、安全组或云厂商防火墙是否放行 TCP/UDP 端口。\n'
   else
-    printf '\n请检查服务器防火墙、安全组或云厂商防火墙是否放行 TCP 端口。\n'
+    [[ "$protocol" == hysteria2 ]] && printf '\n请检查服务器防火墙、安全组或云厂商防火墙是否放行 UDP 端口。\n' \
+      || printf '\n请检查服务器防火墙、安全组或云厂商防火墙是否放行 TCP 端口。\n'
   fi
   printf '\n请妥善保管以上客户端凭据、链接和二维码，不要提交到 GitHub 或普通日志。\n'
 }

@@ -34,6 +34,7 @@ CONFIG_DIR="${CONFIG_DIR:-/etc/ss-manager}"
 DATA_DIR="${DATA_DIR:-/var/lib/ss-manager}"
 RUNTIME_DIR="${RUNTIME_DIR:-/run/ss-manager}"
 BACKUP_DIR="${BACKUP_DIR:-$CONFIG_DIR/backups}"
+CERTS_DIR="${CERTS_DIR:-$CONFIG_DIR/certs}"
 SING_BOX_BINARY="${SING_BOX_BINARY:-/usr/local/bin/sing-box}"
 SING_BOX_CONFIG="${SING_BOX_CONFIG:-/etc/sing-box/config.json}"
 SING_BOX_SERVICE="${SING_BOX_SERVICE:-sing-box}"
@@ -115,6 +116,9 @@ ensure_runtime_dirs() {
   ensure_dir "$DATA_DIR" 700 || return 1
   ensure_dir "$RUNTIME_DIR" 700 || return 1
   ensure_dir "$BACKUP_DIR" 700 || return 1
+  # Certificates are created lazily for Hysteria2 nodes.  Creating the root
+  # here is safe and gives every later transaction a fixed, private parent.
+  ensure_dir "$CERTS_DIR" 700 || return 1
   ensure_dir "$(dirname -- "$SING_BOX_CONFIG")" 755 || return 1
 }
 
@@ -184,45 +188,53 @@ load_json_or_default() {
 
 initialize_state_files() {
   ensure_runtime_dirs || return 1
-  load_json_or_default "$NODES_FILE" '{"schema_version":2,"nodes":[]}' || return 1
+  load_json_or_default "$NODES_FILE" '{"schema_version":3,"nodes":[]}' || return 1
   load_json_or_default "$TRAFFIC_FILE" '{"schema_version":1,"nodes":{}}' || return 1
   load_json_or_default "$HISTORY_FILE" '{"schema_version":1,"cycles":{}}' || return 1
   load_json_or_default "$INTERFACES_FILE" '{"schema_version":1,"interfaces":[]}' || return 1
   migrate_nodes_schema_if_needed || return 1
 }
 
-# Schema 1 was the SS2022-only format.  Keep accepting it for validation and
-# backups, but publish one schema-2 document before any menu or transaction
-# operation can edit it.  The migration is deliberately lossless: every old
-# field is retained and only the protocol discriminator is added.
+# Schema 1 was the SS2022-only format and schema 2 added VLESS.  Keep accepting
+# both for validation and backups, but publish schema 3 before any menu or
+# transaction operation can edit them.  Hysteria2 is part of schema 3.  The migration is deliberately
+# lossless: every old field is retained and only the schema/protocol defaults
+# are added.
 migrate_nodes_schema_if_needed() {
   [[ -f "$NODES_FILE" && ! -L "$NODES_FILE" ]] || return 1
   local schema candidate original candidate_config=''
   local migration_transaction=0 active_status=0 service_was_active=0
   schema=$(jq -er '.schema_version' "$NODES_FILE") || return 1
-  [[ "$schema" == 1 ]] || { [[ "$schema" == 2 ]] && return 0; return 1; }
+  [[ "$schema" == 1 || "$schema" == 2 ]] || { [[ "$schema" == 3 ]] && return 0; return 1; }
 
   declare -F backup_create_snapshot >/dev/null 2>&1 || {
     error '节点数据库迁移所需的备份模块未加载；未修改节点数据。'
     return 1
   }
-  backup_create_snapshot 'schema-1-to-2-migration' >/dev/null || {
+  backup_create_snapshot "schema-${schema}-to-3-migration" >/dev/null || {
     error '旧版节点数据库迁移前自动备份失败；未修改节点数据。'
     return 1
   }
   original=$(runtime_temp_file nodes.schema1-original) || return 1
   install -m 600 -- "$NODES_FILE" "$original" || { rm -f -- "$original"; return 1; }
-  candidate=$(runtime_temp_file nodes.schema2) || { rm -f -- "$original"; return 1; }
-  jq ' .schema_version = 2
-      | .nodes |= map(. + {protocol:"shadowsocks"}) ' "$NODES_FILE" >"$candidate" || {
-    rm -f -- "$candidate" "$original"
-    return 1
-  }
-  validate_nodes_file_semantic "$candidate" || {
+  candidate=$(runtime_temp_file nodes.schema3) || { rm -f -- "$original"; return 1; }
+  if [[ "$schema" == 1 ]]; then
+    jq ' .schema_version = 3
+        | .nodes |= map(. + {protocol:"shadowsocks"}) ' "$NODES_FILE" >"$candidate" || {
+      rm -f -- "$candidate" "$original"
+      return 1
+    }
+  else
+    jq ' .schema_version = 3 ' "$NODES_FILE" >"$candidate" || {
+      rm -f -- "$candidate" "$original"
+      return 1
+    }
+  fi
+  if ! validate_nodes_file_semantic "$candidate"; then
     rm -f -- "$candidate" "$original"
     error '旧版节点数据库迁移后语义校验失败；原文件保持不变。'
     return 1
-  }
+  fi
   if ! validate_traffic_file_semantic "$TRAFFIC_FILE" "$candidate" \
     || ! validate_history_file_semantic "$HISTORY_FILE"; then
     rm -f -- "$candidate" "$original"
@@ -237,7 +249,7 @@ migrate_nodes_schema_if_needed() {
   elif [[ -x "$SING_BOX_BINARY" ]] \
     && declare -F generate_singbox_config >/dev/null 2>&1 \
     && declare -F singbox_check_config >/dev/null 2>&1; then
-    candidate_config=$(runtime_temp_file config.schema2-migration) || {
+    candidate_config=$(runtime_temp_file config.schema3-migration) || {
       rm -f -- "$candidate" "$original"
       return 1
     }
@@ -270,7 +282,7 @@ migrate_nodes_schema_if_needed() {
       error '无法可靠查询 sing-box 原运行状态；节点数据库未迁移。'
       return 1
     fi
-    state_transaction_begin 'schema-1-to-2-migration' "$service_was_active" || {
+    state_transaction_begin "schema-${schema}-to-3-migration" "$service_was_active" || {
       rm -f -- "$candidate" "$original" "$candidate_config"
       error '无法建立节点数据库迁移的持久恢复事务；原文件保持不变。'
       return 1
@@ -311,7 +323,7 @@ migrate_nodes_schema_if_needed() {
   fi
   rm -f -- "$candidate" "$original" "$candidate_config" \
     || warn '节点数据库已经迁移，但受保护的运行时候选文件暂未清理；系统重启后 /run 会自动清空。'
-  info '已将旧版 SS2022 节点数据库迁移为 schema 2；Node ID、密钥、流量和限额均保持不变。'
+  info "已将旧版节点数据库迁移为 schema 3；Node ID、密钥、流量和限额均保持不变。"
 }
 
 nodes_schema_upgrade_copy() {
@@ -320,10 +332,10 @@ nodes_schema_upgrade_copy() {
   schema=$(jq -er '.schema_version' "$source") || return 1
   case "$schema" in
     1)
-      jq '.schema_version = 2 | .nodes |= map(. + {protocol:"shadowsocks"})' "$source" >"$destination" || return 1
+      jq '.schema_version = 3 | .nodes |= map(. + {protocol:"shadowsocks"})' "$source" >"$destination" || return 1
       ;;
-    2)
-      install -m 600 -- "$source" "$destination" || return 1
+    2|3)
+      jq '.schema_version = 3' "$source" >"$destination" || return 1
       ;;
     *) return 1 ;;
   esac
@@ -339,6 +351,8 @@ validate_installed_state_files() {
   done
   validate_manager_state_semantic "$MANAGER_STATE" || die 'manager.json 语义无效；请先使用备份恢复。'
   validate_nodes_file_semantic "$NODES_FILE" || die 'nodes.json 语义无效；请先使用备份恢复。'
+  validate_hysteria2_certificate_state "$NODES_FILE" "$CERTS_DIR" \
+    || die 'Hysteria2 证书目录或证书 Pin 无效；请先使用备份恢复。'
   # Versions before 1.0.4 kept the tc kernel baseline in a separate
   # tc-counters.json file.  Keep accepting that exact, structurally safe
   # legacy form long enough for the install transaction to migrate it.  Do
@@ -704,6 +718,7 @@ validate_nodes_file_semantic() {
     def common_keys: ["address","address_type","created_at","download_limit_mbps","last_reset_at","name","next_reset_at","node_id","port","quota_bytes","reset_day","status","status_reason","updated_at","upload_limit_mbps"];
     def ss_keys: (common_keys + ["method","password","protocol"]);
     def vless_keys: (common_keys + ["flow","protocol","reality_handshake_port","reality_handshake_server","reality_private_key","reality_public_key","reality_server_name","reality_short_id","uuid"]);
+    def hysteria2_keys: (common_keys + ["certificate_sha256","password","protocol","tls_server_name"]);
     def valid_common:
       (.node_id | type == "string" and test("^[a-f0-9]{32}$"))
       and (.name | type == "string" and length >= 1 and length <= 64)
@@ -729,6 +744,12 @@ validate_nodes_file_semantic() {
       and (.reality_handshake_server | type == "string" and length >= 1 and length <= 253)
       and (.reality_handshake_port | type == "number" and floor == . and . >= 1 and . <= 65535)
       and (.reality_private_key != .reality_public_key);
+    def valid_hysteria2:
+      (.protocol == "hysteria2")
+      and (keys | sort) == (hysteria2_keys | sort)
+      and (.password | type == "string" and test("^[A-Za-z0-9_-]{8,128}$"))
+      and (.tls_server_name | type == "string" and length >= 1 and length <= 253)
+      and (.certificate_sha256 | type == "string" and test("^[a-f0-9]{64}$"));
     ((.schema_version == 1 and (.nodes | type == "array")
       and all(.nodes[];
         (keys | sort) == (["address","address_type","created_at","download_limit_mbps","last_reset_at","method","name","next_reset_at","node_id","password","port","quota_bytes","reset_day","status","status_reason","updated_at","upload_limit_mbps"] | sort)
@@ -736,12 +757,13 @@ validate_nodes_file_semantic() {
         and (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm")
         and (.password | type == "string")
       ))
-      or (.schema_version == 2 and (.nodes | type == "array")
+      or ((.schema_version == 2 or .schema_version == 3) and (.nodes | type == "array")
         and all(.nodes[]; valid_common and (if .protocol == "shadowsocks" then
           (keys | sort) == (ss_keys | sort)
           and (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm")
           and (.password | type == "string")
         elif .protocol == "vless" then valid_vless
+        elif .protocol == "hysteria2" then valid_hysteria2
         else false end))
       ))
     and ([.nodes[].node_id] | length == (unique | length))
@@ -754,6 +776,10 @@ validate_nodes_file_semantic() {
     and ([.nodes[] | select(.protocol == "vless") | .reality_public_key]
       | length == (unique | length))
     and ([.nodes[] | select(.protocol == "vless") | (.reality_short_id | ascii_downcase)]
+      | length == (unique | length))
+    and ([.nodes[] | select(.protocol == "hysteria2") | (.password | ascii_downcase)]
+      | length == (unique | length))
+    and ([.nodes[] | select(.protocol == "hysteria2") | .certificate_sha256]
       | length == (unique | length))
   ' "$source" >/dev/null 2>&1 || return 1
 
@@ -774,6 +800,10 @@ validate_nodes_file_semantic() {
       validate_short_id "$(jq -er '.reality_short_id' <<<"$node")" || return 1
       validate_domain_name "$(jq -er '.reality_server_name' <<<"$node")" || return 1
       validate_reality_handshake_server "$(jq -er '.reality_handshake_server' <<<"$node")" || return 1
+    elif [[ "$protocol" == hysteria2 ]]; then
+      validate_hysteria_password "$(jq -er '.password' <<<"$node")" || return 1
+      validate_domain_name "$(jq -er '.tls_server_name' <<<"$node")" || return 1
+      validate_certificate_sha256 "$(jq -er '.certificate_sha256' <<<"$node")" || return 1
     else
       return 1
     fi
@@ -882,7 +912,7 @@ validate_bandwidth_plan_semantic() {
       and (.limit_mbps | type == "number" and . >= 0 and . <= 1000000)
       and ((.protocols // ["tcp","udp"]) as $protocols
         | ($protocols | type) == "array" and ($protocols | length) >= 1 and ($protocols | length) <= 2
-        and $protocols[0] == "tcp" and all($protocols[]; . == "tcp" or . == "udp")
+        and all($protocols[]; . == "tcp" or . == "udp")
         and (($protocols | length) == ($protocols | unique | length))))
     and ([.actions[].index] | length == (unique | length))
     and ([.actions[] | [.node_id,.direction] | join(":")] | length == (unique | length))
@@ -902,7 +932,9 @@ validate_bandwidth_plan_against_state() {
         | ($matches | length) == 1
         and ($matches[0].port == $node.port)
         and (($matches[0].protocols // ["tcp","udp"]) ==
-          (if ($node.protocol // "shadowsocks") == "vless" then ["tcp"] else ["tcp","udp"] end))
+          (if ($node.protocol // "shadowsocks") == "vless" then ["tcp"]
+           elif $node.protocol == "hysteria2" then ["udp"]
+           else ["tcp","udp"] end))
         and ($matches[0].limit_mbps == (if $direction == "ingress" then $node.upload_limit_mbps else $node.download_limit_mbps end))
         and ($matches[0].kind == (if $matches[0].limit_mbps == 0 then "gact" else "police" end)))))
     and all(.actions[];
@@ -1142,7 +1174,7 @@ node_protocol() {
   local node=${1:-}
   jq -er '
     (.protocol // "shadowsocks") as $protocol
-    | if $protocol == "shadowsocks" or $protocol == "vless"
+    | if $protocol == "shadowsocks" or $protocol == "vless" or $protocol == "hysteria2"
       then $protocol
       else error("unsupported node protocol") end
   ' <<<"$node"
@@ -1154,6 +1186,7 @@ node_transport_protocols() {
   case "$protocol" in
     shadowsocks) printf 'tcp\nudp\n' ;;
     vless) printf 'tcp\n' ;;
+    hysteria2) printf 'udp\n' ;;
     *) return 1 ;;
   esac
 }
@@ -1162,6 +1195,12 @@ nodes_file_has_vless() {
   local source=$1
   [[ -f "$source" && ! -L "$source" ]] || return 2
   jq -e 'any(.nodes[]?; (.protocol // "shadowsocks") == "vless")' "$source" >/dev/null 2>&1
+}
+
+nodes_file_has_hysteria2() {
+  local source=$1
+  [[ -f "$source" && ! -L "$source" ]] || return 2
+  jq -e 'any(.nodes[]?; .protocol == "hysteria2")' "$source" >/dev/null 2>&1
 }
 
 bytes_from_gb() {
@@ -1239,6 +1278,7 @@ protocol_label() {
   case "$1" in
     shadowsocks) printf 'SS2022' ;;
     vless) printf 'VLESS' ;;
+    hysteria2) printf 'Hysteria2' ;;
     *) return 1 ;;
   esac
 }

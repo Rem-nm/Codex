@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/certs.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/system.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/service.sh"

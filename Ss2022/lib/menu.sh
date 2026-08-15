@@ -110,7 +110,7 @@ choose_existing_node_key() {
 
 node_delete_flow() {
   acquire_manager_lock
-  local node_id node node_name protocol port keep_history candidate_nodes candidate_traffic candidate_history
+  local node_id node node_name protocol port keep_history candidate_nodes candidate_traffic candidate_history candidate_certs=''
   select_node_for_flow node_id '请选择要删除的节点' || return 0
   node=$(node_by_id "$node_id")
   node_name=$(jq -er '.name' <<<"$node")
@@ -126,6 +126,10 @@ node_delete_flow() {
   prepare_state_candidate_paths delete candidate_nodes candidate_traffic candidate_history \
     || die '无法创建删除事务候选文件。'
   jq --arg id "$node_id" '.nodes |= map(select(.node_id != $id))' "$NODES_FILE" >"$candidate_nodes"
+  if [[ "$protocol" == hysteria2 ]]; then
+    candidate_certs=$(hysteria2_make_candidate_cert_root) || die '无法创建 Hysteria2 证书删除候选目录。'
+    hysteria2_remove_candidate_node "$candidate_certs" "$node_id" || { rm -rf -- "$candidate_certs"; die '无法移除 Hysteria2 节点证书。'; }
+  fi
   traffic_candidate_remove_node "$node_id" >"$candidate_traffic"
   if [[ "$keep_history" == y ]]; then
     traffic_candidate_archive_deleted_node "$HISTORY_FILE" "$node_id" "$node_name" "$TRAFFIC_FILE" >"$candidate_history"
@@ -133,7 +137,7 @@ node_delete_flow() {
     traffic_candidate_purge_deleted_node "$HISTORY_FILE" "$node_id" >"$candidate_history"
   fi
   local transaction_status=0
-  if apply_state_transaction "$candidate_nodes" "$candidate_traffic" "$candidate_history" "delete-node-$node_id" 0; then
+  if apply_state_transaction "$candidate_nodes" "$candidate_traffic" "$candidate_history" "delete-node-$node_id" 0 "$candidate_certs"; then
     success "节点 $node_name 已删除。其他节点未受影响。"
   else
     error '删除失败，已自动恢复上一版本配置。'
@@ -141,21 +145,24 @@ node_delete_flow() {
   fi
   rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history" \
     || warn '删除事务已结束，但运行时候选文件清理失败。'
+  [[ -z "$candidate_certs" || ! -e "$candidate_certs" ]] || rm -rf -- "$candidate_certs"
   return "$transaction_status"
 }
 
 node_modify_flow() {
   acquire_manager_lock
-  local node_id node field action protocol requested name method port address_line address address_type password quota_gb quota reset_day upload_limit download_limit candidate_nodes candidate_traffic candidate_history traffic_source changed=0 show_credentials_after=0
-  local server_name handshake_line handshake_server handshake_port uuid keypair private_key public_key short_id
+  local node_id node field action protocol requested name method port address_line address address_type password quota_gb quota reset_day upload_limit download_limit candidate_nodes candidate_traffic candidate_history traffic_source changed=0 show_credentials_after=0 candidate_certs=''
+  local server_name handshake_line handshake_server handshake_port uuid keypair private_key public_key short_id certificate_pin
   select_node_for_flow node_id '请选择要修改的节点' || return 0
   node=$(node_by_id "$node_id")
   protocol=$(node_protocol "$node") || die '节点协议字段无效。'
   printf '\n当前节点：%s（%s，Node ID %s）\n' "$(jq -er '.name' <<<"$node")" "$(protocol_label "$protocol")" "$node_id"
   if [[ "$protocol" == shadowsocks ]]; then
     printf '1. 名称\n2. 加密方式（会自动生成符合新算法的密钥）\n3. 端口\n4. 修改密钥（重新生成或复制同算法节点）\n5. 节点地址\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n0. 返回\n> '
-  else
+  elif [[ "$protocol" == vless ]]; then
     printf '1. 名称\n2. 端口\n3. 节点地址\n4. Reality Server Name / SNI\n5. Reality 握手目标\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n9. 重新生成 UUID\n10. 重新生成 Reality KeyPair\n11. 重新生成 Short ID\n0. 返回\n> '
+  else
+    printf '1. 名称\n2. 端口\n3. 节点地址\n4. 修改密码\n5. 重新生成自签名证书\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n0. 返回\n> '
   fi
   IFS= read -r field || die '读取输入失败。'
   if [[ "$protocol" == shadowsocks ]]; then
@@ -164,11 +171,17 @@ node_modify_flow() {
       5) field=address ;; 6) field=quota ;; 7) field=reset ;; 8) field=bandwidth ;;
       0) return 0 ;; *) warn '无效选项。'; return 0 ;;
     esac
-  else
+  elif [[ "$protocol" == vless ]]; then
     case "$field" in
       1) field=name ;; 2) field=port ;; 3) field=address ;; 4) field=vless-sni ;;
       5) field=vless-handshake ;; 6) field=quota ;; 7) field=reset ;; 8) field=bandwidth ;;
       9) field=vless-uuid ;; 10) field=vless-keypair ;; 11) field=vless-short ;;
+      0) return 0 ;; *) warn '无效选项。'; return 0 ;;
+    esac
+  else
+    case "$field" in
+      1) field=name ;; 2) field=port ;; 3) field=address ;; 4) field=hy2-password ;;
+      5) field=hy2-cert ;; 6) field=quota ;; 7) field=reset ;; 8) field=bandwidth ;;
       0) return 0 ;; *) warn '无效选项。'; return 0 ;;
     esac
   fi
@@ -177,6 +190,9 @@ node_modify_flow() {
   install -m 600 -- "$NODES_FILE" "$candidate_nodes"
   install -m 600 -- "$TRAFFIC_FILE" "$candidate_traffic"
   install -m 600 -- "$HISTORY_FILE" "$candidate_history"
+  if [[ "$protocol" == hysteria2 ]]; then
+    candidate_certs=$(hysteria2_make_candidate_cert_root) || die '无法创建 Hysteria2 证书候选目录。'
+  fi
   case "$field" in
     name)
       requested=$(read_nonempty '请输入新的节点名称：')
@@ -328,11 +344,39 @@ node_modify_flow() {
       changed=1
       show_credentials_after=1
       ;;
+    hy2-password)
+      prompt_yes_no '重新生成认证密码后，现有客户端节点配置将立即失效，需要重新获取分享链接或重新扫描二维码。确认继续？' n \
+        || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; [[ -z "$candidate_certs" ]] || rm -rf -- "$candidate_certs"; return 0; }
+      password=$(generate_hysteria2_password) || die '无法生成新的 Hysteria2 密码。'
+      printf '%s' "$password" | jq -Rs --arg id "$node_id" --slurpfile source "$candidate_nodes" \
+        '. as $password | $source[0] | .nodes[] |= if .node_id == $id then .password=$password | .updated_at=(now|todateiso8601) else . end' \
+        >"$candidate_nodes.next" || die '无法生成 Hysteria2 密码候选配置。'
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+      changed=1
+      show_credentials_after=1
+      ;;
+    hy2-cert)
+      prompt_yes_no '重新生成 TLS 证书后，证书 SHA-256 Pin 将改变，现有客户端保存的指纹将失效，需要重新获取分享链接或重新扫描二维码。确认继续？' n \
+        || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; [[ -z "$candidate_certs" ]] || rm -rf -- "$candidate_certs"; return 0; }
+      server_name=$(jq -er --arg id "$node_id" '.nodes[] | select(.node_id == $id) | .tls_server_name' "$candidate_nodes") || die '无法读取 Hysteria2 TLS SNI。'
+      certificate_pin=$(hysteria2_generate_certificate "$candidate_certs" "$node_id" "$server_name") \
+        || die '无法重新生成 Hysteria2 自签名证书。'
+      jq --arg id "$node_id" --arg pin "$certificate_pin" \
+        '.nodes[] |= if .node_id == $id then .certificate_sha256=$pin | .updated_at=(now|todateiso8601) else . end' \
+        "$candidate_nodes" >"$candidate_nodes.next" || die '无法写入 Hysteria2 证书候选配置。'
+      mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+      changed=1
+      show_credentials_after=1
+      ;;
   esac
 
-  if (( changed == 0 )); then rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 0; fi
+  if (( changed == 0 )); then
+    [[ -z "$candidate_certs" ]] || rm -rf -- "$candidate_certs"
+    rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"
+    return 0
+  fi
   local transaction_status=0
-  if apply_state_transaction "$candidate_nodes" "$candidate_traffic" "$candidate_history" "modify-node-$node_id"; then
+  if apply_state_transaction "$candidate_nodes" "$candidate_traffic" "$candidate_history" "modify-node-$node_id" 1 "$candidate_certs"; then
     success '节点修改成功。'
     if (( show_credentials_after == 1 )); then
       show_node_credentials "$node_id" \
@@ -344,6 +388,7 @@ node_modify_flow() {
   fi
   rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history" \
     || warn '修改事务已结束，但运行时候选文件清理失败。'
+  [[ -z "$candidate_certs" || ! -e "$candidate_certs" ]] || rm -rf -- "$candidate_certs"
   return "$transaction_status"
 }
 

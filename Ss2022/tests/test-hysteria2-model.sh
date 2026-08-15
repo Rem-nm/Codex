@@ -43,7 +43,7 @@ INSTALL_TRANSACTION_DIR="$CONFIG_DIR/install-transaction"
 SING_BOX_CONFIG="$TEST_TMP/sing-box.json"
 mkdir -p -- "$CONFIG_DIR" "$DATA_DIR" "$RUNTIME_DIR" "$BACKUP_DIR"
 printf '%s\n' '{"listen_mode":"ipv4","tfo_config_supported":false,"tfo_kernel_enabled":false}' >"$MANAGER_STATE"
-printf '%s\n' '{"schema_version":3,"nodes":[]}' >"$NODES_FILE"
+printf '%s\n' '{"schema_version":4,"nodes":[]}' >"$NODES_FILE"
 printf '%s\n' '{"schema_version":1,"nodes":{}}' >"$TRAFFIC_FILE"
 printf '%s\n' '{"schema_version":1,"cycles":{}}' >"$HISTORY_FILE"
 printf '%s\n' '{"schema_version":1,"interfaces":["eth0"]}' >"$INTERFACES_FILE"
@@ -65,6 +65,21 @@ jq -e . "$record" >/dev/null || fail 'Hysteria2 record is not JSON'
 jq --slurpfile record "$record" '.nodes += [$record[0]]' "$NODES_FILE" >"$NODES_FILE.next" && mv "$NODES_FILE.next" "$NODES_FILE"
 validate_nodes_file_semantic "$NODES_FILE" || fail 'valid Hysteria2 node was rejected'
 validate_hysteria2_certificate_state "$NODES_FILE" "$candidate_certs" || fail 'generated certificate failed semantic validation'
+
+legacy_schema3="$TEST_TMP/nodes-schema3.json"
+upgraded_schema4="$TEST_TMP/nodes-schema4.json"
+jq '.schema_version=3' "$NODES_FILE" >"$legacy_schema3"
+validate_nodes_file_semantic "$legacy_schema3" || fail 'valid schema-3 Hysteria2 data was rejected'
+nodes_schema_upgrade_copy "$legacy_schema3" "$upgraded_schema4" || fail 'schema-3 to schema-4 migration failed'
+jq -e --slurpfile old "$legacy_schema3" '
+  .schema_version == 4 and (.nodes == $old[0].nodes)
+' "$upgraded_schema4" >/dev/null || fail 'schema-3 migration changed Hysteria2 identity or TLS data'
+validate_tls_certificate_state "$upgraded_schema4" "$candidate_certs" \
+  || fail 'schema-3 migration invalidated Hysteria2 certificate state'
+jq '.schema_version=2' "$NODES_FILE" >"$TEST_TMP/nodes-schema2-invalid.json"
+if validate_nodes_file_semantic "$TEST_TMP/nodes-schema2-invalid.json"; then
+  fail 'schema 2 incorrectly accepted a Hysteria2 node'
+fi
 
 config="$TEST_TMP/config.json"
 generate_singbox_config "$NODES_FILE" "$config" "$candidate_certs" || fail 'Hysteria2 config generation failed'

@@ -70,6 +70,7 @@ HISTORY_FILE="$fixture/data/traffic-history.json"
 INTERFACES_FILE="$fixture/data/interfaces.json"
 CONFIG_DIR="$fixture/config"
 DATA_DIR="$fixture/data"
+CERTS_DIR="$fixture/certs"
 RUNTIME_DIR="$fixture/run"
 BACKUP_DIR="$fixture/backups"
 STATE_TRANSACTION_DIR="$CONFIG_DIR/state-transaction"
@@ -825,12 +826,18 @@ grep -Fq 'nodes_schema_upgrade_copy "$NODES_FILE" "$candidate_nodes"' <<<"$prefl
   || fail_test 'manager update preflight does not test legacy schema migration in a candidate file'
 grep -Fq 'vless_generation_capabilities_available' <<<"$preflight_body" \
   || fail_test 'manager update preflight does not verify VLESS identity generation capabilities'
+grep -Fq 'tuic_generation_capabilities_available' <<<"$preflight_body" \
+  || fail_test 'manager update preflight does not verify TUIC identity generation capabilities'
 grep -Fq 'source "$SCRIPT_DIR/lib/nodes.sh"' "$ROOT/install.sh" \
   || fail_test 'installer cannot run VLESS identity capability checks'
 grep -Fq 'nodes_file_has_vless "$NODES_FILE"' "$ROOT/install.sh" \
   || fail_test 'idempotent install does not detect existing VLESS nodes'
 grep -Fq 'vless_generation_capabilities_available' "$ROOT/install.sh" \
   || fail_test 'idempotent install does not verify existing VLESS identity generators'
+grep -Fq 'nodes_file_has_tuic "$NODES_FILE"' "$ROOT/install.sh" \
+  || fail_test 'idempotent install does not detect existing TUIC nodes'
+grep -Fq 'tuic_generation_capabilities_available' "$ROOT/install.sh" \
+  || fail_test 'idempotent install does not verify existing TUIC identity generators'
 grep -q 'manager_update_transaction_begin' "$ROOT/lib/update.sh" || fail_test 'manager update lacks a persistent rollback transaction'
 grep -q 'ss-manager.update-old' "$ROOT/lib/common.sh" || fail_test 'rem wrapper lacks interrupted directory-switch recovery'
 grep -Fq '# Managed by Ss2022' "$ROOT/lib/common.sh" || fail_test 'rem wrapper lacks an explicit ownership marker'

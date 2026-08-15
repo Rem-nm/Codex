@@ -5,8 +5,8 @@
 客户端视角为准：
 
 ```text
-上传 = 客户端 → SS2022/VLESS/Hysteria2 服务器
-下载 = Internet → SS2022/VLESS/Hysteria2 服务器 → 客户端
+上传 = 客户端 → SS2022/VLESS/Hysteria2/TUIC 服务器
+下载 = Internet → SS2022/VLESS/Hysteria2/TUIC 服务器 → 客户端
 ```
 
 服务器外部接口上的上传包以节点端口为目标端口，下载包以节点端口为源端口，因此规则分别匹配 ingress `dst_port` 和 egress `src_port`。这是端口层计数：上传包含链路/传输层开销，也可能包含到达公开端口但未通过协议认证的流量；它不是用户认证后的精确业务用量。
@@ -21,13 +21,13 @@ timer 使用 `OnBootSec=1min` 和 `OnUnitActiveSec=60s`，没有对单调 timer 
 
 ## 配额
 
-每个节点重置日为 1-28。0 表示不限额。SS2022、VLESS 和 Hysteria2 使用同一个 manager 全局配额策略：由于端口 ingress 无法区分认证成功与未认证探测，自动停用默认只按下载 egress 判断；上传、下载和合计仍完整统计、显示和归档。管理员明确启用既有全局上传计费开关后，所有协议统一按上传加下载判断，不建立协议专属或节点专属计费策略。这能降低默认策略下 ingress 洪泛的直接影响，但 egress 仍可能包含未认证响应，不能视为认证级账单或抗攻击保证。达到限额只把对应 Node ID 设为 `disabled_quota`，不停止整个 sing-box，也不删除凭据、证书或历史。取消/提高限额会在已用计费量低于新限额时立即恢复节点，降低限额到已用量以下会立即停用；新周期也会自动恢复 `disabled_quota`。
+每个节点重置日为 1-28。0 表示不限额。SS2022、VLESS、Hysteria2 和 TUIC 使用同一个 manager 全局配额策略：由于端口 ingress 无法区分认证成功与未认证探测，自动停用默认只按下载 egress 判断；上传、下载和合计仍完整统计、显示和归档。管理员明确启用既有全局上传计费开关后，所有协议统一按上传加下载判断，不建立协议专属或节点专属计费策略。这能降低默认策略下 ingress 洪泛的直接影响，但 egress 仍可能包含未认证响应，不能视为认证级账单或抗攻击保证。达到限额只把对应 Node ID 设为 `disabled_quota`，不停止整个 sing-box，也不删除凭据、证书或历史。取消/提高限额会在已用计费量低于新限额时立即恢复节点，降低限额到已用量以下会立即停用；新周期也会自动恢复 `disabled_quota`。
 
 ## tc 能力、限速和所有权
 
 安装先在临时 dummy 接口上探测 `clsact`、flower、当前启用地址族的 TCP/UDP、共享 gact/police action、cookie、action `bind` 数、精确规则 JSON 语义和统计字段。地址族以主路由表实际存在的默认出口为准：IPv4-only 只探测并安装 IPv4 规则，不会因 IPv6 loopback 误建 IPv6 规则；IPv6-only 也不强制 IPv4 规则。内核版本、iproute2 版本、默认出口地址族或探测契约变化会使能力签名失效并重新探测。
 
-每个节点上传、下载各有一个共享 action；所有接口、实际启用的地址族以及协议实际使用的 filter 都绑定到它：SS2022 绑定 TCP/UDP，VLESS Reality Vision 只绑定 TCP，Hysteria2 只绑定 UDP。因此限速仍是 Node ID 方向的聚合速率，不会因协议或 filter 数量倍增。0 使用 `gact pass` 只计数，非零使用 police。
+每个节点上传、下载各有一个共享 action；所有接口、实际启用的地址族以及协议实际使用的 filter 都绑定到它：SS2022 绑定 TCP/UDP，VLESS Reality Vision 只绑定 TCP，Hysteria2/TUIC 只绑定 UDP。因此限速仍是 Node ID 方向的聚合速率，不会因协议或 filter 数量倍增。TUIC 的 QUIC 拥塞控制 BBR 与该用户限速是两层独立机制。0 使用 `gact pass` 只计数，非零使用 police。
 
 清理前必须同时证明 action cookie/index、每条只有一个预期 action 的精确 filter handle，以及 action 的全部内核 `bind` 都落在保存的计划范围内。qdisc/filter/action 查询失败、JSON 异常、额外绑定、重复规则或混合 action/所有权都会停止删除。只有 ingress 与 egress 查询都成功且确认无任何规则时，才会删除项目创建的空 clsact。
 

@@ -3,6 +3,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/lib/certs.sh"
 
 assert_true() { "$@" || { printf 'assertion failed: %s\n' "$*" >&2; exit 1; }; }
 assert_false() { if "$@"; then printf 'unexpected success: %s\n' "$*" >&2; exit 1; fi; }

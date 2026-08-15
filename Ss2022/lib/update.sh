@@ -265,7 +265,7 @@ manager_update_validate_package_structure() {
   local root=$1 relative
   local -a required_files=(
     ss-manager.sh VERSION config/defaults.conf
-    lib/common.sh lib/system.sh lib/service.sh lib/singbox.sh lib/traffic.sh
+    lib/common.sh lib/certs.sh lib/system.sh lib/service.sh lib/singbox.sh lib/traffic.sh
     lib/bandwidth.sh lib/backup.sh lib/nodes.sh lib/links.sh lib/update.sh lib/menu.sh
     systemd/sing-box.service systemd/ss-manager-traffic.service systemd/ss-manager-traffic.timer
     openrc/sing-box openrc/ss-manager-traffic openrc/ss-manager-traffic-loop.sh

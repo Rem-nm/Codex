@@ -6,6 +6,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT/lib/common.sh"
 # shellcheck disable=SC1091
+source "$ROOT/lib/certs.sh"
+# shellcheck disable=SC1091
 source "$ROOT/lib/system.sh"
 # shellcheck disable=SC1091
 source "$ROOT/lib/service.sh"

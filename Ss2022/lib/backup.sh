@@ -77,9 +77,20 @@ backup_create_snapshot() {
     rm -rf -- "$preparing"
     return 1
   fi
+  validate_hysteria2_certificate_state "$NODES_FILE" "$CERTS_DIR" || {
+    error '当前 Hysteria2 证书目录无效，拒绝创建不可恢复的备份。'
+    rm -rf -- "$preparing"
+    return 1
+  }
   install -m 600 -- "$NODES_FILE" "$preparing/nodes.json" || { rm -rf -- "$preparing"; return 1; }
   install -m 600 -- "$TRAFFIC_FILE" "$preparing/traffic.json" || { rm -rf -- "$preparing"; return 1; }
   install -m 600 -- "$HISTORY_FILE" "$preparing/traffic-history.json" || { rm -rf -- "$preparing"; return 1; }
+  if [[ -d "$CERTS_DIR" && ! -L "$CERTS_DIR" ]] && jq -e 'any(.nodes[]?; .protocol == "hysteria2")' "$NODES_FILE" >/dev/null 2>&1; then
+    cp -a -- "$CERTS_DIR" "$preparing/certs" || { rm -rf -- "$preparing"; return 1; }
+    chmod 700 -- "$preparing/certs" || { rm -rf -- "$preparing"; return 1; }
+    find "$preparing/certs" -type d -exec chmod 700 {} +
+    find "$preparing/certs" -type f -exec chmod 600 {} +
+  fi
   if [[ -e "$MANAGER_STATE" || -L "$MANAGER_STATE" ]]; then
     [[ -f "$MANAGER_STATE" && ! -L "$MANAGER_STATE" ]] \
       && validate_manager_state_semantic "$MANAGER_STATE" \
@@ -123,7 +134,16 @@ backup_create_snapshot() {
     --arg sing_box_version "$sing_box_version" \
     '{schema_version:1,artifact:"ss2022-state-snapshot",reason:$reason,created_at:$created_at,manager_version:$manager_version,sing_box_version:$sing_box_version}' \
     >"$preparing/metadata.json" || { rm -rf -- "$preparing"; return 1; }
-  chmod 600 -- "$preparing"/* || { rm -rf -- "$preparing"; return 1; }
+  local entry
+  for entry in "$preparing"/*; do
+    if [[ -d "$entry" && ! -L "$entry" ]]; then
+      chmod 700 -- "$entry" || { rm -rf -- "$preparing"; return 1; }
+      find "$entry" -type d -exec chmod 700 {} + || { rm -rf -- "$preparing"; return 1; }
+      find "$entry" -type f -exec chmod 600 {} + || { rm -rf -- "$preparing"; return 1; }
+    else
+      chmod 600 -- "$entry" || { rm -rf -- "$preparing"; return 1; }
+    fi
+  done
   durable_sync_tree "$preparing" || { rm -rf -- "$preparing"; return 1; }
   atomic_move_directory_to_absent_path "$preparing" "$backup_path" || { rm -rf -- "$preparing"; return 1; }
   durable_sync_path "$BACKUP_DIR" || return 1
@@ -141,9 +161,13 @@ backup_snapshot_is_managed() {
     [[ -f "$backup/$required" && ! -L "$backup/$required" ]] || return 1
   done
   local optional
-  for optional in config.json sing-box manager.json; do
+  for optional in config.json sing-box manager.json certs; do
     if [[ -e "$backup/$optional" || -L "$backup/$optional" ]]; then
-      [[ -f "$backup/$optional" && ! -L "$backup/$optional" ]] || return 1
+      if [[ "$optional" == certs ]]; then
+        [[ -d "$backup/$optional" && ! -L "$backup/$optional" ]] || return 1
+      else
+        [[ -f "$backup/$optional" && ! -L "$backup/$optional" ]] || return 1
+      fi
     fi
   done
   jq -e '
@@ -158,6 +182,7 @@ backup_snapshot_is_managed() {
   validate_nodes_file_semantic "$backup/nodes.json" || return 1
   validate_traffic_file_semantic "$backup/traffic.json" "$backup/nodes.json" || return 1
   validate_history_file_semantic "$backup/traffic-history.json" || return 1
+  validate_hysteria2_certificate_state "$backup/nodes.json" "$backup/certs" || return 1
   if [[ -f "$backup/manager.json" ]]; then
     validate_manager_state_semantic "$backup/manager.json" || return 1
   fi
@@ -237,11 +262,20 @@ state_transaction_begin() {
     durable_sync_path "$preparing/config.json" || { rm -rf -- "$preparing"; return 1; }
     had_config=true
   fi
+  local had_certs=false
+  if [[ -e "$CERTS_DIR" || -L "$CERTS_DIR" ]]; then
+    [[ -d "$CERTS_DIR" && ! -L "$CERTS_DIR" ]] || { rm -rf -- "$preparing"; return 1; }
+    cp -a -- "$CERTS_DIR" "$preparing/certs" || { rm -rf -- "$preparing"; return 1; }
+    chmod 700 -- "$preparing/certs" || { rm -rf -- "$preparing"; return 1; }
+    find "$preparing/certs" -type d -exec chmod 700 {} +
+    find "$preparing/certs" -type f -exec chmod 600 {} +
+    had_certs=true
+  fi
   local journal_tmp created_at
   journal_tmp=$(runtime_temp_file state-transaction-journal) || { rm -rf -- "$preparing"; return 1; }
   created_at=$(timestamp_iso) || { rm -rf -- "$preparing"; rm -f -- "$journal_tmp"; return 1; }
-  jq -n --arg reason "$reason" --arg created_at "$created_at" --argjson active "$service_was_active" --argjson had_config "$had_config" \
-    '{schema_version:1,phase:"prepared",reason:$reason,created_at:$created_at,service_was_active:($active == 1),had_config:$had_config}' \
+  jq -n --arg reason "$reason" --arg created_at "$created_at" --argjson active "$service_was_active" --argjson had_config "$had_config" --argjson had_certs "$had_certs" \
+    '{schema_version:1,phase:"prepared",reason:$reason,created_at:$created_at,service_was_active:($active == 1),had_config:$had_config,had_certs:$had_certs}' \
     >"$journal_tmp" || { rm -rf -- "$preparing"; rm -f -- "$journal_tmp"; return 1; }
   install -m 600 -- "$journal_tmp" "$preparing/journal.json" || { rm -rf -- "$preparing"; rm -f -- "$journal_tmp"; return 1; }
   rm -f -- "$journal_tmp" || { rm -rf -- "$preparing"; return 1; }
@@ -285,22 +319,31 @@ state_transaction_restore() {
     and ((has("updated_at") | not) or (.updated_at | iso))
     and (.service_was_active | type == "boolean")
     and (.had_config | type == "boolean")
+    and ((.had_certs // false) | type == "boolean")
   ' "$journal" >/dev/null 2>&1 || return 1
   validate_nodes_file_semantic "$STATE_TRANSACTION_DIR/nodes.json" || return 1
   validate_traffic_file_semantic "$STATE_TRANSACTION_DIR/traffic.json" "$STATE_TRANSACTION_DIR/nodes.json" || return 1
   validate_history_file_semantic "$STATE_TRANSACTION_DIR/traffic-history.json" || return 1
-  local service_was_active had_config
+  local service_was_active had_config had_certs
   # jq -e deliberately exits non-zero when the selected value is false.  The
   # journal schema was validated above, so stringify both booleans before using
   # -e and preserve false as a valid recovery state.
   service_was_active=$(jq -er '.service_was_active | tostring' "$journal") || return 1
   had_config=$(jq -er '.had_config | tostring' "$journal") || return 1
+  had_certs=$(jq -er '(.had_certs // false) | tostring' "$journal") || return 1
   if [[ "$had_config" == true ]]; then
     [[ -f "$STATE_TRANSACTION_DIR/config.json" && ! -L "$STATE_TRANSACTION_DIR/config.json" ]] || return 1
     # Validate every durable snapshot before the first live state file is
     # replaced.  A corrupt config journal must not leave a half-restored set of
     # nodes/traffic files before the official parser reports the damage.
     singbox_check_config "$STATE_TRANSACTION_DIR/config.json" >/dev/null 2>&1 || return 1
+  fi
+  # Validate the durable certificate snapshot before replacing any live state.
+  # Otherwise a damaged cert tree could leave nodes/config restored while the
+  # TLS material remains only partially restored.
+  if [[ "$had_certs" == true ]]; then
+    [[ -d "$STATE_TRANSACTION_DIR/certs" && ! -L "$STATE_TRANSACTION_DIR/certs" ]] || return 1
+    validate_hysteria2_certificate_state "$STATE_TRANSACTION_DIR/nodes.json" "$STATE_TRANSACTION_DIR/certs" || return 1
   fi
   atomic_json_write "$STATE_TRANSACTION_DIR/nodes.json" "$NODES_FILE" 600 || return 1
   atomic_json_write "$STATE_TRANSACTION_DIR/traffic.json" "$TRAFFIC_FILE" 600 || return 1
@@ -310,6 +353,13 @@ state_transaction_restore() {
   else
     rm -f -- "$SING_BOX_CONFIG" || return 1
     durable_sync_path "$(dirname -- "$SING_BOX_CONFIG")" || return 1
+  fi
+  if [[ "$had_certs" == true ]]; then
+    [[ ! -e "$CERTS_DIR" && ! -L "$CERTS_DIR" ]] || rm -rf -- "$CERTS_DIR" || return 1
+    cp -a -- "$STATE_TRANSACTION_DIR/certs" "$CERTS_DIR" || return 1
+    chmod 700 -- "$CERTS_DIR" || return 1
+  else
+    [[ ! -e "$CERTS_DIR" && ! -L "$CERTS_DIR" ]] || rm -rf -- "$CERTS_DIR" || return 1
   fi
   if [[ "$service_was_active" == true ]]; then
     singbox_restart >/dev/null 2>&1 || return 1
@@ -370,6 +420,7 @@ install_transaction_target_names() {
     nodes "$NODES_FILE" \
     traffic "$TRAFFIC_FILE" \
     history "$HISTORY_FILE" \
+    certs "$CERTS_DIR" \
     interfaces "$INTERFACES_FILE" \
     bandwidth-plan "$DATA_DIR/bandwidth-plan.json" \
     sing-box-binary "$SING_BOX_BINARY" \
@@ -797,6 +848,7 @@ apply_state_transaction() {
   local candidate_history=$3
   local reason=$4
   local collect_traffic=${5:-1}
+  local candidate_certs=${6:-}
   ensure_runtime_dirs || return 1
   initialize_state_files || return 1
   local merged_traffic
@@ -824,6 +876,14 @@ apply_state_transaction() {
     || { rm -f -- "$merged_traffic"; error '候选流量数据库语义或节点关联无效。'; return 1; }
   validate_history_file_semantic "$candidate_history" \
     || { rm -f -- "$merged_traffic"; error '候选流量历史语义无效。'; return 1; }
+  if [[ -n "$candidate_certs" ]]; then
+    [[ "$candidate_certs" == "$CONFIG_DIR/.certs-candidate."* && -d "$candidate_certs" && ! -L "$candidate_certs" ]] \
+      || { rm -f -- "$merged_traffic"; return 1; }
+  elif jq -e 'any(.nodes[]?; .protocol == "hysteria2")' "$candidate_nodes" >/dev/null 2>&1; then
+    candidate_certs="$CERTS_DIR"
+  fi
+  validate_hysteria2_certificate_state "$candidate_nodes" "${candidate_certs:-$CERTS_DIR}" \
+    || { rm -f -- "$merged_traffic"; error '候选 Hysteria2 证书目录或 Pin 无效。'; return 1; }
 
   local candidate_config
   candidate_config=$(runtime_temp_file config.candidate) || { rm -f -- "$merged_traffic"; return 1; }
@@ -831,7 +891,7 @@ apply_state_transaction() {
   singbox_is_active || active_status=$?
   (( active_status != 2 )) || { rm -f -- "$merged_traffic"; return 1; }
   if (( active_status == 0 )); then service_was_active=1; fi
-  generate_singbox_config "$candidate_nodes" "$candidate_config" || { rm -f -- "$merged_traffic" "$candidate_config"; return 1; }
+  generate_singbox_config "$candidate_nodes" "$candidate_config" "${candidate_certs:-$CERTS_DIR}" || { rm -f -- "$merged_traffic" "$candidate_config"; return 1; }
   if ! singbox_check_config "$candidate_config" >/dev/null 2>&1; then
     error '新配置未通过 sing-box 官方配置检查；未重启服务，也未修改节点数据库。'
     rm -f -- "$candidate_config" "$merged_traffic"
@@ -845,8 +905,35 @@ apply_state_transaction() {
     return 1
   fi
 
-  if ! state_transaction_set_phase switching_config \
-    || ! atomic_json_write "$candidate_config" "$SING_BOX_CONFIG" 600; then
+  if ! state_transaction_set_phase switching_config; then
+    error '候选配置无法持久提交，正在恢复事务前状态。'
+    state_transaction_rollback_after_failure || true
+    [[ -z "$candidate_certs" || "$candidate_certs" != "$CONFIG_DIR/.certs-candidate."* ]] || rm -rf -- "$candidate_certs"
+    rm -f -- "$candidate_config" "$merged_traffic"
+    return 1
+  fi
+  if [[ -n "$candidate_certs" && "$candidate_certs" == "$CONFIG_DIR/.certs-candidate."* ]]; then
+    hysteria2_publish_candidate_cert_root "$candidate_certs" || {
+      error 'Hysteria2 证书候选目录无法提交，正在恢复事务前状态。'
+      state_transaction_rollback_after_failure || true
+      rm -f -- "$candidate_config" "$merged_traffic"
+      return 1
+    }
+    candidate_certs=''
+    generate_singbox_config "$candidate_nodes" "$candidate_config" "$CERTS_DIR" || {
+      error '发布证书后的最终配置生成失败，正在恢复事务前状态。'
+      state_transaction_rollback_after_failure || true
+      rm -f -- "$candidate_config" "$merged_traffic"
+      return 1
+    }
+    singbox_check_config "$candidate_config" >/dev/null 2>&1 || {
+      error '发布证书后的最终配置检查失败，正在恢复事务前状态。'
+      state_transaction_rollback_after_failure || true
+      rm -f -- "$candidate_config" "$merged_traffic"
+      return 1
+    }
+  fi
+  if ! atomic_json_write "$candidate_config" "$SING_BOX_CONFIG" 600; then
     error '候选配置无法持久提交，正在恢复事务前状态。'
     state_transaction_rollback_after_failure || true
     rm -f -- "$candidate_config" "$merged_traffic"
@@ -916,6 +1003,7 @@ apply_state_transaction() {
     warn "状态已经提交，但事务日志未能清理；下次启动会识别 committed 标记并仅重试清理：$STATE_TRANSACTION_DIR"
   fi
   backup_prune || warn '配置已经提交，但旧备份自动清理失败；可稍后从备份菜单重试。'
+  [[ -z "$candidate_certs" || "$candidate_certs" != "$CONFIG_DIR/.certs-candidate."* ]] || rm -rf -- "$candidate_certs"
   rm -f -- "$candidate_config" "$merged_traffic" || warn '配置已经提交，但运行时候选文件清理失败。'
   success "配置事务已提交，备份：$backup_path"
   return 0
@@ -952,7 +1040,7 @@ backup_restore_flow() {
   [[ "$choice" == 0 ]] && return 0
   [[ "$choice" =~ ^[1-9][0-9]*$ && choice -ge 1 && choice -le ${#backups[@]} ]] || die '无效的备份序号。'
   local selected_name=${backups[$((choice-1))]}
-  local selected="$BACKUP_DIR/$selected_name" restore_reason restore_nodes
+  local selected="$BACKUP_DIR/$selected_name" restore_reason restore_nodes restore_certs=''
   backup_snapshot_is_managed "$selected" || die '备份不完整、语义无效或不属于 Ss2022。'
   restore_reason=$(backup_restore_reason "$selected_name") || die '无法生成安全的恢复事务标识。'
   prompt_yes_no "确认恢复备份 $selected_name？当前状态会先自动再备份" n || return 0
@@ -962,7 +1050,15 @@ backup_restore_flow() {
     rm -f -- "$restore_nodes"
     die '备份节点数据库无法安全迁移到当前 schema。'
   }
-  apply_state_transaction "$restore_nodes" "$selected/traffic.json" "$selected/traffic-history.json" "$restore_reason" 0 || {
+  if jq -e 'any(.nodes[]?; .protocol == "hysteria2")' "$restore_nodes" >/dev/null 2>&1; then
+    [[ -d "$selected/certs" && ! -L "$selected/certs" ]] || { rm -f -- "$restore_nodes"; die '备份缺少 Hysteria2 证书目录，拒绝恢复。'; }
+    restore_certs=$(hysteria2_make_candidate_cert_root) || { rm -f -- "$restore_nodes"; die '无法创建恢复证书候选目录。'; }
+    rm -rf -- "$restore_certs" || { rm -f -- "$restore_nodes"; die '无法清空恢复证书候选目录。'; }
+    ensure_dir "$restore_certs" 700 || { rm -f -- "$restore_nodes"; die '无法重建恢复证书候选目录。'; }
+    cp -a -- "$selected/certs/." "$restore_certs/" || { rm -rf -- "$restore_certs"; rm -f -- "$restore_nodes"; die '无法复制备份证书。'; }
+  fi
+  apply_state_transaction "$restore_nodes" "$selected/traffic.json" "$selected/traffic-history.json" "$restore_reason" 0 "$restore_certs" || {
+    [[ -z "$restore_certs" ]] || rm -rf -- "$restore_certs"
     rm -f -- "$restore_nodes"
     die '恢复失败，已自动回滚。'
   }

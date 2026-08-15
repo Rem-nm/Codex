@@ -2,30 +2,30 @@
 
 ## 进程模型
 
-Ss2022 不为节点创建进程。启用节点按 `protocol` 转换为同一 `config.json` 的 Shadowsocks 2022 或 VLESS + REALITY + Vision inbound，由一个 sing-box 服务负责启动、停止和重启；Debian/Ubuntu/CentOS/AlmaLinux 使用 systemd，Alpine Linux 使用 OpenRC。协议只是统一节点模型的一个判别字段，不存在第二套 VLESS 服务或数据库。
+Ss2022 不为节点创建进程。启用节点按 `protocol` 转换为同一 `config.json` 的 Shadowsocks 2022、VLESS + REALITY + Vision 或 Hysteria2 inbound，由一个 sing-box 服务负责启动、停止和重启；Debian/Ubuntu/CentOS/AlmaLinux 使用 systemd，Alpine Linux 使用 OpenRC。协议只是统一节点模型的一个判别字段，不存在按协议拆分的服务或数据库。
 
 节点地址是客户端分享信息，监听地址由系统 IPv4/IPv6 能力单独决定。IPv6 可用且 `bindv6only=0` 时默认监听 `::`；IPv4-only 系统监听 `0.0.0.0`；`bindv6only=1` 时 IPv4/IPv6 地址按各自家庭监听，域名节点生成两个同端口 inbound，并使用 `-ipv4`/`-ipv6` tag 后缀。
 
 ## 数据边界
 
-`nodes.json` schema 2 保存节点身份、协议、凭据、端口、地址、状态、限额和限速，是唯一节点源数据。公共字段只维护一份；SS2022 保存 method/password，VLESS 保存 UUID、固定 Flow、独立 Reality KeyPair、Short ID、SNI 和握手目标。`traffic.json` 仍按永久 Node ID 保存当前周期、累计计数及对应的 tc 内核计数基线，`traffic-history.json` 保存已结算周期。sing-box 配置由节点源数据生成，不反向作为数据库。
+`nodes.json` schema 3 保存节点身份、协议、凭据、端口、地址、状态、限额和限速，是唯一节点源数据。公共字段只维护一份；SS2022 保存 method/password，VLESS 保存 UUID、固定 Flow、独立 Reality KeyPair、Short ID、SNI 和握手目标，Hysteria2 保存独立 password、TLS SNI 和证书 pin，证书文件由 Node ID 固定派生。`traffic.json` 仍按永久 Node ID 保存当前周期、累计计数及对应的 tc 内核计数基线，`traffic-history.json` 保存已结算周期。sing-box 配置由节点源数据生成，不反向作为数据库。
 
-旧 schema 1 SS2022 数据先创建完整快照，再只增加 `protocol: "shadowsocks"` 并升级到 schema 2。Node ID、名称、端口、密码、流量、历史、限额、重置日、限速和状态都保持不变；候选文件验证失败或提交失败时恢复迁移前文件。
+旧 schema 1 SS2022 数据先创建完整快照，再只增加 `protocol: "shadowsocks"` 并升级到 schema 3；旧 schema 2（SS/VLESS）只提升顶层版本。Node ID、名称、端口、密码、流量、历史、限额、重置日、限速和状态都保持不变；候选文件验证失败或提交失败时恢复迁移前文件。迁移不会为旧节点创建 Hysteria2 证书。
 
 `manager.json` 只保存 manager/sing-box 版本、能力探测、监听模式和更新锁，不保存节点密钥。
 
 ## 流量路径
 
-每个 SS2022 节点使用 TCP + UDP，每个 VLESS Reality Vision 节点使用 TCP。tc 过滤器在默认路由接口上按节点实际传输匹配：
+每个 SS2022 节点使用 TCP + UDP，每个 VLESS Reality Vision 节点使用 TCP，每个 Hysteria2 节点使用 UDP。tc 过滤器在默认路由接口上按节点实际传输匹配：
 
 ```text
 上传：ingress dst_port=node.port
 下载：egress  src_port=node.port
 ```
 
-每个节点、每个方向建立一个带确定性 index 和 128-bit 所有权 cookie 的共享 tc action；当前实际启用的地址族、协议所需传输（SS2022 为 TCP/UDP，VLESS 为 TCP）及多个默认路由接口的 flower filter 都绑定到该 action。IPv4-only 主机不会创建 IPv6 filter。每分钟读取 action 聚合 bytes，与 `traffic.json` 基线做差，并把增量、累计和新基线作为一个 JSON 原子提交。任一计数读取失败则整次采样不写入；同一启动周期的 filter 损坏会先采样仍在的 action，再重建规则。
+每个节点、每个方向建立一个带确定性 index 和 128-bit 所有权 cookie 的共享 tc action；当前实际启用的地址族、协议所需传输（SS2022 为 TCP/UDP，VLESS 为 TCP，Hysteria2 为 UDP）及多个默认路由接口的 flower filter 都绑定到该 action。IPv4-only 主机不会创建 IPv6 filter。每分钟读取 action 聚合 bytes，与 `traffic.json` 基线做差，并把增量、累计和新基线作为一个 JSON 原子提交。任一计数读取失败则整次采样不写入；同一启动周期的 filter 损坏会先采样仍在的 action，再重建规则。
 
-端口 ingress 计数无法证明 SS2022 或 VLESS 认证成功，因此原始上传统计可能含未认证探测。两种协议共用 manager 的全局配额策略：默认只使用下载 egress 触发停用，上传、下载和合计仍全部统计、展示与归档；管理员若启用既有全局上传计费开关，则全部协议一起改为上传加下载。端口计数不是认证用户的精确业务账单，也不能替代抗流量攻击措施。
+端口 ingress 计数无法证明 SS2022、VLESS 或 Hysteria2 认证成功，因此原始上传统计可能含未认证探测。三种协议共用 manager 的全局配额策略：默认只使用下载 egress 触发停用，上传、下载和合计仍全部统计、展示与归档；管理员若启用既有全局上传计费开关，则全部协议一起改为上传加下载。端口计数不是认证用户的精确业务账单，也不能替代抗流量攻击措施。
 
 ## 系统范围
 

@@ -17,6 +17,8 @@ done
 # shellcheck disable=SC1091
 source "$ROOT/lib/common.sh"
 # shellcheck disable=SC1091
+source "$ROOT/lib/certs.sh"
+# shellcheck disable=SC1091
 source "$ROOT/lib/system.sh"
 # shellcheck disable=SC1091
 source "$ROOT/lib/singbox.sh"
@@ -40,6 +42,7 @@ CONFIG_DIR="$TEST_TMP/config"
 DATA_DIR="$TEST_TMP/data"
 RUNTIME_DIR="$TEST_TMP/run"
 BACKUP_DIR="$CONFIG_DIR/backups"
+CERTS_DIR="$CONFIG_DIR/certs"
 MANAGER_STATE="$CONFIG_DIR/manager.json"
 NODES_FILE="$DATA_DIR/nodes.json"
 TRAFFIC_FILE="$DATA_DIR/traffic.json"
@@ -159,7 +162,7 @@ validate_nodes_file_semantic "$legacy_nodes" || fail_test 'valid schema-1 SS2022
 
 upgraded_nodes="$TEST_TMP/nodes-schema2-ss.json"
 nodes_schema_upgrade_copy "$legacy_nodes" "$upgraded_nodes" || fail_test 'schema-1 SS2022 upgrade failed'
-assert_equal 2 "$(jq -r '.schema_version' "$upgraded_nodes")" 'node schema was not upgraded to version 2'
+assert_equal 3 "$(jq -r '.schema_version' "$upgraded_nodes")" 'node schema was not upgraded to version 3'
 assert_equal shadowsocks "$(jq -r '.nodes[0].protocol' "$upgraded_nodes")" 'legacy node protocol discriminator was not added'
 jq -e --slurpfile old "$legacy_nodes" '
   .nodes[0] as $new
@@ -181,8 +184,8 @@ backup_create_snapshot() {
 }
 INSTALL_TRANSACTION_ACTIVE=1
 migrate_nodes_schema_if_needed || fail_test 'automatic schema migration failed'
-assert_equal schema-1-to-2-migration "$migration_backup_reason" 'automatic migration did not request its pre-migration snapshot'
-assert_equal 2 "$(jq -r '.schema_version' "$NODES_FILE")" 'automatic migration did not publish schema 2'
+assert_equal schema-1-to-3-migration "$migration_backup_reason" 'automatic migration did not request its pre-migration snapshot'
+assert_equal 3 "$(jq -r '.schema_version' "$NODES_FILE")" 'automatic migration did not publish schema 3'
 jq -e --slurpfile old "$legacy_nodes" '(.nodes[0] | del(.protocol)) == $old[0].nodes[0]' "$NODES_FILE" >/dev/null \
   || fail_test 'automatic migration changed an existing SS2022 node'
 

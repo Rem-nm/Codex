@@ -1,6 +1,6 @@
 # Ss2022
 
-Ss2022 是一个基于 [sing-box](https://sing-box.sagernet.org/) 的统一代理节点管理工具。它把 Shadowsocks 2022 与 VLESS + REALITY + XTLS Vision 节点放在同一个 sing-box 进程中，由 `rem` 统一管理身份、端口、流量、配额、限速、备份、恢复和更新。GitHub 目录继续保留 `Ss2022/`，终端界面使用 `REM Proxy Manager`。
+Ss2022 是一个基于 [sing-box](https://sing-box.sagernet.org/) 的统一代理节点管理工具。它把 Shadowsocks 2022、VLESS + REALITY + XTLS Vision 与 Hysteria2 节点放在同一个 sing-box 进程中，由 `rem` 统一管理身份、端口、流量、配额、限速、证书、备份、恢复和更新。GitHub 目录继续保留 `Ss2022/`，终端界面使用 `REM Proxy Manager`。
 
 ## 支持范围
 
@@ -12,7 +12,8 @@ Ss2022 是一个基于 [sing-box](https://sing-box.sagernet.org/) 的统一代�
 - amd64/x86_64、arm64/aarch64
 - Shadowsocks 2022（TCP + UDP）：`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm`
 - VLESS（TCP）：仅 `REALITY + xtls-rprx-vision`
-- 每个节点一个全局唯一端口；SS2022 与 VLESS 之间也不允许端口重复
+- Hysteria2（UDP）：每个节点独立密码和自签 ECDSA P-256 TLS 证书，客户端使用证书 DER SHA-256 pin
+- 每个节点一个全局唯一端口；三种协议之间也不允许端口重复
 
 不支持的发行版或架构会在系统修改前明确退出。安装还会在临时 dummy 接口上探测 `clsact`、flower、当前启用地址族的 TCP/UDP、共享 gact/police action、cookie、action `bind` 计数和实际 `tc -j` 规则语义；IPv4-only 主机不会被强制要求 IPv6 filter，所需能力不完整时不会进入项目安装。项目不会为了 BBR 升级内核。
 
@@ -44,23 +45,25 @@ bash install.sh
 
 安装过程会自动识别发行版以及 apt/yum/dnf/apk，安装必要依赖，使用 SagerNet 官方 GitHub Release 下载 sing-box，在 Debian/Ubuntu/CentOS/AlmaLinux 上创建 systemd 服务、在 Alpine 上创建 OpenRC 服务，配置 BBR/TCP Fast Open 能力，并安装 `/usr/local/bin/rem`。依赖包会先由系统包管理器补齐且失败时不会反向卸载；重复修复时如果所需命令已经存在会跳过无必要的 APT 更新，避免旧 Debian 软件源阻断既有安装。Debian 11 若仍配置 `bullseye/updates` 或 `bullseye-backports`，依赖安装会临时使用官方 `bullseye`/`bullseye-security` 主源，不修改 `/etc/apt`；临时源也不可用时再提示升级系统或修复软件源。随后安装/修复会保存持久恢复日志，任一步失败会一起恢复旧程序、状态文件、服务定义、sing-box、`rem`、sysctl 文件和实时内核值。
 
-首次安装完成后不会询问“是否创建节点”，而是直接进入第一个节点创建流程。节点名称仍是第一项输入，随后选择 Shadowsocks 2022 或 VLESS + REALITY + Vision。创建完成后，任意目录执行：
+首次安装完成后不会询问“是否创建节点”，而是直接进入第一个节点创建流程。节点名称仍是第一项输入，随后选择 Shadowsocks 2022、VLESS + REALITY + Vision 或 Hysteria2。创建完成后，任意目录执行：
 
 ```bash
 rem
 ```
 
-即可进入管理菜单。重复运行 `install.sh` 是幂等的：已有节点、密码、UUID、Reality KeyPair、Short ID、流量和备份不会被覆盖或重置；检测到既有 VLESS 节点时，还会在安装事务提交前验证当前 sing-box 与安全随机源仍能完成 VLESS 身份生成和校验。
+即可进入管理菜单。重复运行 `install.sh` 是幂等的：已有节点、密码、UUID、Reality KeyPair、Short ID、Hysteria2 密码、证书、流量和备份不会被覆盖或重置；检测到既有 VLESS/Hysteria2 节点时，还会在安装事务提交前验证当前 sing-box、随机源和证书状态。
 
 ## 节点和凭据
 
-每个节点拥有独立的永久 Node ID、名称、协议、端口、客户端地址和协议凭据。SS2022 tag 继续使用 `ss-<node-id>`，VLESS 使用 `vless-<node-id>`；仅在 `bindv6only=1` 的域名双 inbound 情况追加 `-ipv4`/`-ipv6`。名称、端口、地址或协议参数变化不会改变 Node ID，也不会丢失历史数据。第一版不提供 SS2022 与 VLESS 之间的协议转换。
+每个节点拥有独立的永久 Node ID、名称、协议、端口、客户端地址和协议凭据。SS2022 tag 继续使用 `ss-<node-id>`，VLESS 使用 `vless-<node-id>`，Hysteria2 使用 `hy2-<node-id>`；仅在 `bindv6only=1` 的域名双 inbound 情况追加 `-ipv4`/`-ipv6`。名称、端口、地址或协议参数变化不会改变 Node ID，也不会丢失历史数据。第一版不提供协议之间的转换。
 
-名称重复时使用当前最小可用后缀，例如 `Tokyo`、`Tokyo-3` 已存在时，新名称为 `Tokyo-2`；64 字符名称会先为后缀预留空间。端口会先检查统一节点数据库，再检查协议实际使用的系统监听：SS2022 检查 TCP/UDP，VLESS 检查 TCP。任一 `ss` 查询失败都会停止选择。保留原端口时也必须确认所需监听都属于唯一的 sing-box PID，发现其他进程占用不会覆盖。
+名称重复时使用当前最小可用后缀，例如 `Tokyo`、`Tokyo-3` 已存在时，新名称为 `Tokyo-2`；64 字符名称会先为后缀预留空间。端口会先检查统一节点数据库，再检查协议实际使用的系统监听：SS2022 检查 TCP/UDP，VLESS 检查 TCP，Hysteria2 检查 UDP。任一 `ss` 查询失败都会停止选择。保留原端口时也必须确认所需监听都属于唯一的 sing-box PID，发现其他进程占用不会覆盖。
 
 2022 密钥由 `sing-box generate rand --base64` 或等价的 OpenSSL CSPRNG 生成，AES-128 使用 16 字节，AES-256 使用 32 字节。不会接受空密码、固定默认密码、时间戳密码或人工弱密码。修改密钥时可以重新生成，也可以复制另一个使用相同加密方式的节点密钥；新建节点仍默认各自生成独立随机密钥。
 
 每个 VLESS 节点独立生成 UUID、Reality X25519 KeyPair 和 Short ID，Flow 固定为 `xtls-rprx-vision`。Reality Private Key 只写入权限为 600 的节点数据库、备份和服务端配置，不显示在节点列表、普通详情、分享链接、Base64 或二维码中。重新生成 UUID、KeyPair 或 Short ID 前会明确提示现有客户端配置将失效。
+
+每个 Hysteria2 节点独立生成密码和自签 ECDSA P-256 证书。证书固定保存在 `/etc/ss-manager/certs/<node-id>/`，目录权限 700、证书和私钥权限 600；客户端分享 URI 使用 TLS SNI、`insecure=1` 和叶子证书 DER SHA-256 的 `pinSHA256`，不显示或分享私钥。
 
 节点创建完成或用户主动查看节点链接时，菜单会按协议显示：
 
@@ -72,11 +75,11 @@ Reality Private Key 永不出现在终端普通输出；VLESS UUID、Public Key 
 
 ## 配置与服务管理
 
-所有启用节点都在一个 `/etc/sing-box/config.json` 中按 `protocol` 生成 Shadowsocks 或 VLESS inbound，由一个 sing-box 服务进程统一管理。systemd 系统使用 `sing-box.service`，Alpine 使用 OpenRC `sing-box`；两者都只运行一个 sing-box 进程。节点停用时只从生成配置移除该 Node ID 的 inbound，不会停止其他协议或节点。`bindv6only=1` 且分享地址为域名时，同一节点会生成 IPv4/IPv6 两个同端口 inbound（tag 带家庭后缀），避免域名解析到另一地址族后无法连接。
+所有启用节点都在一个 `/etc/sing-box/config.json` 中按 `protocol` 生成 Shadowsocks、VLESS 或 Hysteria2 inbound，由一个 sing-box 服务进程统一管理。systemd 系统使用 `sing-box.service`，Alpine 使用 OpenRC `sing-box`；两者都只运行一个 sing-box 进程。节点停用时只从生成配置移除该 Node ID 的 inbound，不会停止其他协议或节点。`bindv6only=1` 且分享地址为域名时，同一节点会生成 IPv4/IPv6 两个同端口 inbound（tag 带家庭后缀），避免域名解析到另一地址族后无法连接。
 
 如果用户在“Sing-box 管理”中手动停止整个服务，后续定时流量结算和配置事务会保留停止状态，不会擅自重新启动；再次选择“启动”后才恢复服务并执行完整端口健康检查。
 
-SS2022 配置采用官方 Shadowsocks inbound 结构；TCP 和 UDP 同时启用时省略 `network` 字段，因为 sing-box 官方文档规定空值表示两者。VLESS 配置采用官方 VLESS inbound、TLS Reality server 和 `xtls-rprx-vision` 用户 Flow 结构，不增加 WS、gRPC、普通 TLS、ACME 或其他传输。TCP Fast Open 只有在内核和当前 sing-box 构建都通过检测时才写入配置。
+SS2022 配置采用官方 Shadowsocks inbound 结构；TCP 和 UDP 同时启用时省略 `network` 字段，因为 sing-box 官方文档规定空值表示两者。VLESS 配置采用官方 VLESS inbound、TLS Reality server 和 `xtls-rprx-vision` 用户 Flow 结构。Hysteria2 配置采用官方 UDP inbound，服务端 TLS 只引用项目固定证书路径。不增加 WS、gRPC、普通 TLS、ACME 或其他传输。TCP Fast Open 只有在内核和当前 sing-box 构建都通过检测时才写入配置。
 
 每次添加、删除、修改、启停、限额或限速变更都遵循：
 
@@ -175,7 +178,7 @@ manager 状态、包含密钥的节点数据库、流量数据和 sing-box 配�
 
 - 不要把 `/etc/ss-manager`、`/var/lib/ss-manager`、`/etc/sing-box/config.json` 或备份上传到 GitHub。
 - 不要在普通聊天、工单或日志中粘贴完整密钥、URI 或二维码。
-- 项目不会自动开放防火墙；请按云厂商和服务器策略手动放行 SS2022 的 TCP/UDP 端口或 VLESS 的 TCP 端口。
+- 项目不会自动开放防火墙；请按云厂商和服务器策略手动放行 SS2022 的 TCP/UDP、VLESS 的 TCP 或 Hysteria2 的 UDP 端口。
 - sing-box 访问日志保持关闭；systemd/journald 或 OpenRC 仅用于必要的服务状态排障，不开发访问监控。
 
 ## 官方能力依据
@@ -183,6 +186,8 @@ manager 状态、包含密钥的节点数据库、流量数据和 sing-box 配�
 - [sing-box Shadowsocks inbound](https://sing-box.sagernet.org/configuration/inbound/shadowsocks/)
 - [sing-box Shadowsocks protocol guide](https://sing-box.sagernet.org/manual/proxy-protocol/shadowsocks/)
 - [sing-box VLESS inbound](https://sing-box.sagernet.org/configuration/inbound/vless/)
+- [sing-box Hysteria2 inbound](https://sing-box.sagernet.org/configuration/inbound/hysteria2/)
+- [sing-box TLS fields](https://sing-box.sagernet.org/configuration/shared/tls/)
 - [sing-box TLS / Reality fields](https://sing-box.sagernet.org/configuration/shared/tls/#reality-fields)
 - [sing-box Listen Fields / TCP Fast Open](https://sing-box.sagernet.org/configuration/shared/listen/)
 - [sing-box configuration check](https://sing-box.sagernet.org/configuration/)

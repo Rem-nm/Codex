@@ -388,6 +388,7 @@ singbox_config_supports_tfo() {
 generate_singbox_config() {
   local nodes_source=$1
   local output_file=$2
+  local certs_root=${3:-$CERTS_DIR}
   local tfo_supported tfo_kernel listen_mode
   tfo_supported=$(manager_state_get tfo_config_supported false) || return 1
   tfo_kernel=$(manager_state_get tfo_kernel_enabled false) || return 1
@@ -397,7 +398,7 @@ generate_singbox_config() {
 
   # Transform the protected node database directly. This keeps every node key
   # out of both shell-expanded external command arguments and process listings.
-  jq -e --arg listen_mode "$listen_mode" --argjson tfo "$tfo_supported" '
+  jq -e --arg listen_mode "$listen_mode" --argjson tfo "$tfo_supported" --arg certs_root "$certs_root" '
     def ss_inbound($node; $listen; $tag):
       ({
         type: "shadowsocks",
@@ -428,17 +429,34 @@ generate_singbox_config() {
           }
         }
       } | if $tfo then .tcp_fast_open = true else . end);
+    def hysteria2_inbound($node; $listen; $tag):
+      {
+        type: "hysteria2",
+        tag: $tag,
+        listen: $listen,
+        listen_port: $node.port,
+        users: [{password:$node.password}],
+        tls: {
+          enabled: true,
+          server_name: $node.tls_server_name,
+          certificate_path: ($certs_root + "/" + $node.node_id + "/cert.pem"),
+          key_path: ($certs_root + "/" + $node.node_id + "/key.pem")
+        }
+      };
     def inbound($node; $listen; $tag):
       if ($node.protocol // "shadowsocks") == "shadowsocks" then
         ss_inbound($node; $listen; $tag)
       elif $node.protocol == "vless" then
         vless_inbound($node; $listen; $tag)
+      elif $node.protocol == "hysteria2" then
+        hysteria2_inbound($node; $listen; $tag)
       else
         error("unsupported node protocol")
       end;
     def tag_prefix($node):
       if ($node.protocol // "shadowsocks") == "shadowsocks" then "ss"
       elif $node.protocol == "vless" then "vless"
+      elif $node.protocol == "hysteria2" then "hy2"
       else error("unsupported node protocol") end;
     [
       .nodes[]
@@ -600,12 +618,19 @@ port_listener_owned_by_pid() {
 singbox_owns_node_port() {
   local port=$1 pid=${2:-} protocol=${3:-shadowsocks}
   [[ -n "$pid" ]] || pid=$(singbox_process_pid) || return 1
-  port_listener_owned_by_pid tcp "$port" "$pid" any || return 1
-  if [[ "$protocol" == shadowsocks ]]; then
-    port_listener_owned_by_pid udp "$port" "$pid" any
-  else
-    [[ "$protocol" == vless ]]
-  fi
+  case "$protocol" in
+    shadowsocks)
+      port_listener_owned_by_pid tcp "$port" "$pid" any || return 1
+      port_listener_owned_by_pid udp "$port" "$pid" any
+      ;;
+    vless)
+      port_listener_owned_by_pid tcp "$port" "$pid" any
+      ;;
+    hysteria2)
+      port_listener_owned_by_pid udp "$port" "$pid" any
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 singbox_health_check_once() {
@@ -628,9 +653,11 @@ singbox_health_check_once() {
     while IFS= read -r listener; do
       [[ -n "$listener" ]] || continue
       [[ "$listener" == '::' ]] && family=ipv6 || family=ipv4
-      port_listener_owned_by_pid tcp "$port" "$main_pid" "$family" \
-        || { error "预期 $family TCP 端口未由 sing-box 监听：$port"; return 1; }
-      if [[ "$protocol" == shadowsocks ]]; then
+      if [[ "$protocol" == shadowsocks || "$protocol" == vless ]]; then
+        port_listener_owned_by_pid tcp "$port" "$main_pid" "$family" \
+          || { error "预期 $family TCP 端口未由 sing-box 监听：$port"; return 1; }
+      fi
+      if [[ "$protocol" == shadowsocks || "$protocol" == hysteria2 ]]; then
         port_listener_owned_by_pid udp "$port" "$main_pid" "$family" \
           || { error "预期 $family UDP 端口未由 sing-box 监听：$port"; return 1; }
       fi

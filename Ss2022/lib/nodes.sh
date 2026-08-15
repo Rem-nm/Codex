@@ -61,17 +61,18 @@ node_port_in_database() {
 system_port_in_use_for_protocol() {
   local port=$1 protocol=${2:-shadowsocks} tcp_listeners udp_listeners
   local pattern="(^|:)${port}$"
-  tcp_listeners=$(ss -H -ltn 2>/dev/null) || return 2
-  if [[ "$protocol" == shadowsocks ]]; then
-    # Preserve one trustworthy TCP+UDP snapshot before deciding availability;
-    # an ss failure for either required transport must remain fail closed even
-    # when the other snapshot already shows an occupied port.
+  case "$protocol" in
+    shadowsocks|vless) tcp_listeners=$(ss -H -ltn 2>/dev/null) || return 2 ;;
+    hysteria2) ;;
+    *) return 2 ;;
+  esac
+  if [[ "$protocol" == shadowsocks || "$protocol" == hysteria2 ]]; then
     udp_listeners=$(ss -H -lun 2>/dev/null) || return 2
-  elif [[ "$protocol" != vless ]]; then
-    return 2
   fi
-  awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' <<<"$tcp_listeners" && return 0
-  if [[ "$protocol" == shadowsocks ]]; then
+  if [[ "$protocol" != hysteria2 ]] && awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' <<<"$tcp_listeners"; then
+    return 0
+  fi
+  if [[ "$protocol" == shadowsocks || "$protocol" == hysteria2 ]]; then
     awk -v pattern="$pattern" '$4 ~ pattern { found=1 } END { exit !found }' <<<"$udp_listeners" && return 0
   fi
   return 1
@@ -92,7 +93,7 @@ port_available() {
       protocol=shadowsocks
     fi
   fi
-  [[ "$protocol" == shadowsocks || "$protocol" == vless ]] || return 2
+  [[ "$protocol" == shadowsocks || "$protocol" == vless || "$protocol" == hysteria2 ]] || return 2
   local database_status=0
   validate_port "$port" || return 1
   node_port_in_database "$port" "$exclude_id" || database_status=$?
@@ -163,6 +164,8 @@ choose_port() {
       (( availability_status != 2 )) || die '无法可靠查询系统监听端口，已停止选择端口。'
       if [[ "$protocol" == shadowsocks ]]; then
         warn "端口 $port 的 TCP 或 UDP 已被占用，或与已有节点冲突；不会覆盖。"
+      elif [[ "$protocol" == hysteria2 ]]; then
+        warn "端口 $port 的 UDP 已被占用，或与已有节点冲突；不会覆盖。"
       else
         warn "端口 $port 的 TCP 已被占用，或与已有节点冲突；不会覆盖。"
       fi
@@ -188,14 +191,15 @@ choose_method() {
 choose_protocol() {
   local choice
   while true; do
-    printf '%s\n\n1. Shadowsocks 2022\n2. VLESS + REALITY + Vision\n' '请选择协议：' >&2
+    printf '%s\n\n1. Shadowsocks 2022\n2. VLESS + REALITY + Vision\n3. Hysteria2\n' '请选择协议：' >&2
     printf '> ' >&2
     IFS= read -r choice || die '读取输入失败。'
     [[ -z "$choice" ]] && choice=1
     case "$choice" in
       1) printf 'shadowsocks'; return 0 ;;
       2) printf 'vless'; return 0 ;;
-      *) warn '请选择 1 或 2。' ;;
+      3) printf 'hysteria2'; return 0 ;;
+      *) warn '请选择 1、2 或 3。' ;;
     esac
   done
 }
@@ -505,10 +509,35 @@ node_new_vless_record() {
         end'
 }
 
+node_new_hysteria2_record() {
+  local name=$1 port=$2 address=$3 address_type=$4 node_id=$5 password=$6 server_name=$7 pin=$8
+  local now reset_at next_reset
+  now=$(timestamp_iso) || return 1
+  reset_at=$(timestamp_iso) || return 1
+  next_reset=$(calculate_next_reset_at "$reset_at" "$DEFAULT_RESET_DAY") || return 1
+  printf '%s' "$password" | jq -eRs \
+    --arg node_id "$node_id" \
+    --arg name "$name" \
+    --arg address "$address" \
+    --arg address_type "$address_type" \
+    --arg server_name "$server_name" \
+    --arg pin "$pin" \
+    --arg now "$now" \
+    --arg reset_at "$reset_at" \
+    --arg next_reset "$next_reset" \
+    --argjson port "$port" \
+    --argjson quota "$DEFAULT_QUOTA_BYTES" \
+    --argjson reset_day "$DEFAULT_RESET_DAY" \
+    --argjson upload_limit "$DEFAULT_UPLOAD_LIMIT_MBPS" \
+    --argjson download_limit "$DEFAULT_DOWNLOAD_LIMIT_MBPS" \
+    '. as $password | {node_id:$node_id,name:$name,protocol:"hysteria2",password:$password,tls_server_name:$server_name,certificate_sha256:$pin,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}'
+}
+
 node_add_flow() {
   acquire_manager_lock
   local requested name protocol method port address_line address address_type node_id password record_file candidate traffic_candidate candidate_history
   local server_name handshake_line handshake_server handshake_port uuid keypair private_key public_key short_id
+  local certificate_pin candidate_certs
   requested=$(read_nonempty '请输入节点名称：')
   validate_name "$requested" || die "节点名称包含控制字符、路径字符或超过 64 个字符。"
   name=$(unique_node_name "$requested") || die "无法生成唯一节点名称。"
@@ -527,7 +556,7 @@ node_add_flow() {
     password=$(generate_random_key "$(method_key_bytes "$method")")
     node_new_record "$name" "$method" "$port" "$address" "$address_type" "$node_id" "$password" >"$record_file" \
       || { rm -f -- "$record_file"; die '无法创建 Shadowsocks 节点记录。'; }
-  else
+  elif [[ "$protocol" == vless ]]; then
     server_name=$(choose_reality_server_name)
     handshake_line=$(choose_reality_handshake_target)
     handshake_server=${handshake_line%$'\t'*}
@@ -541,6 +570,17 @@ node_add_flow() {
     short_id=$(generate_unique_reality_short_id) || { rm -f -- "$record_file"; die '无法安全生成未被其他节点使用的有效 Reality Short ID。'; }
     node_new_vless_record "$name" "$port" "$address" "$address_type" "$node_id" "$uuid" "$private_key" "$public_key" "$short_id" "$server_name" "$handshake_server" "$handshake_port" >"$record_file" \
       || { rm -f -- "$record_file"; die '无法创建 VLESS 节点记录。'; }
+  else
+    server_name=$(hysteria2_server_name_for_node "$node_id") \
+      || { rm -f -- "$record_file"; die '无法生成 Hysteria2 TLS Server Name。'; }
+    info "Hysteria2 TLS Server Name：$server_name"
+    candidate_certs=$(hysteria2_make_candidate_cert_root) || { rm -f -- "$record_file"; die '无法创建 Hysteria2 证书候选目录。'; }
+    password=$(generate_hysteria2_password) || { rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法生成 Hysteria2 密码。'; }
+    certificate_pin=$(hysteria2_generate_certificate "$candidate_certs" "$node_id" "$server_name") || {
+      rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法生成 Hysteria2 自签名证书。';
+    }
+    node_new_hysteria2_record "$name" "$port" "$address" "$address_type" "$node_id" "$password" "$server_name" "$certificate_pin" >"$record_file" \
+      || { rm -rf -- "$candidate_certs"; rm -f -- "$record_file"; die '无法创建 Hysteria2 节点记录。'; }
   fi
   chmod 600 -- "$record_file" || { rm -f -- "$record_file"; die '无法保护节点记录暂存文件。'; }
   candidate=$(runtime_temp_file nodes.candidate) || { rm -f -- "$record_file"; die '无法创建节点候选暂存文件。'; }
@@ -553,12 +593,16 @@ node_add_flow() {
     || { rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"; die '无法生成新节点流量状态。'; }
   install -m 600 -- "$HISTORY_FILE" "$candidate_history" \
     || { rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"; die '无法复制流量历史候选状态。'; }
-  apply_state_transaction "$candidate" "$traffic_candidate" "$candidate_history" "add-node-$node_id" || {
+  apply_state_transaction "$candidate" "$traffic_candidate" "$candidate_history" "add-node-$node_id" 1 "${candidate_certs:-}" || {
+    [[ -z "${candidate_certs:-}" ]] || rm -rf -- "$candidate_certs"
     rm -f -- "$candidate" "$traffic_candidate" "$candidate_history"
     die "添加节点失败，当前运行配置和节点数据库已保持不变。"
   }
   rm -f -- "$candidate" "$traffic_candidate" "$candidate_history" \
     || warn '节点已经创建，但运行时候选文件清理失败。'
+  [[ -z "${candidate_certs:-}" ]] || {
+    [[ ! -e "$candidate_certs" ]] || warn 'Hysteria2 证书候选目录已经发布，但暂存目录清理失败。'
+  }
   success "节点创建成功。"
   show_node_credentials "$node_id" || warn '节点已经创建，但凭据展示未完整完成；可稍后从菜单重新显示。'
 }
@@ -632,6 +676,7 @@ node_show_detail() {
   local upload download total total_upload total_download total_all quota reset_day status billable quota_policy
   local name address port protocol protocol_text upload_limit download_limit next_reset status_text
   local upload_text download_text total_text total_upload_text total_download_text total_all_text
+  local cert_path cert_dates cert_start cert_end
   upload=$(traffic_value "$node_id" '.current_upload_bytes') || die '无法读取节点上传流量。'
   download=$(traffic_value "$node_id" '.current_download_bytes') || die '无法读取节点下载流量。'
   total=$((upload + download))
@@ -661,7 +706,7 @@ node_show_detail() {
   printf '\n节点：%s\nNode ID：%s\n协议：%s\n服务器地址：%s\n' "$name" "$node_id" "$protocol_text" "$address"
   if [[ "$protocol" == shadowsocks ]]; then
     printf '端口：%s（TCP + UDP）\n加密方式：%s\n' "$port" "$(jq -er '.method' <<<"$node")"
-  else
+  elif [[ "$protocol" == vless ]]; then
     local handshake_server handshake_port handshake_display
     handshake_server=$(jq -er '.reality_handshake_server' <<<"$node") || die 'Reality 握手服务器字段无效。'
     handshake_port=$(jq -er '.reality_handshake_port' <<<"$node") || die 'Reality 握手端口字段无效。'
@@ -675,6 +720,25 @@ node_show_detail() {
       "$handshake_display" "$handshake_port" \
       "$(jq -er '.reality_public_key' <<<"$node")" \
       "$(jq -er '.reality_short_id' <<<"$node")"
+  else
+    cert_path=$(hysteria2_cert_path "$CERTS_DIR" "$node_id") || die '无法推导 Hysteria2 证书路径。'
+    hysteria2_validate_certificate_files "$CERTS_DIR" "$node_id" \
+      "$(jq -er '.tls_server_name' <<<"$node")" "$(jq -er '.certificate_sha256' <<<"$node")" \
+      || die 'Hysteria2 证书、私钥或 Pin 校验失败；请先使用备份恢复。'
+    cert_dates=$(openssl x509 -in "$cert_path" -noout -startdate -enddate 2>/dev/null) \
+      || die '无法读取 Hysteria2 证书有效期。'
+    cert_start=${cert_dates#*notBefore=}
+    cert_start=${cert_start%%$'\n'*}
+    cert_end=${cert_dates#*notAfter=}
+    cert_end=${cert_end%%$'\n'*}
+    printf '端口：%s（UDP）\n模式：TLS + Hysteria2\n密码：%s\nTLS SNI：%s\n证书 Pin（SHA-256）：%s\n证书有效期：%s 至 %s\n' \
+      "$port" \
+      "$(jq -er '.password' <<<"$node")" \
+      "$(jq -er '.tls_server_name' <<<"$node")" \
+      "$(jq -er '.certificate_sha256' <<<"$node")" "$cert_start" "$cert_end"
+    if ! openssl x509 -in "$cert_path" -checkend $((30 * 86400)) -noout >/dev/null 2>&1; then
+      warn 'Hysteria2 证书将在 30 天内到期；项目不会自动轮换，请手动确认是否重新生成。'
+    fi
   fi
   printf '状态：%s\n' "$status_text"
   printf '本周期上传：%s\n本周期下载：%s\n本周期合计：%s\n' "$upload_text" "$download_text" "$total_text"

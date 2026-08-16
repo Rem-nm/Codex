@@ -619,6 +619,9 @@ node_add_flow() {
   address_line=$(choose_address)
   address=${address_line%$'\t'*}
   address_type=${address_line##*$'\t'}
+  if [[ "$protocol" == shadowsocks ]] && declare -F time_sync_ss_creation_check >/dev/null 2>&1; then
+    time_sync_ss_creation_check || die '时间同步状态未确认，已取消 Shadowsocks 2022 节点创建。'
+  fi
   node_id=$(generate_node_id)
   record_file=$(runtime_temp_file node-record) || die '无法创建节点记录暂存文件。'
   if [[ "$protocol" == shadowsocks ]]; then

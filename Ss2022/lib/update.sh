@@ -243,6 +243,7 @@ manager_update_finalize_switched_program() {
   version_output=$("$PROGRAM_DIR/ss-manager.sh" --self-test 2>/dev/null) || return 1
   grep -Fxq "Ss2022 manager $version" <<<"$version_output" || return 1
   manager_update_install_service_files || return 1
+  "$PROGRAM_DIR/ss-manager.sh" --update-finalize || return 1
   manager_state_set_json manager_version "$(jq -Rn --arg value "$version" '$value')" || return 1
   install_rem_command || return 1
 }
@@ -298,7 +299,7 @@ manager_update_validate_package_structure() {
   local root=$1 relative
   local -a required_files=(
     ss-manager.sh VERSION config/defaults.conf
-    lib/common.sh lib/certs.sh lib/system.sh lib/service.sh lib/singbox.sh lib/traffic.sh
+    lib/common.sh lib/certs.sh lib/system.sh lib/service.sh lib/time_sync.sh lib/singbox.sh lib/traffic.sh
     lib/bandwidth.sh lib/port_hopping.sh lib/backup.sh lib/nodes.sh lib/links.sh lib/export.sh lib/subscription.sh lib/update.sh lib/menu.sh
     subscription/ss-manager-subscription.py
     systemd/sing-box.service systemd/ss-manager-traffic.service systemd/ss-manager-traffic.timer systemd/ss-manager-porthop.service systemd/ss-manager-subscription.service

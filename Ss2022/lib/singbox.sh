@@ -389,16 +389,31 @@ generate_singbox_config() {
   local nodes_source=$1
   local output_file=$2
   local certs_root=${3:-$CERTS_DIR}
-  local tfo_supported tfo_kernel listen_mode
+  local tfo_supported tfo_kernel listen_mode ntp_enabled ntp_server ntp_port ntp_interval
   tfo_supported=$(manager_state_get tfo_config_supported false) || return 1
   tfo_kernel=$(manager_state_get tfo_kernel_enabled false) || return 1
   [[ "$tfo_supported" == true && "$tfo_kernel" == true ]] || tfo_supported=false
   listen_mode=$(manager_state_get listen_mode ipv4) || return 1
   [[ "$listen_mode" =~ ^(dual|ipv4|family-specific)$ ]] || return 1
+  ntp_enabled=$(jq -r '.time_sync.singbox_ntp_enabled // true' "$MANAGER_STATE" 2>/dev/null) || return 1
+  ntp_server=$(jq -r '.time_sync.ntp_server // "time.apple.com"' "$MANAGER_STATE" 2>/dev/null) || return 1
+  ntp_port=$(jq -r '.time_sync.ntp_port // 123' "$MANAGER_STATE" 2>/dev/null) || return 1
+  ntp_interval=$(jq -r '.time_sync.ntp_interval // "30m"' "$MANAGER_STATE" 2>/dev/null) || return 1
+  [[ "$ntp_enabled" == true || "$ntp_enabled" == false ]] || return 1
+  validate_port "$ntp_port" || return 1
+  [[ "$ntp_interval" == 30m ]] || return 1
+  if declare -F time_sync_validate_server >/dev/null 2>&1; then
+    time_sync_validate_server "$ntp_server" || return 1
+  else
+    [[ "$ntp_server" =~ ^[A-Za-z0-9_.:-]{1,253}$ ]] || return 1
+  fi
 
   # Transform the protected node database directly. This keeps every node key
   # out of both shell-expanded external command arguments and process listings.
-  jq -e --arg listen_mode "$listen_mode" --argjson tfo "$tfo_supported" --arg certs_root "$certs_root" '
+  jq -e --arg listen_mode "$listen_mode" --argjson tfo "$tfo_supported" \
+    --argjson ntp_enabled "$ntp_enabled" --arg ntp_server "$ntp_server" \
+    --argjson ntp_port "$ntp_port" --arg ntp_interval "$ntp_interval" \
+    --arg certs_root "$certs_root" '
     def ss_inbound($node; $listen; $tag):
       ({
         type: "shadowsocks",
@@ -499,7 +514,7 @@ generate_singbox_config() {
           error("unsupported node address type")
         end
     ] as $inbounds
-    | {log:{disabled:true},inbounds:$inbounds,outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}
+    | {log:{disabled:true},ntp:{enabled:$ntp_enabled,server:$ntp_server,server_port:$ntp_port,interval:$ntp_interval},inbounds:$inbounds,outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}
   ' "$nodes_source" >"$output_file" || return 1
   chmod 600 -- "$output_file" || return 1
   jq -e . "$output_file" >/dev/null

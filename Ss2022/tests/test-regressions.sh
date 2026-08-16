@@ -86,7 +86,7 @@ rm -f -- "$checksum_fixture"
 manager_package_fixture=$(mktemp -d)
 for required_file in \
   ss-manager.sh VERSION config/defaults.conf \
-  lib/common.sh lib/certs.sh lib/system.sh lib/service.sh lib/singbox.sh lib/traffic.sh \
+  lib/common.sh lib/certs.sh lib/system.sh lib/service.sh lib/time_sync.sh lib/singbox.sh lib/traffic.sh \
   lib/bandwidth.sh lib/port_hopping.sh lib/backup.sh lib/nodes.sh lib/links.sh lib/export.sh lib/subscription.sh lib/update.sh lib/menu.sh \
   subscription/ss-manager-subscription.py \
   systemd/sing-box.service systemd/ss-manager-porthop.service systemd/ss-manager-traffic.service systemd/ss-manager-traffic.timer \

@@ -12,7 +12,13 @@ Ss2022 不为节点创建进程。启用节点按 `protocol` 转换为同一 `co
 
 旧 schema 1 SS2022 数据先创建完整快照，再增加 `protocol: "shadowsocks"`、`subscription_enabled: true` 并升级到 schema 5；旧 schema 2/3/4 保留所有协议凭据，补齐订阅字段和 HY2 跳跃默认值。Node ID、名称、端口、密码、UUID、密钥、证书、流量、历史、限额、重置日、限速和状态都保持不变；候选文件验证失败或提交失败时恢复迁移前文件。迁移不会为旧节点生成或轮换证书。
 
-`manager.json` 只保存 manager/sing-box 版本、能力探测、监听模式和更新锁，不保存节点密钥。
+`manager.json` 只保存 manager/sing-box 版本、能力探测、监听模式、更新锁和 `time_sync` 时间同步设置，不保存节点密钥。`time_sync` 记录系统 NTP Provider 与 sing-box NTP 开关、服务器和状态；系统 Provider 仍属于主机基础服务，不由 sing-box 服务依赖或按节点拆分。
+
+## 时间同步路径
+
+时间同步采用两层机制：主机已有或按发行版选择的一套系统 Provider（`chrony`、`systemd-timesyncd` 或 `unknown`）负责校准操作系统 Unix 时间；sing-box 配置生成器再从 `manager.json.time_sync` 生成顶层 `ntp` 模块作为协议层 fallback。Provider 检查失败只产生辅助警告，不会停止四协议共用的 sing-box 进程。安装、更新、系统设置和恢复都不得自动修改时区，也不得同时启用两个 NTP daemon。
+
+`rem → 系统设置 → 时间同步` 只修改 manager 状态并复用现有配置事务：候选 manager → 完整 sing-box 配置 → 官方 `sing-box check` → restart/健康检查 → 提交。时间显示同时包含 Local Time、UTC、Timezone、Provider 和同步状态，避免把时区差异误判为 Unix 时间错误。
 
 `port-hopping-plan.json` 是由 nodes 重建的 HY2 NAT/tc 派生计划；它只描述 manager 自有规则的后端、地址族、范围和所有权，不包含用户防火墙策略。订阅设置单独保存在 root-only 的 `/etc/ss-manager/subscription.json`；root 管理器将符合条件的节点转换成不含服务端私钥的 `subscription-export.json`，低权限 HTTP 服务只读该派生文件，不读取 `nodes.json` 或证书目录。订阅默认关闭，生成失败会发布不可用状态而不是陈旧快照。
 

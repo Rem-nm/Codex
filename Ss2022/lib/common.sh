@@ -755,6 +755,20 @@ validate_manager_state_semantic() {
       ((.tc_clsact_interfaces | type == "array")
         and all(.tc_clsact_interfaces[]; type == "string" and test("^[A-Za-z0-9_.-]{1,15}$"))
         and ([.tc_clsact_interfaces[]] | length == (unique | length))))
+    and ((has("time_sync") | not) or
+      (.time_sync | type == "object"
+        and (keys | sort) == (["installed_by_rem","last_checked_at","last_status","last_sync_at","ntp_interval","ntp_port","ntp_server","provider","service_name","singbox_ntp_enabled","system_sync_enabled"] | sort)
+        and (.system_sync_enabled | type == "boolean")
+        and (.singbox_ntp_enabled | type == "boolean")
+        and (.ntp_server | type == "string" and length >= 1 and length <= 253 and test("^[A-Za-z0-9_.:-]+$"))
+        and (.ntp_port | type == "number" and floor == . and . >= 1 and . <= 65535)
+        and (.ntp_interval == "30m")
+        and (.provider == "chrony" or .provider == "systemd-timesyncd" or .provider == "unknown")
+        and (.service_name | type == "string" and length <= 128 and test("^[A-Za-z0-9_.@-]*$"))
+        and (.installed_by_rem | type == "boolean")
+        and (.last_status == "synchronized" or .last_status == "unsynchronized" or .last_status == "unknown" or .last_status == "disabled" or .last_status == "error")
+        and (.last_checked_at == null or (.last_checked_at | iso))
+        and (.last_sync_at == null or (.last_sync_at | iso))))
   ' "$source" >/dev/null 2>&1
 }
 

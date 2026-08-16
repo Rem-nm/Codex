@@ -156,7 +156,31 @@ Reality Private Key 只属于服务器端。`nodes.json`、备份和 sing-box �
 
 ## 其他状态文件
 
-- `manager.json`：manager/sing-box 版本、项目管理的 sing-box 二进制 SHA-256、init system、监听/TFO/BBR/tc 能力、全局配额策略和项目创建的 clsact 接口记录；不保存节点凭据。
+- `manager.json`：manager/sing-box 版本、项目管理的 sing-box 二进制 SHA-256、init system、监听/TFO/BBR/tc 能力、全局配额策略、项目创建的 clsact 接口记录和 `time_sync` 系统时间同步设置；不保存节点凭据。
+
+### `manager.json.time_sync`
+
+时间同步设置属于 manager 状态，不属于节点协议字段，也不建立第二套时间数据库。旧版本没有该对象时，安装、更新或 manager 启动会在事务保护下补齐以下默认结构：
+
+```json
+{
+  "system_sync_enabled": true,
+  "singbox_ntp_enabled": true,
+  "ntp_server": "time.apple.com",
+  "ntp_port": 123,
+  "ntp_interval": "30m",
+  "provider": "unknown",
+  "service_name": "",
+  "installed_by_rem": false,
+  "last_status": "unknown",
+  "last_checked_at": null,
+  "last_sync_at": null
+}
+```
+
+`provider` 只能是 `chrony`、`systemd-timesyncd` 或 `unknown`；`ntp_port` 必须为 1-65535 的整数；第一版 `ntp_interval` 固定为 `30m`；时间字段使用 UTC ISO-8601 或 `null`。系统同步 Provider 只记录发现和启用状态，不把 chrony/timesyncd 的配置文件复制进项目，也不因卸载 REM 删除系统时间同步软件。`singbox_ntp_enabled`、服务器和端口修改时，会由配置生成器把同一份状态转换为 sing-box 顶层 `ntp` 模块并走现有配置事务。
+
+系统状态读取失败必须记录为 `unknown`，不能写成“已同步”。常规备份完整保存该对象；节点/流量恢复流程不覆盖当前 `manager.json.time_sync`，以免恢复历史节点时意外改变主机时间策略。安装事务、系统设置事务和 manager 更新事务恢复时按事务快照恢复该对象，并重新生成带 NTP 的候选配置；任何情况下都不改变节点 Node ID、协议凭据、证书或流量数据。
 - `interfaces.json`：检测到的默认路由接口，名称唯一且符合 Linux 接口长度约束。
 - `bandwidth-plan.json`：boot ID、接口、实际启用地址族，以及每个启用节点/方向的 action kind、index、cookie、端口、速率和实际传输列表。SS2022 action 使用 `["tcp","udp"]`，VLESS action 使用 `["tcp"]`，Hysteria2/TUIC action 使用 `["udp"]`；启动校验会把它与节点协议和接口状态交叉核对。旧计划缺少传输字段时仅按旧 SS2022 的 TCP/UDP 语义读取。
 - `port-hopping-plan.json`：schema 1 的可重建派生计划，记录 manager 后端、Node ID、地址族、接口、连续 UDP 范围、实际端口和规则身份；不作为节点源数据，恢复时从 nodes 重新生成。

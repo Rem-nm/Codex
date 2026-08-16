@@ -15,6 +15,7 @@ Ss2022 是一个基于 [sing-box](https://sing-box.sagernet.org/) 的统一代�
 - Hysteria2（UDP）：每个节点独立密码和自签 ECDSA P-256 TLS 证书，客户端使用证书 DER SHA-256 pin
 - TUIC v5（QUIC/UDP）：每个节点独立 UUID、Password 和自签 ECDSA P-256 TLS 证书；固定关闭 0-RTT，QUIC 拥塞控制为 BBR
 - 每个节点一个全局唯一实际监听端口；四种协议之间也不允许实际端口重复。Hysteria2 可选地把一个连续 UDP 外部范围由 manager 自有 NAT REDIRECT 指向该实际端口
+- 系统时间同步：复用一套 chrony/chronyd 或 systemd-timesyncd，并默认启用 sing-box 内置 NTP fallback；不自动修改时区或同时运行多个 NTP daemon
 
 不支持的发行版或架构会在系统修改前明确退出。安装还会在临时 dummy 接口上探测 `clsact`、flower、当前启用地址族的 TCP/UDP、共享 gact/police action、cookie、action `bind` 计数和实际 `tc -j` 规则语义；IPv4-only 主机不会被强制要求 IPv6 filter，所需能力不完整时不会进入项目安装。启用 Hysteria2 端口跳跃时，manager 还会在自己的 NAT 命名空间中探测并核验连续 UDP 范围 REDIRECT；探测失败会保持关闭，不会改动用户规则。项目不会为了 BBR 升级内核。
 
@@ -44,7 +45,7 @@ wget -qO- "https://raw.githubusercontent.com/Rem-nm/Codex/$SS_MANAGER_COMMIT/Ss2
 bash install.sh
 ```
 
-安装过程会自动识别发行版以及 apt/yum/dnf/apk，安装必要依赖，使用 SagerNet 官方 GitHub Release 下载 sing-box，在 Debian/Ubuntu/CentOS/AlmaLinux 上创建 systemd 服务、在 Alpine 上创建 OpenRC 服务，配置 BBR/TCP Fast Open 能力，并安装 `/usr/local/bin/rem`。依赖包会先由系统包管理器补齐且失败时不会反向卸载；重复修复时如果所需命令已经存在会跳过无必要的 APT 更新，避免旧 Debian 软件源阻断既有安装。Debian 11 若仍配置 `bullseye/updates` 或 `bullseye-backports`，依赖安装会临时使用官方 `bullseye`/`bullseye-security` 主源，不修改 `/etc/apt`；临时源也不可用时再提示升级系统或修复软件源。随后安装/修复会保存持久恢复日志，任一步失败会一起恢复旧程序、状态文件、服务定义、sing-box、`rem`、sysctl 文件和实时内核值。
+安装过程会自动识别发行版以及 apt/yum/dnf/apk，安装必要依赖，检测并复用当前唯一的系统时间同步 Provider，使用 SagerNet 官方 GitHub Release 下载 sing-box，在 Debian/Ubuntu/CentOS/AlmaLinux 上创建 systemd 服务、在 Alpine 上创建 OpenRC 服务，配置 BBR/TCP Fast Open 能力，并安装 `/usr/local/bin/rem`。Debian/Ubuntu 无 Provider 时优先使用 systemd-timesyncd，CentOS/AlmaLinux 使用 chrony，Alpine 使用 OpenRC chrony；不会同时启用两套 NTP daemon，也不依赖 ntpdate。sing-box 配置默认生成 `ntp.enabled=true`、`server=time.apple.com`、`server_port=123`、`interval=30m`，所有修改仍通过候选配置、官方 `sing-box check` 和健康检查。若宿主机不允许修改系统时钟或 Provider 启动失败，安装会保留明确警告并继续使用 sing-box NTP fallback，不会因此停止 sing-box 或其他协议。依赖包会先由系统包管理器补齐且失败时不会反向卸载；重复修复时如果所需命令已经存在会跳过无必要的 APT 更新，避免旧 Debian 软件源阻断既有安装。Debian 11 若仍配置 `bullseye/updates` 或 `bullseye-backports`，依赖安装会临时使用官方 `bullseye`/`bullseye-security` 主源，不修改 `/etc/apt`；临时源也不可用时再提示升级系统或修复软件源。随后安装/修复会保存持久恢复日志，任一步失败会一起恢复旧程序、状态文件、服务定义、sing-box、`rem`、sysctl 文件和实时内核值。系统原有或由本次补装的时间同步软件默认保留，不因卸载 REM 删除。
 
 首次安装完成后不会询问“是否创建节点”，而是直接进入第一个节点创建流程。节点名称仍是第一项输入，随后选择 Shadowsocks 2022、VLESS + REALITY + Vision、Hysteria2 或 TUIC。创建完成后，任意目录执行：
 
@@ -77,6 +78,12 @@ rem
 Reality Private Key 永不出现在终端普通输出；VLESS UUID、Public Key 和 Short ID 可按需求显示在协议详情中。完整客户端链接、Base64 和二维码只在创建结果或“显示链接/二维码”这些明确操作中显示，不写入访问日志。生成配置、URI 和二维码时，秘密值通过受保护文件或标准输入传递，不放进外部命令的参数列表。
 
 ## 配置与服务管理
+
+### 系统时间同步
+
+时间同步采用两层机制：Linux 系统时间同步负责校准 Unix Timestamp，sing-box 内置 NTP 作为协议层 fallback。时间同步不改变服务器时区；状态页同时显示 Local Time、UTC、Timezone、系统 Provider、系统同步状态和 sing-box NTP 状态。进入 `rem → 系统设置 → 时间同步` 可立即检查、调用当前 Provider 原生方式同步、修改 NTP Server 或启用/禁用 sing-box NTP。
+
+如果系统同步暂时未知但 sing-box NTP 已启用，SS2022 仍可继续创建；如果系统 NTP 未同步且 sing-box NTP 也禁用，菜单会显示时间偏差可能影响 SS2022 的明显警告。时间同步异常不会自动停止 VLESS、Hysteria2、TUIC 或整个 sing-box。
 
 所有启用节点都在一个 `/etc/sing-box/config.json` 中按 `protocol` 生成 Shadowsocks、VLESS、Hysteria2 或 TUIC inbound，由一个 sing-box 服务进程统一管理。systemd 系统使用 `sing-box.service`，Alpine 使用 OpenRC `sing-box`；两者都只运行一个 sing-box 进程。节点停用时只从生成配置移除该 Node ID 的 inbound，不会停止其他协议或节点。`bindv6only=1` 且分享地址为域名时，同一节点会生成 IPv4/IPv6 两个同端口 inbound（tag 带家庭后缀），避免域名解析到另一地址族后无法连接。
 
@@ -135,7 +142,7 @@ Hysteria2 端口跳跃默认关闭。开启后 sing-box 仍只监听节点的一
 /usr/local/bin/rem
 ```
 
-manager 状态、包含密钥的节点数据库、流量数据和 sing-box 配置使用 root 所有、目录 700、敏感文件 600 的权限。manager 还保存项目管理的 sing-box 二进制 SHA-256；旧状态首次由本版本启动时会在版本匹配后补齐摘要，此后启动、修复和卸载都会同时核对版本与摘要，避免把同版本的外部替换文件当作项目二进制。GitHub 目录只保存源代码、默认配置、版本、文档和测试，不保存服务器密码、真实地址、域名、流量文件或备份。
+manager 状态、包含密钥的节点数据库、流量数据和 sing-box 配置使用 root 所有、目录 700、敏感文件 600 的权限。`manager.json` 的 `time_sync` 保存 Provider、系统同步开关、sing-box NTP 开关、服务器、端口、周期和最近状态，不保存 NTP 认证密钥或节点凭据。manager 还保存项目管理的 sing-box 二进制 SHA-256；旧状态首次由本版本启动时会在版本匹配后补齐摘要和 `time_sync` 默认值，此后启动、修复和卸载都会同时核对版本与摘要，避免把同版本的外部替换文件当作项目二进制。GitHub 目录只保存源代码、默认配置、版本、文档和测试，不保存服务器密码、真实地址、域名、流量文件或备份。
 
 ## 流量统计、重置和限额
 
@@ -183,7 +190,7 @@ manager 状态、包含密钥的节点数据库、流量数据和 sing-box 配�
 2. 删除程序和运行配置，保留备份
 3. 完全卸载项目创建的程序、systemd/OpenRC 服务、sing-box（由本项目管理时）、rem、节点数据、流量、历史和备份
 
-所有模式都会删除本项目自己的 tc 规则、端口跳跃 NAT 规则和订阅服务定义；不会删除任何用户已有的防火墙规则或反向代理配置。模式 1 会保留运行中的 sing-box 和配置，便于以后重新安装 manager 继续管理。模式 2 和模式 3 会在删除 manager 状态前恢复本项目记录的 BBR/TFO 内核原值并清理运行目录。维护服务或 sing-box 无法确认停止/禁用时，卸载会在删除对应程序和配置前停止。
+所有模式都会删除本项目自己的 tc 规则、端口跳跃 NAT 规则和订阅服务定义；不会删除任何用户已有的防火墙规则或反向代理配置，也不会删除或停止系统原有/本次补装的 chrony、chronyd 或 systemd-timesyncd。模式 1 会保留运行中的 sing-box 和配置，便于以后重新安装 manager 继续管理。模式 2 和模式 3 会在删除 manager 状态前恢复本项目记录的 BBR/TFO 内核原值并清理运行目录。维护服务或 sing-box 无法确认停止/禁用时，卸载会在删除对应程序和配置前停止。
 
 ## 安全注意事项
 

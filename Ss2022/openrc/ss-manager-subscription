@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+# Managed by Ss2022
+
+name="ss-manager-subscription"
+description="Ss2022 read-only subscription service"
+command="/usr/bin/python3"
+command_args="/opt/ss-manager/subscription/ss-manager-subscription.py"
+command_user="ss-manager-subscription:ss-manager-subscription"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+depend() {
+  need net
+  after firewall
+}

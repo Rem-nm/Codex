@@ -62,7 +62,7 @@ probe_tc_capabilities() {
     error '无法创建临时 dummy 接口；系统缺少 tc 所需的 CAP_NET_ADMIN 或 dummy 支持。'
     return 1
   fi
-  local probe_ok=1 family protocol family_pref expected_rules=0 bind_count handles handle_count handle family_lines
+  local probe_ok=1 family protocol family_pref range_pref expected_rules=0 expected_range_rules=0 bind_count handles handle_count handle family_lines
   local -a families=()
   family_lines=$(tc_active_families) || probe_ok=0
   if (( probe_ok == 1 )); then
@@ -80,16 +80,28 @@ probe_tc_capabilities() {
         tc_add_flower_rule "$interface" ingress "$family" "$protocol" 9 "$family_pref" gact "$gact_index" "$gact_cookie" >/dev/null 2>&1 || { probe_ok=0; break 2; }
         tc_add_flower_rule "$interface" egress "$family" "$protocol" 9 "$family_pref" police "$police_index" "$police_cookie" >/dev/null 2>&1 || { probe_ok=0; break 2; }
         expected_rules=$((expected_rules + 1))
+        range_pref=$(tc_family_pref 64900 "$family") || { probe_ok=0; break 2; }
+        tc_add_flower_rule_range "$interface" ingress "$family" "$protocol" 10 11 "$range_pref" gact "$gact_index" "$gact_cookie" >/dev/null 2>&1 || { probe_ok=0; break 2; }
+        expected_range_rules=$((expected_range_rules + 1))
       done
     done
   fi
   if (( probe_ok == 1 )); then
     ingress_output=$(tc -s -j filter show dev "$interface" ingress 2>/dev/null) || probe_ok=0
     if (( probe_ok == 1 )); then ingress_output=$(tc_filter_normalize_json "$ingress_output") || probe_ok=0; fi
-    (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" '[.[] | select((.options? // null) | type == "object")] | length == $expected' >/dev/null 2>&1 <<<"$ingress_output" || probe_ok=0
+    (( probe_ok == 0 )) || jq -e --argjson expected "$((expected_rules + expected_range_rules))" '[.[] | select((.options? // null) | type == "object")] | length == $expected' >/dev/null 2>&1 <<<"$ingress_output" || probe_ok=0
     egress_output=$(tc -s -j filter show dev "$interface" egress 2>/dev/null) || probe_ok=0
     if (( probe_ok == 1 )); then egress_output=$(tc_filter_normalize_json "$egress_output") || probe_ok=0; fi
     (( probe_ok == 0 )) || jq -e --argjson expected "$expected_rules" '[.[] | select((.options? // null) | type == "object")] | length == $expected' >/dev/null 2>&1 <<<"$egress_output" || probe_ok=0
+    if (( probe_ok == 1 )); then
+      for family in "${families[@]}"; do
+        range_pref=$(tc_family_pref 64900 "$family") || { probe_ok=0; break 2; }
+        for protocol in tcp udp; do
+          match_count=$(tc_rule_json_match_count_range "$ingress_output" "$range_pref" "$family" "$protocol" ingress 10 11 gact "$gact_index") || { probe_ok=0; break 3; }
+          (( match_count == 1 )) || { probe_ok=0; break 3; }
+        done
+      done
+    fi
     if (( probe_ok == 1 )); then
       for family in "${families[@]}"; do
         family_pref=$(tc_family_pref 65000 "$family") || { probe_ok=0; break; }
@@ -115,7 +127,7 @@ probe_tc_capabilities() {
     (( probe_ok == 0 )) || tc_action_counter_from_json "$output" gact "$gact_index" "$gact_cookie" >/dev/null 2>&1 || probe_ok=0
     if (( probe_ok == 1 )); then
       bind_count=$(tc_action_bind_count_from_json "$output" gact "$gact_index" "$gact_cookie") || probe_ok=0
-      (( probe_ok == 0 || bind_count == expected_rules )) || probe_ok=0
+      (( probe_ok == 0 || bind_count == (expected_rules + expected_range_rules) )) || probe_ok=0
     fi
     output=$(tc -s -j actions get action police index "$police_index" 2>/dev/null) || probe_ok=0
     (( probe_ok == 0 )) || tc_action_counter_from_json "$output" police "$police_index" "$police_cookie" >/dev/null 2>&1 || probe_ok=0
@@ -173,7 +185,7 @@ bandwidth_plan_matches_current_boot() {
   plan_file=$(bandwidth_plan_path) || return 1
   [[ -f "$plan_file" && ! -L "$plan_file" ]] || return 1
   boot_id=$(kernel_boot_id) || boot_id=unknown
-  jq -e --arg boot_id "$boot_id" '.schema_version == 2 and .boot_id == $boot_id and (.actions | type == "array")' "$plan_file" >/dev/null 2>&1
+  jq -e --arg boot_id "$boot_id" '(.schema_version == 2 or .schema_version == 3) and .boot_id == $boot_id and (.actions | type == "array")' "$plan_file" >/dev/null 2>&1
 }
 
 bandwidth_plan_matches_current_families() {
@@ -405,13 +417,23 @@ bandwidth_action_kind() {
 }
 
 bandwidth_build_actions() {
-  local nodes_source=$1 output_file=$2 node node_id port direction limit identity index cookie kind node_lines protocols protocols_json
+  local nodes_source=$1 output_file=$2 node node_id port direction limit identity index cookie kind node_lines protocols protocols_json matches_json
   jq -n '[]' >"$output_file" || return 1
   node_lines=$(jq -c '.nodes[] | select(.status == "enabled")' "$nodes_source") || return 1
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     node_id=$(jq -er '.node_id' <<<"$node") || return 1
     port=$(jq -er '.port' <<<"$node") || return 1
+    if [[ "$(jq -r '.protocol' <<<"$node")" == hysteria2 && "$(jq -r '.port_hopping_enabled // false' <<<"$node")" == true ]]; then
+      local hop_start hop_end
+      hop_start=$(jq -er '.hop_port_start' <<<"$node") || return 1
+      hop_end=$(jq -er '.hop_port_end' <<<"$node") || return 1
+      matches_json=$(jq -n --argjson start "$hop_start" --argjson finish "$hop_end" --argjson actual "$port" \
+        'if ($actual >= $start and $actual <= $finish) then [{start:$start,end:$finish}]
+         else [{start:$start,end:$finish},{start:$actual,end:$actual}] end') || return 1
+    else
+      matches_json=$(jq -n --argjson port "$port" '[{start:$port,end:$port}]') || return 1
+    fi
     protocols=$(node_transport_protocols "$node") || return 1
     protocols_json=$(printf '%s\n' "$protocols" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
     for direction in ingress egress; do
@@ -425,8 +447,8 @@ bandwidth_build_actions() {
       cookie=${identity#*$'\t'}
       kind=$(bandwidth_action_kind "$limit") || return 1
       jq --arg node_id "$node_id" --arg direction "$direction" --arg kind "$kind" --arg cookie "$cookie" \
-        --argjson port "$port" --argjson index "$index" --argjson limit "$limit" --argjson protocols "$protocols_json" \
-        '. += [{node_id:$node_id,direction:$direction,port:$port,kind:$kind,index:$index,cookie:$cookie,limit_mbps:$limit,protocols:$protocols}]' \
+        --argjson port "$port" --argjson index "$index" --argjson limit "$limit" --argjson protocols "$protocols_json" --argjson matches "$matches_json" \
+        '. += [{node_id:$node_id,direction:$direction,port:$port,matches:$matches,kind:$kind,index:$index,cookie:$cookie,limit_mbps:$limit,protocols:$protocols}]' \
         "$output_file" >"$output_file.next" || return 1
       mv -f -- "$output_file.next" "$output_file" || return 1
     done
@@ -679,17 +701,24 @@ bandwidth_preflight_actions() {
   done <<<"$action_lines"
 }
 
-tc_add_flower_rule() {
-  local interface=$1 direction=$2 family=$3 protocol=$4 port=$5 pref=$6 kind=$7 index=$8 cookie=${9:-}
+tc_add_flower_rule_range() {
+  local interface=$1 direction=$2 family=$3 protocol=$4 start=$5 end=$6 pref=$7 kind=$8 index=$9 cookie=${10:-}
   local -a args=(filter add dev "$interface" "$direction" pref "$pref" protocol "$family" flower skip_hw ip_proto "$protocol")
-  if [[ "$direction" == ingress ]]; then args+=(dst_port "$port"); else args+=(src_port "$port"); fi
+  local match="$start"
+  [[ "$start" == "$end" ]] || match="$start-$end"
+  if [[ "$direction" == ingress ]]; then args+=(dst_port "$match"); else args+=(src_port "$match"); fi
   args+=(action "$kind" index "$index")
   [[ "${TC_INLINE_ACTIONS:-0}" == 1 && -n "$cookie" ]] && args+=(cookie "$cookie")
   tc "${args[@]}"
 }
 
-tc_rule_json_match_count() {
-  local rules_json=$1 pref=$2 family=$3 protocol=$4 direction=$5 port=$6 expected_action=$7 expected_index=${8:-}
+tc_add_flower_rule() {
+  local interface=$1 direction=$2 family=$3 protocol=$4 port=$5 pref=$6 kind=$7 index=$8 cookie=${9:-}
+  tc_add_flower_rule_range "$interface" "$direction" "$family" "$protocol" "$port" "$port" "$pref" "$kind" "$index" "$cookie"
+}
+
+tc_rule_json_match_count_range() {
+  local rules_json=$1 pref=$2 family=$3 protocol=$4 direction=$5 start=$6 end=$7 expected_action=$8 expected_index=${9:-}
   local port_field protocol_number
   case "$direction" in
     ingress) port_field=dst_port ;;
@@ -702,7 +731,16 @@ tc_rule_json_match_count() {
     *) return 1 ;;
   esac
   jq -r --argjson pref "$pref" --arg family "$family" --arg protocol "$protocol" --arg protocol_number "$protocol_number" \
-    --arg port_field "$port_field" --argjson port "$port" --arg expected_action "$expected_action" --arg expected_index "$expected_index" '
+    --arg port_field "$port_field" --argjson start "$start" --argjson finish "$end" --arg expected_action "$expected_action" --arg expected_index "$expected_index" '
+      def port_matches($value; $start; $finish):
+        if ($value | type) == "number" then ($start == $finish and $value == $start)
+        elif ($value | type) == "array" and ($value | length) == 2 then (($value[0] | tonumber?) == $start and ($value[1] | tonumber?) == $finish)
+        elif ($value | type) == "object" then ((($value.min // $value.start // -1) | tonumber?) == $start and (($value.max // $value.end // -1) | tonumber?) == $finish)
+        elif ($value | type) == "string" then
+          (($value | capture("^(?<s>[0-9]+)(-(?<e>[0-9]+))?$")?) // {}) as $p
+          | (($p.s // "-1") | tonumber) == $start
+            and (($p.e // $p.s // "-1") | tonumber) == $finish
+        else false end;
       [ .[]
         | select(if has("pref") then (((.pref | tonumber?) // -1) == $pref) else true end)
         | select(if has("protocol") then ((.protocol | tostring | ascii_downcase) == $family) else true end)
@@ -710,7 +748,7 @@ tc_rule_json_match_count() {
         | ($options.keys // $options) as $keys
         | (($keys.ip_proto // "") | tostring | ascii_downcase) as $actual_protocol
         | select($actual_protocol == $protocol or $actual_protocol == $protocol_number)
-        | select(((($keys[$port_field] // 0) | tonumber?) // -1) == $port)
+        | select(port_matches(($keys[$port_field] // 0); $start; $finish))
         | ($options.actions // []) as $actions
         | select(($actions | length) == 1)
         | select(any($actions[];
@@ -720,19 +758,33 @@ tc_rule_json_match_count() {
     ' <<<"$rules_json"
 }
 
+tc_rule_json_match_count() {
+  local rules_json=$1 pref=$2 family=$3 protocol=$4 direction=$5 port=$6 expected_action=$7 expected_index=${8:-}
+  tc_rule_json_match_count_range "$rules_json" "$pref" "$family" "$protocol" "$direction" "$port" "$port" "$expected_action" "$expected_index"
+}
+
 tc_rule_json_matches() {
   local match_count
   match_count=$(tc_rule_json_match_count "$@") || return 1
   [[ "$match_count" == 1 ]]
 }
 
-tc_rule_json_handles() {
-  local rules_json=$1 pref=$2 family=$3 protocol=$4 direction=$5 port=$6 expected_action=$7 expected_index=$8
+tc_rule_json_handles_range() {
+  local rules_json=$1 pref=$2 family=$3 protocol=$4 direction=$5 start=$6 end=$7 expected_action=$8 expected_index=$9
   local port_field protocol_number
   case "$direction" in ingress) port_field=dst_port ;; egress) port_field=src_port ;; *) return 1 ;; esac
   case "$protocol" in tcp) protocol_number=6 ;; udp) protocol_number=17 ;; *) return 1 ;; esac
   jq -r --argjson pref "$pref" --arg family "$family" --arg protocol "$protocol" --arg protocol_number "$protocol_number" \
-    --arg port_field "$port_field" --argjson port "$port" --arg expected_action "$expected_action" --argjson expected_index "$expected_index" '
+    --arg port_field "$port_field" --argjson start "$start" --argjson finish "$end" --arg expected_action "$expected_action" --argjson expected_index "$expected_index" '
+      def port_matches($value; $start; $finish):
+        if ($value | type) == "number" then ($start == $finish and $value == $start)
+        elif ($value | type) == "array" and ($value | length) == 2 then (($value[0] | tonumber?) == $start and ($value[1] | tonumber?) == $finish)
+        elif ($value | type) == "object" then ((($value.min // $value.start // -1) | tonumber?) == $start and (($value.max // $value.end // -1) | tonumber?) == $finish)
+        elif ($value | type) == "string" then
+          (($value | capture("^(?<s>[0-9]+)(-(?<e>[0-9]+))?$")?) // {}) as $p
+          | (($p.s // "-1") | tonumber) == $start
+            and (($p.e // $p.s // "-1") | tonumber) == $finish
+        else false end;
       .[]
       | select(if has("pref") then (((.pref | tonumber?) // -1) == $pref) else true end)
       | select(if has("protocol") then ((.protocol | tostring | ascii_downcase) == $family) else true end)
@@ -740,7 +792,7 @@ tc_rule_json_handles() {
       | ($options.keys // $options) as $keys
       | (($keys.ip_proto // "") | tostring | ascii_downcase) as $actual_protocol
       | select($actual_protocol == $protocol or $actual_protocol == $protocol_number)
-      | select(((($keys[$port_field] // 0) | tonumber?) // -1) == $port)
+      | select(port_matches(($keys[$port_field] // 0); $start; $finish))
       | ($options.actions // []) as $actions
       | select(($actions | length) == 1)
       | select(any($actions[];
@@ -748,6 +800,11 @@ tc_rule_json_handles() {
           and ((((.index // -1) | tonumber?) // -1) == $expected_index)))
       | ($options.handle // .handle // empty)
     ' <<<"$rules_json"
+}
+
+tc_rule_json_handles() {
+  local rules_json=$1 pref=$2 family=$3 protocol=$4 direction=$5 port=$6 expected_action=$7 expected_index=$8
+  tc_rule_json_handles_range "$rules_json" "$pref" "$family" "$protocol" "$direction" "$port" "$port" "$expected_action" "$expected_index"
 }
 
 tc_rule_owned_action_count() {
@@ -874,27 +931,29 @@ bandwidth_delete_legacy_filters() {
 
 bandwidth_remove_plan() {
   local plan_file=$1 pref action entry status expected_bind bind interface family direction family_pref rules actions_json owned_count
-  local node_id port kind index cookie protocol handles handle action_key action_lines interface_lines family_lines direction_action_lines protocol_lines protocol_count
+  local node_id port kind index cookie protocol handles handle action_key action_lines interface_lines family_lines direction_action_lines protocol_lines protocol_count match match_start match_end match_count
   local reset_interfaces='' needs_clsact_reset=0
   local -a deletions=()
   local -A observed_bind=()
   [[ -f "$plan_file" && ! -L "$plan_file" ]] || return 1
   validate_bandwidth_plan_semantic "$plan_file" || return 1
   pref=$(jq -er '.pref' "$plan_file") || return 1
-  local interface_count family_count
+  local interface_count family_count plan_schema
   interface_count=$(jq -er '.interfaces | length' "$plan_file") || return 1
   action_lines=$(jq -c '.actions[]' "$plan_file") || return 1
   interface_lines=$(jq -r '.interfaces[]?' "$plan_file") || return 1
   family_lines=$(bandwidth_plan_families "$plan_file") || return 1
   family_count=$(awk 'NF {count++} END {print count+0}' <<<"$family_lines") || return 1
   (( family_count >= 1 )) || return 1
+  plan_schema=$(jq -er '.schema_version' "$plan_file") || return 1
   while IFS= read -r action; do
     [[ -n "$action" ]] || continue
     kind=$(jq -er '.kind' <<<"$action") || return 1
     index=$(jq -er '.index' <<<"$action") || return 1
     cookie=$(jq -er '.cookie' <<<"$action") || return 1
     protocol_count=$(jq -er '(.protocols // ["tcp","udp"]) | length' <<<"$action") || return 1
-    expected_bind=$((interface_count * family_count * protocol_count))
+    if [[ "$plan_schema" == 2 ]]; then match_count=1; else match_count=$(jq -er '.matches | length' <<<"$action") || return 1; fi
+    expected_bind=$((interface_count * family_count * protocol_count * match_count))
     action_key="$kind:$index"
     observed_bind["$action_key"]=0
     if entry=$(tc_action_lookup "$kind" "$index"); then
@@ -921,25 +980,29 @@ bandwidth_remove_plan() {
           [[ -n "$action" ]] || continue
           node_id=$(jq -er '.node_id' <<<"$action") || return 1
           : "$node_id"
-          port=$(jq -er '.port' <<<"$action") || return 1
           kind=$(jq -er '.kind' <<<"$action") || return 1
           index=$(jq -er '.index' <<<"$action") || return 1
           protocol_lines=$(jq -r '(.protocols // ["tcp","udp"])[]' <<<"$action") || return 1
-          while IFS= read -r protocol; do
-            [[ -n "$protocol" ]] || continue
-            handles=$(tc_rule_json_handles "$rules" "$family_pref" "$family" "$protocol" "$direction" "$port" "$kind" "$index") || return 1
-            local handle_count
-            handle_count=$(awk 'NF {count++} END {print count+0}' <<<"$handles") || return 1
-            (( handle_count <= 1 )) || { error "检测到重复的 Ss2022 tc 规则，拒绝模糊清理。"; return 1; }
-            if (( handle_count == 1 )); then
-              handle=$(awk 'NF {print; exit}' <<<"$handles") || return 1
-              [[ "$handle" =~ ^(0x)?[A-Fa-f0-9]+$ ]] || { error "tc filter handle 无效：$handle"; return 1; }
-              deletions+=("$interface"$'\t'"$direction"$'\t'"$family"$'\t'"$family_pref"$'\t'"$handle")
-              matched_count=$((matched_count + 1))
-              action_key="$kind:$index"
-              observed_bind["$action_key"]=$(( ${observed_bind["$action_key"]:-0} + 1 ))
-            fi
-          done <<<"$protocol_lines"
+          while IFS= read -r match; do
+            [[ -n "$match" ]] || continue
+            match_start=$(jq -er '.start' <<<"$match") || return 1
+            match_end=$(jq -er '.end' <<<"$match") || return 1
+            while IFS= read -r protocol; do
+              [[ -n "$protocol" ]] || continue
+              handles=$(tc_rule_json_handles_range "$rules" "$family_pref" "$family" "$protocol" "$direction" "$match_start" "$match_end" "$kind" "$index") || return 1
+              local handle_count
+              handle_count=$(awk 'NF {count++} END {print count+0}' <<<"$handles") || return 1
+              (( handle_count <= 1 )) || { error "检测到重复的 Ss2022 tc 规则，拒绝模糊清理。"; return 1; }
+              if (( handle_count == 1 )); then
+                handle=$(awk 'NF {print; exit}' <<<"$handles") || return 1
+                [[ "$handle" =~ ^(0x)?[A-Fa-f0-9]+$ ]] || { error "tc filter handle 无效：$handle"; return 1; }
+                deletions+=("$interface"$'\t'"$direction"$'\t'"$family"$'\t'"$family_pref"$'\t'"$handle")
+                matched_count=$((matched_count + 1))
+                action_key="$kind:$index"
+                observed_bind["$action_key"]=$(( ${observed_bind["$action_key"]:-0} + 1 ))
+              fi
+            done <<<"$protocol_lines"
+          done < <(if [[ "$plan_schema" == 2 ]]; then jq -nc --argjson port "$(jq -er '.port' <<<"$action")" '[{start:$port,end:$port}] | .[]'; else jq -c '.matches[]' <<<"$action"; fi)
         done <<<"$direction_action_lines"
         owned_count=$(tc_rule_owned_action_count "$rules" "$actions_json") || return 1
         (( owned_count == matched_count )) || { error "tc 优先级包含使用 Ss2022 action 的未知规则，拒绝删除。"; return 1; }
@@ -1028,7 +1091,7 @@ delete_manager_tc_filters() {
       error "tc 规则计划不是常规文件或为符号链接：$plan_file。无法证明所有权，拒绝清理。"
       return 1
     }
-    if jq -e '.schema_version == 2 and (.actions | type == "array")' "$plan_file" >/dev/null 2>&1; then
+    if jq -e '(.schema_version == 2 or .schema_version == 3) and (.actions | type == "array")' "$plan_file" >/dev/null 2>&1; then
       bandwidth_remove_plan "$plan_file" || return 1
       rm -f -- "$plan_file" || return 1
       return 0
@@ -1132,7 +1195,7 @@ bandwidth_apply_nodes() {
   updated_at=$(timestamp_iso) || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
   jq -n --argjson pref "$pref" --arg boot_id "$boot_id" --arg updated_at "$updated_at" --argjson interfaces "$interfaces_json" --argjson families "$families_json" \
     --slurpfile actions "$actions_file" \
-    '{schema_version:2,pref:$pref,boot_id:$boot_id,interfaces:$interfaces,families:$families,actions:$actions[0],updated_at:$updated_at}' >"$plan_candidate" || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
+    '{schema_version:3,pref:$pref,boot_id:$boot_id,interfaces:$interfaces,families:$families,actions:$actions[0],updated_at:$updated_at}' >"$plan_candidate" || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
   validate_bandwidth_plan_semantic "$plan_candidate" || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
 
   action_lines=$(jq -c '.[]' "$actions_file") || { rm -f -- "$actions_file" "$plan_candidate"; return 1; }
@@ -1146,7 +1209,7 @@ bandwidth_apply_nodes() {
     return 1
   }
 
-  local interface action kind index cookie limit port direction family family_pref protocol protocol_lines
+  local interface action kind index cookie limit port direction family family_pref protocol protocol_lines match match_start match_end
   while IFS= read -r interface; do
     [[ -n "$interface" ]] || continue
     ensure_clsact "$interface" || {
@@ -1176,19 +1239,24 @@ bandwidth_apply_nodes() {
       kind=$(jq -er '.kind' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
       index=$(jq -er '.index' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
       cookie=$(jq -er '.cookie' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
-      while IFS= read -r family; do
-        [[ -n "$family" ]] || continue
-        family_pref=$(tc_family_pref "$pref" "$family") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
-        protocol_lines=$(jq -r '(.protocols // ["tcp","udp"])[]' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
-        while IFS= read -r protocol; do
-          [[ -n "$protocol" ]] || continue
-          if ! tc_add_flower_rule "$interface" "$direction" "$family" "$protocol" "$port" "$family_pref" "$kind" "$index" "$cookie"; then
-            error "tc 规则创建失败：接口 $interface，$direction，$family/$protocol，端口 $port"
-            bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"
-            return 1
-          fi
-        done <<<"$protocol_lines"
-      done <<<"$family_lines"
+      while IFS= read -r match; do
+        [[ -n "$match" ]] || continue
+        match_start=$(jq -er '.start' <<<"$match") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+        match_end=$(jq -er '.end' <<<"$match") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+        while IFS= read -r family; do
+          [[ -n "$family" ]] || continue
+          family_pref=$(tc_family_pref "$pref" "$family") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+          protocol_lines=$(jq -r '(.protocols // ["tcp","udp"])[]' <<<"$action") || { bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"; return 1; }
+          while IFS= read -r protocol; do
+            [[ -n "$protocol" ]] || continue
+            if ! tc_add_flower_rule_range "$interface" "$direction" "$family" "$protocol" "$match_start" "$match_end" "$family_pref" "$kind" "$index" "$cookie"; then
+              error "tc 规则创建失败：接口 $interface，$direction，$family/$protocol，端口 ${match_start}-${match_end}"
+              bandwidth_apply_candidate_abort "$plan_candidate" "$actions_file"
+              return 1
+            fi
+          done <<<"$protocol_lines"
+        done <<<"$family_lines"
+      done < <(jq -c '.matches[]' <<<"$action")
     done <<<"$action_lines"
   done <<<"$interfaces"
   rm -f -- "$actions_file" "$actions_file.next" "$plan_candidate" \
@@ -1238,14 +1306,15 @@ bandwidth_check_nodes() {
     index=$(jq -er '.index' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
     cookie=$(jq -er '.cookie' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
     protocol_count=$(jq -er '(.protocols // ["tcp","udp"]) | length' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
-    expected_bind=$((interfaces_count * family_count * protocol_count))
+    match_count=$(jq -er '.matches | length' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
+    expected_bind=$((interfaces_count * family_count * protocol_count * match_count))
     if ! entry=$(tc_action_lookup "$kind" "$index"); then rm -f -- "$expected_actions"; return 1; fi
     tc_action_cookie_matches "$entry" "$cookie" || { rm -f -- "$expected_actions"; return 1; }
     bind=$(tc_action_bind_count_from_json "$entry" "$kind" "$index" "$cookie") || { rm -f -- "$expected_actions"; return 1; }
     (( bind == expected_bind )) || { rm -f -- "$expected_actions"; return 1; }
   done <<<"$action_lines"
 
-  local pref interface family family_pref direction rules actions_json owned_count expected_owned port protocol match_count
+  local pref interface family family_pref direction rules actions_json owned_count expected_owned port protocol match_count match match_start match_end
   local plan_family_lines direction_action_lines protocol_lines
   pref=$(jq -er '.pref' "$plan_file") || { rm -f -- "$expected_actions"; return 1; }
   plan_family_lines=$(jq -r '.[]' <<<"$plan_families") || { rm -f -- "$expected_actions"; return 1; }
@@ -1258,20 +1327,24 @@ bandwidth_check_nodes() {
         rules=$(tc_filter_scoped_json "$interface" "$direction" "$family" "$family_pref") || { rm -f -- "$expected_actions"; return 1; }
         actions_json=$(jq -c --arg direction "$direction" '[.[] | select(.direction == $direction)]' "$expected_actions") || { rm -f -- "$expected_actions"; return 1; }
         direction_action_lines=$(jq -c '.[]' <<<"$actions_json") || { rm -f -- "$expected_actions"; return 1; }
-        expected_owned=$(jq -r '[.[] | ((.protocols // ["tcp","udp"]) | length)] | add // 0' <<<"$actions_json") || { rm -f -- "$expected_actions"; return 1; }
+        expected_owned=$(jq -r '[.[] | ((.protocols // ["tcp","udp"]) | length) * (.matches | length)] | add // 0' <<<"$actions_json") || { rm -f -- "$expected_actions"; return 1; }
         owned_count=$(tc_rule_owned_action_count "$rules" "$actions_json") || { rm -f -- "$expected_actions"; return 1; }
         [[ "$owned_count" == "$expected_owned" ]] || { rm -f -- "$expected_actions"; return 1; }
         while IFS= read -r action; do
           [[ -n "$action" ]] || continue
-          port=$(jq -er '.port' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
           kind=$(jq -er '.kind' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
           index=$(jq -er '.index' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
           protocol_lines=$(jq -r '(.protocols // ["tcp","udp"])[]' <<<"$action") || { rm -f -- "$expected_actions"; return 1; }
-          while IFS= read -r protocol; do
-            [[ -n "$protocol" ]] || continue
-            match_count=$(tc_rule_json_match_count "$rules" "$family_pref" "$family" "$protocol" "$direction" "$port" "$kind" "$index") || { rm -f -- "$expected_actions"; return 1; }
-            [[ "$match_count" == 1 ]] || { rm -f -- "$expected_actions"; return 1; }
-          done <<<"$protocol_lines"
+          while IFS= read -r match; do
+            [[ -n "$match" ]] || continue
+            match_start=$(jq -er '.start' <<<"$match") || { rm -f -- "$expected_actions"; return 1; }
+            match_end=$(jq -er '.end' <<<"$match") || { rm -f -- "$expected_actions"; return 1; }
+            while IFS= read -r protocol; do
+              [[ -n "$protocol" ]] || continue
+              match_count=$(tc_rule_json_match_count_range "$rules" "$family_pref" "$family" "$protocol" "$direction" "$match_start" "$match_end" "$kind" "$index") || { rm -f -- "$expected_actions"; return 1; }
+              [[ "$match_count" == 1 ]] || { rm -f -- "$expected_actions"; return 1; }
+            done <<<"$protocol_lines"
+          done < <(jq -c '.matches[]' <<<"$action")
         done <<<"$direction_action_lines"
       done
     done <<<"$plan_family_lines"

@@ -1,0 +1,23 @@
+# Managed by Ss2022
+[Unit]
+Description=Ss2022 read-only subscription service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ss-manager-subscription
+Group=ss-manager-subscription
+ExecStart=/usr/bin/python3 /opt/ss-manager/subscription/ss-manager-subscription.py
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/ss-manager/subscription
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -24,7 +24,7 @@ if [[ -r "$VERSION_FILE" ]]; then
   IFS= read -r MANAGER_VERSION <"$VERSION_FILE" || true
   MANAGER_VERSION=${MANAGER_VERSION//$'\r'/}
 fi
-MANAGER_VERSION="${MANAGER_VERSION:-1.2.0-dev.1}"
+MANAGER_VERSION="${MANAGER_VERSION:-1.3.0-dev.1}"
 [[ "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
   printf 'Invalid manager VERSION: %s\n' "$MANAGER_VERSION" >&2
   exit 1
@@ -46,6 +46,13 @@ TRAFFIC_FILE="$DATA_DIR/traffic.json"
 HISTORY_FILE="$DATA_DIR/traffic-history.json"
 COUNTERS_FILE="$DATA_DIR/tc-counters.json"
 INTERFACES_FILE="$DATA_DIR/interfaces.json"
+PORTHOP_PLAN="$DATA_DIR/port-hopping-plan.json"
+SUBSCRIPTION_CONFIG="$CONFIG_DIR/subscription.json"
+SUBSCRIPTION_DIR="$DATA_DIR/subscription"
+SUBSCRIPTION_EXPORT="$SUBSCRIPTION_DIR/subscription-export.json"
+SUBSCRIPTION_RUNTIME="$SUBSCRIPTION_DIR/subscription-runtime.json"
+SUBSCRIPTION_SERVICE_USER="ss-manager-subscription"
+SUBSCRIPTION_SERVICE_GROUP="ss-manager-subscription"
 TRANSACTION_LOCK="$RUNTIME_DIR/manager.lock"
 STATE_TRANSACTION_DIR="$CONFIG_DIR/state-transaction"
 INSTALL_TRANSACTION_DIR="$CONFIG_DIR/install-transaction"
@@ -55,6 +62,10 @@ SYSTEMD_TRAFFIC_SERVICE="ss-manager-traffic.service"
 SYSTEMD_TRAFFIC_TIMER="ss-manager-traffic.timer"
 OPENRC_DIR="/etc/init.d"
 OPENRC_TRAFFIC_SERVICE="ss-manager-traffic"
+SYSTEMD_PORTHOP_SERVICE="ss-manager-porthop.service"
+OPENRC_PORTHOP_SERVICE="ss-manager-porthop"
+SYSTEMD_SUBSCRIPTION_SERVICE="ss-manager-subscription.service"
+OPENRC_SUBSCRIPTION_SERVICE="ss-manager-subscription"
 
 RED=""
 GREEN=""
@@ -114,6 +125,14 @@ ensure_dir() {
 ensure_runtime_dirs() {
   ensure_dir "$CONFIG_DIR" 700 || return 1
   ensure_dir "$DATA_DIR" 700 || return 1
+  # The optional low-privilege subscription daemon needs traversal to its
+  # derived subdirectory, while all sibling state files remain root-only
+  # regular files.  Keep this parent mode across periodic maintenance runs;
+  # subscription_initialize establishes it when the feature exists.
+  if [[ -d "$SUBSCRIPTION_DIR" && ! -L "$SUBSCRIPTION_DIR" ]]; then
+    chmod 711 -- "$DATA_DIR" || return 1
+    chmod 750 -- "$SUBSCRIPTION_DIR" || return 1
+  fi
   ensure_dir "$RUNTIME_DIR" 700 || return 1
   ensure_dir "$BACKUP_DIR" 700 || return 1
   # Certificates are created lazily for managed TLS nodes. Creating the root
@@ -188,44 +207,52 @@ load_json_or_default() {
 
 initialize_state_files() {
   ensure_runtime_dirs || return 1
-  load_json_or_default "$NODES_FILE" '{"schema_version":4,"nodes":[]}' || return 1
+  load_json_or_default "$NODES_FILE" '{"schema_version":5,"nodes":[]}' || return 1
   load_json_or_default "$TRAFFIC_FILE" '{"schema_version":1,"nodes":{}}' || return 1
   load_json_or_default "$HISTORY_FILE" '{"schema_version":1,"cycles":{}}' || return 1
   load_json_or_default "$INTERFACES_FILE" '{"schema_version":1,"interfaces":[]}' || return 1
   migrate_nodes_schema_if_needed || return 1
 }
 
-# Schema 1 was SS2022-only, schema 2 added VLESS and schema 3 added Hysteria2.
-# Keep accepting all three for validation and backups, but publish schema 4
-# before any menu or transaction operation can edit them. TUIC is part of
-# schema 4. The migration is deliberately lossless: every old field is retained
-# and only the schema/protocol defaults are added.
+# Schema 1 was SS2022-only, schema 2 added VLESS, schema 3 added Hysteria2 and
+# schema 4 added TUIC. Schema 5 adds the common subscription flag and the
+# Hysteria2 port-hopping defaults. Keep accepting every historical schema for
+# validation and backups, but publish schema 5 before any menu or transaction
+# operation can edit it. The migration is deliberately lossless: every old
+# credential, identity and accounting field is retained and only explicit
+# protocol/default fields are added.
 migrate_nodes_schema_if_needed() {
   [[ -f "$NODES_FILE" && ! -L "$NODES_FILE" ]] || return 1
   local schema candidate original candidate_config=''
   local migration_transaction=0 active_status=0 service_was_active=0
   schema=$(jq -er '.schema_version' "$NODES_FILE") || return 1
-  [[ "$schema" == 1 || "$schema" == 2 || "$schema" == 3 ]] || { [[ "$schema" == 4 ]] && return 0; return 1; }
+  [[ "$schema" == 1 || "$schema" == 2 || "$schema" == 3 || "$schema" == 4 ]] || { [[ "$schema" == 5 ]] && return 0; return 1; }
 
   declare -F backup_create_snapshot >/dev/null 2>&1 || {
     error '节点数据库迁移所需的备份模块未加载；未修改节点数据。'
     return 1
   }
-  backup_create_snapshot "schema-${schema}-to-4-migration" >/dev/null || {
+  backup_create_snapshot "schema-${schema}-to-5-migration" >/dev/null || {
     error '旧版节点数据库迁移前自动备份失败；未修改节点数据。'
     return 1
   }
   original=$(runtime_temp_file nodes.schema1-original) || return 1
   install -m 600 -- "$NODES_FILE" "$original" || { rm -f -- "$original"; return 1; }
-  candidate=$(runtime_temp_file nodes.schema4) || { rm -f -- "$original"; return 1; }
+  candidate=$(runtime_temp_file nodes.schema5) || { rm -f -- "$original"; return 1; }
   if [[ "$schema" == 1 ]]; then
-    jq ' .schema_version = 4
-        | .nodes |= map(. + {protocol:"shadowsocks"}) ' "$NODES_FILE" >"$candidate" || {
+    jq ' .schema_version = 5
+        | .nodes |= map(. + {protocol:"shadowsocks",subscription_enabled:true}) ' "$NODES_FILE" >"$candidate" || {
       rm -f -- "$candidate" "$original"
       return 1
     }
   else
-    jq ' .schema_version = 4 ' "$NODES_FILE" >"$candidate" || {
+    jq ' .schema_version = 5
+        | .nodes |= map(
+            . + {subscription_enabled:true}
+            + (if .protocol == "hysteria2" then
+                {port_hopping_enabled:false,hop_port_start:null,hop_port_end:null,hop_interval:"30s"}
+               else {} end)
+          ) ' "$NODES_FILE" >"$candidate" || {
       rm -f -- "$candidate" "$original"
       return 1
     }
@@ -249,7 +276,7 @@ migrate_nodes_schema_if_needed() {
   elif [[ -x "$SING_BOX_BINARY" ]] \
     && declare -F generate_singbox_config >/dev/null 2>&1 \
     && declare -F singbox_check_config >/dev/null 2>&1; then
-    candidate_config=$(runtime_temp_file config.schema4-migration) || {
+    candidate_config=$(runtime_temp_file config.schema5-migration) || {
       rm -f -- "$candidate" "$original"
       return 1
     }
@@ -282,7 +309,7 @@ migrate_nodes_schema_if_needed() {
       error '无法可靠查询 sing-box 原运行状态；节点数据库未迁移。'
       return 1
     fi
-    state_transaction_begin "schema-${schema}-to-4-migration" "$service_was_active" || {
+    state_transaction_begin "schema-${schema}-to-5-migration" "$service_was_active" || {
       rm -f -- "$candidate" "$original" "$candidate_config"
       error '无法建立节点数据库迁移的持久恢复事务；原文件保持不变。'
       return 1
@@ -323,7 +350,7 @@ migrate_nodes_schema_if_needed() {
   fi
   rm -f -- "$candidate" "$original" "$candidate_config" \
     || warn '节点数据库已经迁移，但受保护的运行时候选文件暂未清理；系统重启后 /run 会自动清空。'
-  info "已将旧版节点数据库迁移为 schema 4；Node ID、密钥、证书、流量和限额均保持不变。"
+  info "已将旧版节点数据库迁移为 schema 5；Node ID、密钥、证书、流量和限额均保持不变。"
 }
 
 nodes_schema_upgrade_copy() {
@@ -332,10 +359,18 @@ nodes_schema_upgrade_copy() {
   schema=$(jq -er '.schema_version' "$source") || return 1
   case "$schema" in
     1)
-      jq '.schema_version = 4 | .nodes |= map(. + {protocol:"shadowsocks"})' "$source" >"$destination" || return 1
+      jq '.schema_version = 5 | .nodes |= map(. + {protocol:"shadowsocks",subscription_enabled:true})' "$source" >"$destination" || return 1
       ;;
     2|3|4)
-      jq '.schema_version = 4' "$source" >"$destination" || return 1
+      jq '.schema_version = 5 | .nodes |= map(
+            . + {subscription_enabled:true}
+            + (if .protocol == "hysteria2" then
+                {port_hopping_enabled:false,hop_port_start:null,hop_port_end:null,hop_interval:"30s"}
+               else {} end)
+          )' "$source" >"$destination" || return 1
+      ;;
+    5)
+      jq '.' "$source" >"$destination" || return 1
       ;;
     *) return 1 ;;
   esac
@@ -492,7 +527,13 @@ atomic_json_write() {
   local mode=${3:-600}
   local destination_dir
   destination_dir=$(dirname -- "$destination") || return 1
-  ensure_dir "$destination_dir" 700 || return 1
+  local parent_mode=700
+  if [[ "$destination_dir" == "$DATA_DIR" && -d "$SUBSCRIPTION_DIR" && ! -L "$SUBSCRIPTION_DIR" ]]; then
+    parent_mode=711
+  elif [[ "$destination_dir" == "$SUBSCRIPTION_DIR" ]]; then
+    parent_mode=750
+  fi
+  ensure_dir "$destination_dir" "$parent_mode" || return 1
   jq -e . "$source_file" >/dev/null 2>&1 || { error "拒绝写入无效 JSON：$source_file"; return 1; }
   local temporary
   temporary=$(mktemp "${destination}.tmp.XXXXXXXX") || return 1
@@ -507,7 +548,14 @@ atomic_json_write() {
 atomic_json_from_stdin() {
   local destination=$1
   local mode=${2:-600}
-  ensure_dir "$(dirname -- "$destination")" 700 || return 1
+  local destination_dir parent_mode=700
+  destination_dir=$(dirname -- "$destination") || return 1
+  if [[ "$destination_dir" == "$DATA_DIR" && -d "$SUBSCRIPTION_DIR" && ! -L "$SUBSCRIPTION_DIR" ]]; then
+    parent_mode=711
+  elif [[ "$destination_dir" == "$SUBSCRIPTION_DIR" ]]; then
+    parent_mode=750
+  fi
+  ensure_dir "$destination_dir" "$parent_mode" || return 1
   local temporary
   temporary=$(mktemp "${destination}.tmp.XXXXXXXX") || return 1
   [[ -f "$temporary" && ! -L "$temporary" ]] || { rm -f -- "$temporary"; return 1; }
@@ -672,6 +720,7 @@ PY
 
 validate_manager_state_semantic() {
   local source=$1
+  [[ -f "$source" && ! -L "$source" && -s "$source" ]] || return 1
   jq -e '
     def iso: type == "string" and ((try fromdateiso8601 catch null) != null);
     type == "object" and .schema_version == 1
@@ -711,15 +760,21 @@ validate_manager_state_semantic() {
 
 validate_nodes_file_semantic() {
   local source=$1
+  [[ -f "$source" && ! -L "$source" && -s "$source" ]] || return 1
   jq -e --argjson max "$MAX_SAFE_JSON_INTEGER" '
     def iso: type == "string" and ((try fromdateiso8601 catch null) != null);
     def uint: type == "number" and . >= 0 and . <= $max and floor == .;
     def limit: type == "number" and . >= 0 and . <= 1000000;
     def common_keys: ["address","address_type","created_at","download_limit_mbps","last_reset_at","name","next_reset_at","node_id","port","quota_bytes","reset_day","status","status_reason","updated_at","upload_limit_mbps"];
+    def common_keys_v5: (common_keys + ["subscription_enabled"]);
     def ss_keys: (common_keys + ["method","password","protocol"]);
     def vless_keys: (common_keys + ["flow","protocol","reality_handshake_port","reality_handshake_server","reality_private_key","reality_public_key","reality_server_name","reality_short_id","uuid"]);
     def hysteria2_keys: (common_keys + ["certificate_sha256","password","protocol","tls_server_name"]);
     def tuic_keys: (common_keys + ["auth_timeout","certificate_sha256","congestion_control","heartbeat","password","protocol","tls_server_name","uuid","zero_rtt_handshake"]);
+    def ss_keys_v5: (common_keys_v5 + ["method","password","protocol"]);
+    def vless_keys_v5: (common_keys_v5 + ["flow","protocol","reality_handshake_port","reality_handshake_server","reality_private_key","reality_public_key","reality_server_name","reality_short_id","uuid"]);
+    def hysteria2_keys_v5: (common_keys_v5 + ["certificate_sha256","hop_interval","hop_port_end","hop_port_start","password","port_hopping_enabled","protocol","tls_server_name"]);
+    def tuic_keys_v5: (common_keys_v5 + ["auth_timeout","certificate_sha256","congestion_control","heartbeat","password","protocol","tls_server_name","uuid","zero_rtt_handshake"]);
     def valid_common:
       (.node_id | type == "string" and test("^[a-f0-9]{32}$"))
       and (.name | type == "string" and length >= 1 and length <= 64)
@@ -733,9 +788,10 @@ validate_nodes_file_semantic() {
       and (.upload_limit_mbps | limit) and (.download_limit_mbps | limit)
       and (.created_at | iso) and (.updated_at | iso) and (.last_reset_at | iso) and (.next_reset_at | iso)
       and (.created_at <= .updated_at) and (.last_reset_at < .next_reset_at);
+    def valid_common_v5:
+      (valid_common and (.subscription_enabled | type == "boolean"));
     def valid_vless:
       (.protocol == "vless")
-      and (keys | sort) == (vless_keys | sort)
       and (.uuid | type == "string" and test("^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-8][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$"))
       and (.flow == "xtls-rprx-vision")
       and (.reality_private_key | type == "string" and test("^[A-Za-z0-9_-]{43}$"))
@@ -751,9 +807,21 @@ validate_nodes_file_semantic() {
       and (.password | type == "string" and test("^[A-Za-z0-9_-]{8,128}$"))
       and (.tls_server_name | type == "string" and length >= 1 and length <= 253)
       and (.certificate_sha256 | type == "string" and test("^[a-f0-9]{64}$"));
+    def valid_hysteria2_v5:
+      (.protocol == "hysteria2")
+      and (keys | sort) == (hysteria2_keys_v5 | sort)
+      and (.password | type == "string" and test("^[A-Za-z0-9_-]{8,128}$"))
+      and (.tls_server_name | type == "string" and length >= 1 and length <= 253)
+      and (.certificate_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.port_hopping_enabled | type == "boolean")
+      and (.hop_interval == "30s")
+      and ((.port_hopping_enabled == false and .hop_port_start == null and .hop_port_end == null)
+        or (.port_hopping_enabled == true
+          and (.hop_port_start | type == "number" and floor == . and . >= 1 and . <= 65535)
+          and (.hop_port_end | type == "number" and floor == . and . >= 1 and . <= 65535)
+          and (.hop_port_start <= .hop_port_end)));
     def valid_tuic:
       (.protocol == "tuic")
-      and (keys | sort) == (tuic_keys | sort)
       and (.uuid | type == "string" and test("^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-8][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$"))
       and (.password | type == "string" and test("^[A-Za-z0-9_-]{8,128}$"))
       and (.congestion_control == "bbr")
@@ -774,9 +842,9 @@ validate_nodes_file_semantic() {
           (keys | sort) == (ss_keys | sort)
           and (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm")
           and (.password | type == "string")
-        elif .protocol == "vless" then valid_vless
+        elif .protocol == "vless" then (keys | sort) == (vless_keys | sort) and valid_vless
         elif .protocol == "hysteria2" then valid_hysteria2
-        elif .protocol == "tuic" then valid_tuic
+        elif .protocol == "tuic" then (keys | sort) == (tuic_keys | sort) and valid_tuic
         else false end))
         and (if .schema_version == 2 then
                all(.nodes[]; .protocol == "shadowsocks" or .protocol == "vless")
@@ -784,6 +852,20 @@ validate_nodes_file_semantic() {
                all(.nodes[]; .protocol != "tuic")
              else true end)
       ))
+      or ((.schema_version == 5) and (.nodes | type == "array")
+        and all(.nodes[]; valid_common_v5 and (if .protocol == "shadowsocks" then
+          (keys | sort) == (ss_keys_v5 | sort)
+          and (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm")
+          and (.password | type == "string")
+        elif .protocol == "vless" then
+          (keys | sort) == (vless_keys_v5 | sort)
+          and valid_vless
+        elif .protocol == "hysteria2" then valid_hysteria2_v5
+        elif .protocol == "tuic" then
+          (keys | sort) == (tuic_keys_v5 | sort)
+          and valid_tuic
+        else false end))
+      )
     and ([.nodes[].node_id] | length == (unique | length))
     and ([.nodes[].name | ascii_downcase] | length == (unique | length))
     and ([.nodes[].port] | length == (unique | length))
@@ -845,6 +927,10 @@ validate_nodes_file_semantic() {
 
 validate_traffic_file_semantic() {
   local source=$1 nodes_source=${2:-}
+  [[ -f "$source" && ! -L "$source" && -s "$source" ]] || return 1
+  if [[ -n "$nodes_source" ]]; then
+    [[ -f "$nodes_source" && ! -L "$nodes_source" && -s "$nodes_source" ]] || return 1
+  fi
   jq -e --argjson max "$MAX_SAFE_JSON_INTEGER" '
     def iso: type == "string" and ((try fromdateiso8601 catch null) != null);
     def uint: type == "number" and . >= 0 and . <= $max and floor == .;
@@ -871,6 +957,7 @@ validate_traffic_file_semantic() {
 
 validate_history_file_semantic() {
   local source=$1
+  [[ -f "$source" && ! -L "$source" && -s "$source" ]] || return 1
   # Keep the escapes as JSON escapes for jq regex.  Doubling the
   # backslashes makes the character class range from `\\` to `u`, which
   # rejects ordinary names (for example, `alpine-renamed`) as if they
@@ -909,6 +996,7 @@ validate_history_file_semantic() {
 
 validate_interfaces_file_semantic() {
   local source=$1
+  [[ -f "$source" && ! -L "$source" && -s "$source" ]] || return 1
   jq -e '
     .schema_version == 1 and (.interfaces | type == "array")
     and all(.interfaces[]; type == "string" and test("^[A-Za-z0-9_.-]{1,15}$"))
@@ -918,9 +1006,11 @@ validate_interfaces_file_semantic() {
 
 validate_bandwidth_plan_semantic() {
   local source=$1
+  [[ -f "$source" && ! -L "$source" && -s "$source" ]] || return 1
   jq -e '
     def iso: type == "string" and ((try fromdateiso8601 catch null) != null);
-    .schema_version == 2
+    (.schema_version) as $schema
+    | ($schema == 2 or $schema == 3)
     and (.pref | type == "number" and floor == . and . >= 100 and . <= 65500)
     and (.boot_id == "unknown" or (.boot_id | type == "string" and test("^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$")))
     and (.interfaces | type == "array")
@@ -937,6 +1027,12 @@ validate_bandwidth_plan_semantic() {
       (.node_id | type == "string" and test("^[a-f0-9]{32}$"))
       and (.direction == "ingress" or .direction == "egress")
       and (.port | type == "number" and floor == . and . >= 1 and . <= 65535)
+      and (if $schema == 2 then true else
+        (.matches | type == "array" and length >= 1
+          and all(.[]; (.start | type == "number" and floor == . and . >= 1 and . <= 65535)
+            and (.end | type == "number" and floor == . and . >= 1 and . <= 65535)
+            and (.start <= .end)))
+      end)
       and (.kind == "gact" or .kind == "police")
       and (.index | type == "number" and floor == . and . > 0 and . <= 4294967295)
       and (.cookie | type == "string" and test("^[a-f0-9]{32}$"))
@@ -961,7 +1057,9 @@ validate_bandwidth_plan_against_state() {
         . as $direction
         | [ $plan.actions[] | select(.node_id == $node.node_id and .direction == $direction) ] as $matches
         | ($matches | length) == 1
-        and ($matches[0].port == $node.port)
+        and (if $plan.schema_version == 2 then $matches[0].port == $node.port else
+          any($matches[0].matches[]; .start <= $node.port and .end >= $node.port)
+        end)
         and (($matches[0].protocols // ["tcp","udp"]) ==
           (if ($node.protocol // "shadowsocks") == "vless" then ["tcp"]
            elif ($node.protocol == "hysteria2" or $node.protocol == "tuic") then ["udp"]

@@ -45,7 +45,7 @@ INSTALL_TRANSACTION_DIR="$CONFIG_DIR/install-transaction"
 SING_BOX_CONFIG="$TEST_TMP/sing-box.json"
 mkdir -p -- "$CONFIG_DIR" "$DATA_DIR" "$RUNTIME_DIR" "$BACKUP_DIR"
 printf '%s\n' '{"listen_mode":"ipv4","tfo_config_supported":false,"tfo_kernel_enabled":false}' >"$MANAGER_STATE"
-printf '%s\n' '{"schema_version":4,"nodes":[]}' >"$NODES_FILE"
+printf '%s\n' '{"schema_version":5,"nodes":[]}' >"$NODES_FILE"
 printf '%s\n' '{"schema_version":1,"nodes":{}}' >"$TRAFFIC_FILE"
 printf '%s\n' '{"schema_version":1,"cycles":{}}' >"$HISTORY_FILE"
 printf '%s\n' '{"schema_version":1,"interfaces":["eth0"]}' >"$INTERFACES_FILE"
@@ -239,7 +239,7 @@ if validate_tls_certificate_state "$NODES_FILE.bad" "$candidate_certs"; then fai
   jq -n --arg version "$MANAGER_VERSION" \
     '{schema_version:1,artifact:"ss2022-state-snapshot",reason:"pre-tls",created_at:"2026-08-15T00:00:00Z",manager_version:$version,sing_box_version:""}' \
     >"$selected/metadata.json"
-  printf '%s\n' '{"schema_version":4,"nodes":[]}' >"$selected/nodes.json"
+  printf '%s\n' '{"schema_version":5,"nodes":[]}' >"$selected/nodes.json"
   printf '%s\n' '{"schema_version":1,"nodes":{}}' >"$selected/traffic.json"
   printf '%s\n' '{"schema_version":1,"cycles":{}}' >"$selected/traffic-history.json"
   backup_list() { printf '%s\n' "$backup_name"; }

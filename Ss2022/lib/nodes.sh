@@ -514,7 +514,7 @@ node_new_record() {
     --argjson reset_day "$DEFAULT_RESET_DAY" \
     --argjson upload_limit "$DEFAULT_UPLOAD_LIMIT_MBPS" \
     --argjson download_limit "$DEFAULT_DOWNLOAD_LIMIT_MBPS" \
-    '. as $password | {node_id:$node_id,name:$name,protocol:"shadowsocks",method:$method,password:$password,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}'
+    '. as $password | {node_id:$node_id,name:$name,protocol:"shadowsocks",method:$method,password:$password,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",subscription_enabled:true,quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}'
 }
 
 node_new_vless_record() {
@@ -546,7 +546,7 @@ node_new_vless_record() {
     --argjson download_limit "$DEFAULT_DOWNLOAD_LIMIT_MBPS" \
     'split("\n") as $credentials
       | if ($credentials | length) != 3 then error("invalid VLESS credential record") else
-          {node_id:$node_id,name:$name,protocol:"vless",uuid:$credentials[1],flow:"xtls-rprx-vision",reality_private_key:$credentials[0],reality_public_key:$public_key,reality_short_id:$credentials[2],reality_server_name:$server_name,reality_handshake_server:$handshake_server,reality_handshake_port:$handshake_port,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}
+          {node_id:$node_id,name:$name,protocol:"vless",uuid:$credentials[1],flow:"xtls-rprx-vision",reality_private_key:$credentials[0],reality_public_key:$public_key,reality_short_id:$credentials[2],reality_server_name:$server_name,reality_handshake_server:$handshake_server,reality_handshake_port:$handshake_port,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",subscription_enabled:true,quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}
         end'
 }
 
@@ -571,7 +571,7 @@ node_new_hysteria2_record() {
     --argjson reset_day "$DEFAULT_RESET_DAY" \
     --argjson upload_limit "$DEFAULT_UPLOAD_LIMIT_MBPS" \
     --argjson download_limit "$DEFAULT_DOWNLOAD_LIMIT_MBPS" \
-    '. as $password | {node_id:$node_id,name:$name,protocol:"hysteria2",password:$password,tls_server_name:$server_name,certificate_sha256:$pin,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}'
+    '. as $password | {node_id:$node_id,name:$name,protocol:"hysteria2",password:$password,tls_server_name:$server_name,certificate_sha256:$pin,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",subscription_enabled:true,port_hopping_enabled:false,hop_port_start:null,hop_port_end:null,hop_interval:"30s",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}'
 }
 
 node_new_tuic_record() {
@@ -598,7 +598,7 @@ node_new_tuic_record() {
     --argjson download_limit "$DEFAULT_DOWNLOAD_LIMIT_MBPS" \
     'split("\n") as $credentials
       | if ($credentials | length) != 2 then error("invalid TUIC credential record") else
-          {node_id:$node_id,name:$name,protocol:"tuic",uuid:$credentials[0],password:$credentials[1],congestion_control:"bbr",auth_timeout:"3s",zero_rtt_handshake:false,heartbeat:"10s",tls_server_name:$server_name,certificate_sha256:$pin,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}
+          {node_id:$node_id,name:$name,protocol:"tuic",uuid:$credentials[0],password:$credentials[1],congestion_control:"bbr",auth_timeout:"3s",zero_rtt_handshake:false,heartbeat:"10s",tls_server_name:$server_name,certificate_sha256:$pin,port:$port,address:$address,address_type:$address_type,status:"enabled",status_reason:"",subscription_enabled:true,quota_bytes:$quota,reset_day:$reset_day,upload_limit_mbps:$upload_limit,download_limit_mbps:$download_limit,created_at:$now,updated_at:$now,last_reset_at:$reset_at,next_reset_at:$next_reset}
         end'
 }
 
@@ -817,6 +817,13 @@ node_show_detail() {
       "$(jq -er '.password' <<<"$node")" \
       "$(jq -er '.tls_server_name' <<<"$node")" \
       "$(jq -er '.certificate_sha256' <<<"$node")" "$cert_start" "$cert_end"
+    if [[ "$(jq -r '.port_hopping_enabled // false' <<<"$node")" == true ]]; then
+      printf '端口跳跃：已开启\n跳跃范围：UDP %s-%s\n跳跃间隔：%s\n' \
+        "$(jq -er '.hop_port_start' <<<"$node")" "$(jq -er '.hop_port_end' <<<"$node")" \
+        "$(jq -er '.hop_interval' <<<"$node")"
+    else
+      printf '端口跳跃：关闭\n'
+    fi
     if ! openssl x509 -in "$cert_path" -checkend $((30 * 86400)) -noout >/dev/null 2>&1; then
       warn 'Hysteria2 证书将在 30 天内到期；项目不会自动轮换，请手动确认是否重新生成。'
     fi

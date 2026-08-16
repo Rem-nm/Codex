@@ -245,7 +245,7 @@ service_remove_managed_definition() {
 check_manager_maintenance_service_files() {
   local source destination unit presence_status
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    for unit in "$SYSTEMD_TRAFFIC_SERVICE" "$SYSTEMD_TRAFFIC_TIMER"; do
+    for unit in "$SYSTEMD_TRAFFIC_SERVICE" "$SYSTEMD_TRAFFIC_TIMER" "$SYSTEMD_PORTHOP_SERVICE"; do
       destination=$(service_definition_path "$unit") || return 1
       if service_definition_path_present "$unit" && ! service_definition_is_managed "$unit"; then
         die "$destination 已存在且不是本项目创建，拒绝静默覆盖。"
@@ -260,14 +260,20 @@ check_manager_maintenance_service_files() {
       [[ -f "$source" && ! -L "$source" ]] || die "缺少常规 systemd 模板或模板为符号链接：$source"
     done
   else
-    destination=$(service_definition_path "$OPENRC_TRAFFIC_SERVICE") || return 1
-    if service_definition_path_present "$OPENRC_TRAFFIC_SERVICE" && ! service_definition_is_managed "$OPENRC_TRAFFIC_SERVICE"; then
-      die "$destination 已存在且不是本项目创建，拒绝静默覆盖。"
-    fi
-    source="$PROGRAM_DIR/openrc/$OPENRC_TRAFFIC_SERVICE"
-    [[ -f "$source" && ! -L "$source" ]] || die "缺少常规 OpenRC 模板或模板为符号链接：$source"
+    local -a openrc_units=("$OPENRC_TRAFFIC_SERVICE" "$OPENRC_PORTHOP_SERVICE")
+    local unit
+    for unit in "${openrc_units[@]}"; do
+      destination=$(service_definition_path "$unit") || return 1
+      if service_definition_path_present "$unit" && ! service_definition_is_managed "$unit"; then
+        die "$destination 已存在且不是本项目创建，拒绝静默覆盖。"
+      fi
+      source="$PROGRAM_DIR/openrc/$unit"
+      [[ -f "$source" && ! -L "$source" ]] || die "缺少常规 OpenRC 模板或模板为符号链接：$source"
+    done
     [[ -f "$PROGRAM_DIR/openrc/ss-manager-traffic-loop.sh" && ! -L "$PROGRAM_DIR/openrc/ss-manager-traffic-loop.sh" \
       && -x "$PROGRAM_DIR/openrc/ss-manager-traffic-loop.sh" ]] || die '缺少常规 OpenRC 流量维护循环或文件为符号链接。'
+    [[ -f "$PROGRAM_DIR/openrc/ss-manager-porthop-loop.sh" && ! -L "$PROGRAM_DIR/openrc/ss-manager-porthop-loop.sh" \
+      && -x "$PROGRAM_DIR/openrc/ss-manager-porthop-loop.sh" ]] || die '缺少常规 OpenRC 端口跳跃维护循环或文件为符号链接。'
   fi
 }
 
@@ -275,43 +281,71 @@ install_manager_maintenance_service_files() {
   local source destination unit
   check_manager_maintenance_service_files
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    for unit in "$SYSTEMD_TRAFFIC_SERVICE" "$SYSTEMD_TRAFFIC_TIMER"; do
+    for unit in "$SYSTEMD_TRAFFIC_SERVICE" "$SYSTEMD_TRAFFIC_TIMER" "$SYSTEMD_PORTHOP_SERVICE"; do
       destination=$(service_definition_path "$unit") || return 1
       source="$PROGRAM_DIR/systemd/$unit"
       atomic_file_write "$source" "$destination" 644 755 || return 1
     done
   else
-    destination=$(service_definition_path "$OPENRC_TRAFFIC_SERVICE") || return 1
-    source="$PROGRAM_DIR/openrc/$OPENRC_TRAFFIC_SERVICE"
-    atomic_file_write "$source" "$destination" 755 755 || return 1
+    for unit in "$OPENRC_TRAFFIC_SERVICE" "$OPENRC_PORTHOP_SERVICE"; do
+      destination=$(service_definition_path "$unit") || return 1
+      source="$PROGRAM_DIR/openrc/$unit"
+      atomic_file_write "$source" "$destination" 755 755 || return 1
+    done
   fi
   service_manager_reload || return 1
 }
 
 enable_manager_maintenance_service() {
-  local name active_status=0 enabled_status=0
+  local name active_status enabled_status
+  local -a names=()
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    name=$SYSTEMD_TRAFFIC_TIMER
+    names=("$SYSTEMD_TRAFFIC_TIMER" "$SYSTEMD_PORTHOP_SERVICE")
   else
-    name=$OPENRC_TRAFFIC_SERVICE
+    names=("$OPENRC_TRAFFIC_SERVICE" "$OPENRC_PORTHOP_SERVICE")
   fi
-  service_enable "$name" >/dev/null || return 1
-  service_is_enabled "$name" || enabled_status=$?
-  (( enabled_status == 0 )) || return 1
-  service_is_active "$name" || active_status=$?
-  (( active_status != 2 )) || return 1
-  if (( active_status == 1 )); then
-    service_start "$name" >/dev/null || return 1
-    active_status=0
+  for name in "${names[@]}"; do
+    enabled_status=0; active_status=0
+    service_enable "$name" >/dev/null || return 1
+    service_is_enabled "$name" || enabled_status=$?
+    (( enabled_status == 0 )) || return 1
+    # install.sh holds the manager lock while it publishes the complete
+    # installation transaction.  Starting the one-shot port-hop unit
+    # synchronously here would make systemd wait for a process that is itself
+    # waiting for this lock.  The installer starts it immediately after
+    # releasing the lock; normal menu/boot calls keep the strict active check.
+    if [[ "$name" == "$SYSTEMD_PORTHOP_SERVICE" || "$name" == "$OPENRC_PORTHOP_SERVICE" ]] \
+      && [[ "${SS_MANAGER_DEFER_PORTHOP_START:-0}" == 1 ]]; then
+      continue
+    fi
     service_is_active "$name" || active_status=$?
-    (( active_status == 0 )) || return 1
+    (( active_status != 2 )) || return 1
+    if (( active_status == 1 )); then
+      service_start "$name" >/dev/null || return 1
+      active_status=0
+      service_is_active "$name" || active_status=$?
+      (( active_status == 0 )) || return 1
+    fi
+  done
+}
+
+start_deferred_port_hopping_service() {
+  local name
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    name="$SYSTEMD_PORTHOP_SERVICE"
+  else
+    name="$OPENRC_PORTHOP_SERVICE"
   fi
+  service_is_enabled "$name" || return 0
+  service_is_active "$name" && return 0
+  service_start "$name" >/dev/null || return 1
+  service_is_active "$name"
 }
 
 remove_manager_maintenance_service_files() {
   local name active_status enabled_status presence_status
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    for name in "$SYSTEMD_TRAFFIC_TIMER" "$SYSTEMD_TRAFFIC_SERVICE"; do
+    for name in "$SYSTEMD_TRAFFIC_TIMER" "$SYSTEMD_PORTHOP_SERVICE" "$SYSTEMD_TRAFFIC_SERVICE"; do
       if ! service_definition_path_present "$name"; then
         presence_status=0
         service_exists "$name" || presence_status=$?
@@ -342,14 +376,15 @@ remove_manager_maintenance_service_files() {
       service_remove_managed_definition "$name" || return 1
     done
   else
-    name=$OPENRC_TRAFFIC_SERVICE
+    local -a openrc_units=("$OPENRC_PORTHOP_SERVICE" "$OPENRC_TRAFFIC_SERVICE")
+    for name in "${openrc_units[@]}"; do
     if ! service_definition_path_present "$name"; then
       presence_status=0
       service_exists "$name" || presence_status=$?
       (( presence_status != 2 )) || { error "无法可靠查询同名服务是否存在：$name"; return 1; }
       (( presence_status != 0 )) || { error "检测到同名但不受 Ss2022 管理的服务：$name"; return 1; }
       service_manager_reload >/dev/null 2>&1 || return 1
-      return 0
+      continue
     fi
     service_definition_is_managed "$name" \
       || { error "拒绝停止或删除不受 Ss2022 管理的服务：$name"; return 1; }
@@ -372,6 +407,7 @@ remove_manager_maintenance_service_files() {
       (( enabled_status == 1 )) || return 1
     fi
     service_remove_managed_definition "$name" || return 1
+    done
   fi
   service_manager_reload >/dev/null 2>&1 || return 1
 }

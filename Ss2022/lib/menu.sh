@@ -149,6 +149,78 @@ node_delete_flow() {
   return "$transaction_status"
 }
 
+node_port_hopping_modify_locked() {
+  local node_id=$1 node node_hop range_line range_start range_end choice
+  local candidate_nodes candidate_traffic candidate_history changed=0
+  node=$(node_by_id "$node_id") || { error '节点不存在。'; return 1; }
+  [[ "$(node_protocol "$node")" == hysteria2 ]] || { error '只有 Hysteria2 节点支持 UDP 端口跳跃。'; return 1; }
+  node_hop=$(jq -r '.port_hopping_enabled // false' <<<"$node") || return 1
+  printf '\nHysteria2 端口跳跃\n\n'
+  if [[ "$node_hop" == true ]]; then
+    printf '状态：已开启\n实际端口：%s / UDP\n跳跃范围：%s-%s / UDP\n跳跃间隔：%s\n\n1. 修改跳跃端口范围\n2. 关闭端口跳跃\n0. 返回\n> ' \
+      "$(jq -er '.port' <<<"$node")" "$(jq -er '.hop_port_start' <<<"$node")" \
+      "$(jq -er '.hop_port_end' <<<"$node")" "$(jq -er '.hop_interval' <<<"$node")"
+    IFS= read -r choice || return 1
+    case "$choice" in
+      1) range_line=$(read_nonempty '请输入 UDP 跳跃端口范围（格式：20000-50000）：') || return 1
+         range_line=$(port_hopping_parse_range "$range_line") || {
+           error '端口范围格式无效；只接受 1-65535 的十进制 start-end。'; return 1;
+         }
+         IFS=$'\t' read -r range_start range_end <<<"$range_line"
+         changed=1 ;;
+      2) changed=1 ;;
+      0) return 0 ;;
+      *) warn '无效选项。'; return 0 ;;
+    esac
+  else
+    printf '状态：关闭\n实际端口：%s / UDP\n\n1. 开启端口跳跃\n0. 返回\n> ' "$(jq -er '.port' <<<"$node")"
+    IFS= read -r choice || return 1
+    case "$choice" in
+      1) range_line=$(read_nonempty '请输入 UDP 跳跃端口范围（格式：20000-50000）：') || return 1
+         range_line=$(port_hopping_parse_range "$range_line") || {
+           error '端口范围格式无效；只接受 1-65535 的十进制 start-end。'; return 1;
+         }
+         IFS=$'\t' read -r range_start range_end <<<"$range_line"
+         changed=1 ;;
+      0) return 0 ;;
+      *) warn '无效选项。'; return 0 ;;
+    esac
+  fi
+  (( changed == 1 )) || return 0
+  prepare_state_candidate_paths porthop candidate_nodes candidate_traffic candidate_history \
+    || return 1
+  # Seed the temporary candidates from committed state before changing HY2
+  # metadata; the helper only allocates empty private files.
+  install -m 600 -- "$NODES_FILE" "$candidate_nodes" \
+    || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 1; }
+  install -m 600 -- "$TRAFFIC_FILE" "$candidate_traffic" \
+    || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 1; }
+  install -m 600 -- "$HISTORY_FILE" "$candidate_history" \
+    || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 1; }
+  if [[ "$choice" == 2 && "$node_hop" == true ]]; then
+    jq --arg id "$node_id" '.nodes[] |= if .node_id == $id then .port_hopping_enabled=false | .hop_port_start=null | .hop_port_end=null | .updated_at=(now|todateiso8601) else . end' \
+      "$candidate_nodes" >"$candidate_nodes.next" || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 1; }
+  else
+    jq --arg id "$node_id" --argjson start "$range_start" --argjson finish "$range_end" \
+      '.nodes[] |= if .node_id == $id then .port_hopping_enabled=true | .hop_port_start=$start | .hop_port_end=$finish | .hop_interval="30s" | .updated_at=(now|todateiso8601) else . end' \
+      "$candidate_nodes" >"$candidate_nodes.next" || { rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"; return 1; }
+  fi
+  mv -f -- "$candidate_nodes.next" "$candidate_nodes"
+  if port_hopping_apply_state_transaction "$candidate_nodes" "$candidate_traffic" "$candidate_history" "port-hop-$node_id" 1; then
+    if [[ "$choice" == 2 && "$node_hop" == true ]]; then
+      success 'Hysteria2 端口跳跃已关闭。'
+    else
+      success "Hysteria2 端口跳跃已启用，范围：${range_start}-${range_end} / UDP。"
+      printf '请自行确认云安全组和外部防火墙已放行 UDP %s-%s。\n' "$range_start" "$range_end"
+    fi
+  else
+    error 'Hysteria2 端口跳跃修改失败，已自动恢复上一版本配置和规则。'
+    rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"
+    return 1
+  fi
+  rm -f -- "$candidate_nodes" "$candidate_traffic" "$candidate_history"
+}
+
 node_modify_flow() {
   acquire_manager_lock
   local node_id node field action protocol requested name method port address_line address address_type password quota_gb quota reset_day upload_limit download_limit candidate_nodes candidate_traffic candidate_history traffic_source changed=0 show_credentials_after=0 candidate_certs=''
@@ -162,7 +234,7 @@ node_modify_flow() {
   elif [[ "$protocol" == vless ]]; then
     printf '1. 名称\n2. 端口\n3. 节点地址\n4. Reality Server Name / SNI\n5. Reality 握手目标\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n9. 重新生成 UUID\n10. 重新生成 Reality KeyPair\n11. 重新生成 Short ID\n0. 返回\n> '
   elif [[ "$protocol" == hysteria2 ]]; then
-    printf '1. 名称\n2. 端口\n3. 节点地址\n4. 修改密码\n5. 重新生成自签名证书\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n0. 返回\n> '
+    printf '1. 名称\n2. 端口\n3. 节点地址\n4. 修改密码\n5. 重新生成自签名证书\n6. 端口跳跃设置\n7. 月流量限额\n8. 流量重置日\n9. 上传/下载限速\n0. 返回\n> '
   else
     printf '1. 名称\n2. 端口\n3. 节点地址\n4. 重新生成 UUID / Password\n5. 重新生成自签名证书\n6. 月流量限额\n7. 流量重置日\n8. 上传/下载限速\n0. 返回\n> '
   fi
@@ -183,7 +255,7 @@ node_modify_flow() {
   elif [[ "$protocol" == hysteria2 ]]; then
     case "$field" in
       1) field=name ;; 2) field=port ;; 3) field=address ;; 4) field=hy2-password ;;
-      5) field=hy2-cert ;; 6) field=quota ;; 7) field=reset ;; 8) field=bandwidth ;;
+      5) field=hy2-cert ;; 6) field=hy2-hop ;; 7) field=quota ;; 8) field=reset ;; 9) field=bandwidth ;;
       0) return 0 ;; *) warn '无效选项。'; return 0 ;;
     esac
   else
@@ -192,6 +264,10 @@ node_modify_flow() {
       5) field=tuic-cert ;; 6) field=quota ;; 7) field=reset ;; 8) field=bandwidth ;;
       0) return 0 ;; *) warn '无效选项。'; return 0 ;;
     esac
+  fi
+  if [[ "$field" == hy2-hop ]]; then
+    node_port_hopping_modify_locked "$node_id"
+    return $?
   fi
   prepare_state_candidate_paths modify candidate_nodes candidate_traffic candidate_history \
     || die '无法创建修改事务候选文件。'
@@ -617,6 +693,158 @@ singbox_restart_action() {
   singbox_health_check "$NODES_FILE" || die '重启后健康检查未通过。'
 }
 
+subscription_show_nodes() {
+  local node
+  printf '\n订阅节点（可切换加入状态）：\n'
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    printf '%s\t%s\t%s\t订阅=%s\n' \
+      "$(jq -er '.name' <<<"$node")" \
+      "$(protocol_label "$(node_protocol "$node")")" \
+      "$(status_label "$(jq -er '.status' <<<"$node")")" \
+      "$(jq -r 'if .subscription_enabled then "是" else "否" end' <<<"$node")"
+  done < <(jq -c '.nodes[] | select(true)' "$NODES_FILE")
+}
+
+subscription_toggle_nodes_action() {
+  acquire_manager_lock
+  local node_id node current candidate old_nodes new_value
+  select_node_for_flow node_id '请选择要切换订阅开关的节点' || return 0
+  node=$(node_by_id "$node_id") || die '无法读取所选节点。'
+  current=$(jq -r '.subscription_enabled | if type == "boolean" then tostring else empty end' <<<"$node") || die '节点订阅字段无效。'
+  [[ "$current" == true || "$current" == false ]] || die '节点订阅字段无效。'
+  if [[ "$current" == true ]]; then new_value=false; else new_value=true; fi
+  old_nodes=$(runtime_temp_file subscription-old-nodes) || return 1
+  install -m 600 -- "$NODES_FILE" "$old_nodes" || return 1
+  candidate=$(runtime_temp_file subscription-nodes) || { rm -f -- "$old_nodes"; return 1; }
+  jq --arg id "$node_id" --argjson value "$new_value" \
+    '.nodes[] |= if .node_id == $id then .subscription_enabled=$value | .updated_at=(now|todateiso8601) else . end' \
+    "$NODES_FILE" >"$candidate" || { rm -f -- "$old_nodes" "$candidate"; return 1; }
+  validate_nodes_file_semantic "$candidate" || { rm -f -- "$old_nodes" "$candidate"; return 1; }
+  atomic_json_write "$candidate" "$NODES_FILE" 600 || { rm -f -- "$old_nodes" "$candidate"; return 1; }
+  if ! subscription_publish_export "$NODES_FILE"; then
+    atomic_json_write "$old_nodes" "$NODES_FILE" 600 || true
+    rm -f -- "$old_nodes" "$candidate"
+    die '订阅派生输出更新失败，节点订阅开关已恢复。'
+  fi
+  rm -f -- "$old_nodes" "$candidate"
+  success "节点订阅开关已切换为：$new_value（未重启 sing-box，未修改 tc/NAT）。"
+}
+
+subscription_all_toggle_action() {
+  local value=$1
+  acquire_manager_lock
+  if [[ "$value" == false ]]; then prompt_yes_no '确认将全部节点移出订阅？节点仍会继续运行。' n || return 0; fi
+  local candidate
+  candidate=$(runtime_temp_file subscription-all-nodes) || return 1
+  jq --argjson value "$value" '.nodes |= map(.subscription_enabled=$value | .updated_at=(now|todateiso8601))' "$NODES_FILE" >"$candidate" || return 1
+  validate_nodes_file_semantic "$candidate" || { rm -f -- "$candidate"; return 1; }
+  atomic_json_write "$candidate" "$NODES_FILE" 600 || { rm -f -- "$candidate"; return 1; }
+  subscription_publish_export "$NODES_FILE" || die '订阅派生输出更新失败；节点数据已保留，请执行重建。'
+  rm -f -- "$candidate"
+  success '订阅节点范围已更新。'
+}
+
+subscription_rebuild_action() {
+  acquire_manager_lock
+  subscription_publish_export "$NODES_FILE" || die '订阅派生输出重建失败。'
+  success '订阅派生输出已重建。'
+}
+
+subscription_show_url_action() {
+  subscription_validate_settings_file "$SUBSCRIPTION_CONFIG" || die '订阅设置无效。'
+  local enabled url count skipped
+  enabled=$(jq -r '.enabled' "$SUBSCRIPTION_CONFIG") || return 1
+  url=$(subscription_url) || die '订阅 Token 尚未生成，请先启用订阅服务。'
+  count=$(jq -er '[.nodes[] | select(.subscription_enabled == true and .status == "enabled")] | length' "$NODES_FILE") || return 1
+  skipped=$(jq -er '[.nodes[] | select(.subscription_enabled != true or .status != "enabled")] | length' "$NODES_FILE") || return 1
+  printf '订阅状态：%s\n订阅地址（Bearer 凭据，请勿写入日志）：%s\n订阅节点：%s\n跳过节点：%s\n' \
+    "$(if [[ "$enabled" == true ]]; then printf 已启用; else printf 已停用; fi)" "$url" "$count" "$skipped"
+  printf 'Raw：%s/raw\nBase64：%s/base64\nsing-box：%s/sing-box\n' "$url" "$url" "$url"
+}
+
+subscription_qr_action() {
+  local url
+  url=$(subscription_url) || die '订阅 Token 尚未生成，请先启用订阅服务。'
+  printf '二维码包含完整订阅 Bearer 地址，获得它的人可以读取全部节点凭据。\n'
+  if command -v qrencode >/dev/null 2>&1; then
+    printf '%s' "$url" | qrencode -t UTF8 -m 1 || warn '订阅二维码生成失败；订阅地址仍可复制。'
+  else
+    warn '系统没有 qrencode，无法在终端显示二维码。'
+  fi
+}
+
+subscription_rotate_action() {
+  acquire_manager_lock
+  prompt_yes_no '确认重新生成订阅 Token？旧订阅地址会立即失效。' n || return 0
+  local enabled url port
+  enabled=$(jq -r '.enabled' "$SUBSCRIPTION_CONFIG") || return 1
+  url=$(jq -r '.public_base_url // empty' "$SUBSCRIPTION_CONFIG") || return 1
+  port=$(jq -er '.listen_port' "$SUBSCRIPTION_CONFIG") || return 1
+  subscription_update_settings "$enabled" "$url" "$port" true || die '订阅 Token 轮换失败。'
+  success '订阅 Token 已轮换；旧地址已失效。'
+}
+
+subscription_settings_action() {
+  acquire_manager_lock
+  local url port enabled
+  url=$(jq -r '.public_base_url // empty' "$SUBSCRIPTION_CONFIG") || return 1
+  port=$(jq -er '.listen_port' "$SUBSCRIPTION_CONFIG") || return 1
+  printf '请输入订阅公网基础地址（留空清除，仅允许 http/https://host[:port]）：\n当前：%s\n> ' "$url"
+  IFS= read -r url || die '读取输入失败。'
+  url=$(trim_spaces "$url")
+  printf '请输入本地监听端口（当前 %s）：\n> ' "$port"
+  IFS= read -r port || die '读取输入失败。'
+  [[ -n "$port" ]] || port=$(jq -er '.listen_port' "$SUBSCRIPTION_CONFIG")
+  enabled=$(jq -r '.enabled' "$SUBSCRIPTION_CONFIG") || return 1
+  subscription_update_settings "$enabled" "$url" "$port" false || die '订阅设置更新失败。'
+  success '订阅设置已更新。'
+}
+
+subscription_enable_disable_action() {
+  acquire_manager_lock
+  local enabled url port
+  enabled=$(jq -r '.enabled' "$SUBSCRIPTION_CONFIG") || return 1
+  url=$(jq -r '.public_base_url // empty' "$SUBSCRIPTION_CONFIG") || return 1
+  port=$(jq -er '.listen_port' "$SUBSCRIPTION_CONFIG") || return 1
+  if [[ "$enabled" == true ]]; then
+    subscription_update_settings false "$url" "$port" false || die '订阅服务停用失败。'
+  else
+    [[ -n "$url" ]] || { url=$(read_nonempty '请输入订阅公网基础地址（例如 https://sub.example.com）'); }
+    [[ "$url" == http://* ]] && warn '当前使用 HTTP，订阅 Token 和节点凭据可能被窃听；优先使用 HTTPS 反向代理。'
+    subscription_update_settings true "$url" "$port" false || die '订阅服务启用失败。'
+  fi
+}
+
+subscription_management_flow() {
+  local choice enabled port url count skipped
+  while true; do
+    enabled=$(jq -r '.enabled // false' "$SUBSCRIPTION_CONFIG") || enabled=false
+    port=$(jq -r '.listen_port // 18080' "$SUBSCRIPTION_CONFIG") || port=18080
+    url=$(jq -r '.public_base_url // empty' "$SUBSCRIPTION_CONFIG") || url=''
+    count=$(jq -er '[.nodes[] | select(.subscription_enabled == true and .status == "enabled")] | length' "$NODES_FILE") || count=0
+    skipped=$(jq -er '[.nodes[] | select(.subscription_enabled != true or .status != "enabled")] | length' "$NODES_FILE") || skipped=0
+    printf '\n订阅管理\n订阅状态：%s\n本地监听：127.0.0.1:%s\n公网地址：%s\n订阅节点：%s\n跳过节点：%s\n\n1. 查看订阅地址\n2. 查看订阅节点\n3. 管理订阅节点\n4. 全部加入订阅\n5. 全部移出订阅\n6. 显示订阅二维码\n7. 重新生成订阅 Token\n8. 设置订阅公网地址和本地端口\n9. 检查订阅服务\n10. 重建订阅输出\n11. 启用 / 停用订阅服务\n0. 返回\n> ' \
+      "$(if [[ "$enabled" == true ]]; then printf 已启用; else printf 已停用; fi)" "$port" "$(if [[ -n "$url" ]]; then printf 已配置; else printf 未配置; fi)" "$count" "$skipped"
+    IFS= read -r choice || die '读取输入失败。'
+    case "$choice" in
+      1) subscription_show_url_action ;;
+      2) subscription_show_nodes ;;
+      3) run_menu_action subscription_toggle_nodes_action ;;
+      4) run_menu_action subscription_all_toggle_action true ;;
+      5) run_menu_action subscription_all_toggle_action false ;;
+      6) subscription_qr_action ;;
+      7) run_menu_action subscription_rotate_action ;;
+      8) run_menu_action subscription_settings_action ;;
+      9) run_menu_action subscription_local_health && success '订阅服务本地健康检查通过。' || warn '订阅服务本地健康检查失败。' ;;
+      10) run_menu_action subscription_rebuild_action ;;
+      11) run_menu_action subscription_enable_disable_action ;;
+      0) return 0 ;;
+      *) warn '无效选项。' ;;
+    esac
+  done
+}
+
 system_settings_flow() {
   local choice listen_mode listen_address bbr_enabled tfo_kernel_enabled tfo_config_supported
   while true; do
@@ -697,6 +925,7 @@ system_refresh_interfaces_action() {
   system_mutation_transaction_begin system_interfaces || return 1
   detect_traffic_interfaces || return 1
   bandwidth_apply_and_check "$NODES_FILE" || return 1
+  port_hopping_reconcile "$NODES_FILE" || return 1
   traffic_reset_kernel_baselines "$NODES_FILE" "$TRAFFIC_FILE" || return 1
   system_mutation_transaction_commit || return 1
   success '已刷新流量接口，并重新验证统计/限速规则。'
@@ -738,8 +967,9 @@ uninstall_flow() {
   printf '\n卸载模式：\n1. 仅删除程序，保留配置和数据\n2. 删除程序和运行配置，保留备份\n3. 完全卸载\n0. 返回\n> '
   IFS= read -r mode || die '读取输入失败。'
   [[ "$mode" == 1 || "$mode" == 2 || "$mode" == 3 ]] || return 0
-  prompt_yes_no "确认执行卸载模式 $mode？本项目不会修改任何防火墙规则" n || return 0
+  prompt_yes_no "确认执行卸载模式 $mode？项目只会清理自己明确标记的 Hysteria2 端口跳跃规则，不会修改其他防火墙规则" n || return 0
   acquire_manager_lock
+  subscription_service_remove_definition || die '订阅服务停止/清理失败，卸载已停止。'
   if [[ "$mode" != 1 ]]; then
     uninstall_validate_managed_runtime || die '卸载所有权预检失败，尚未删除项目运行配置或 sing-box 二进制。'
   fi
@@ -769,6 +999,8 @@ uninstall_flow() {
     fi
   fi
   bandwidth_remove_manager_rules || die '无法证明并清理全部 Ss2022 tc 规则；卸载已停止。'
+  port_hopping_cleanup "$(if [[ -f "$PORTHOP_PLAN" && ! -L "$PORTHOP_PLAN" ]]; then jq -r '.backend // empty' "$PORTHOP_PLAN" 2>/dev/null || true; fi)" \
+    || die '无法证明并清理全部 Ss2022 Hysteria2 端口跳跃规则；卸载已停止。'
   remove_rem_command || die 'rem 命令清理失败；卸载已停止。'
   if [[ "$mode" != 1 ]]; then
     service_remove_managed_definition "$SING_BOX_SERVICE" || die 'sing-box 服务定义清理失败；卸载已停止。'
@@ -781,13 +1013,14 @@ uninstall_flow() {
     # kernel values, so restore them before deleting manager.json.
     restore_kernel_settings_on_uninstall || die '安装前内核参数恢复失败；已保留 manager 状态以便重试。'
     if [[ "$mode" == 2 ]]; then
-      rm -f -- "$MANAGER_STATE" "$NODES_FILE" "$TRAFFIC_FILE" "$HISTORY_FILE" "$COUNTERS_FILE" "$INTERFACES_FILE" "$DATA_DIR/bandwidth-plan.json" \
+      rm -f -- "$MANAGER_STATE" "$NODES_FILE" "$TRAFFIC_FILE" "$HISTORY_FILE" "$COUNTERS_FILE" "$INTERFACES_FILE" "$DATA_DIR/bandwidth-plan.json" "$PORTHOP_PLAN" "$SUBSCRIPTION_CONFIG" \
         || die '运行状态文件删除失败；卸载未完成。'
       find "$CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name backups -exec rm -rf -- {} + 2>/dev/null \
         || die '配置目录清理失败；备份仍保留，卸载未完成。'
       rm -rf -- "$DATA_DIR" || die '数据目录删除失败；卸载未完成。'
     else
       rm -rf -- "$CONFIG_DIR" "$DATA_DIR" || die '配置或数据目录删除失败；完全卸载未完成。'
+      subscription_remove_account || die '订阅服务专用用户清理失败；完全卸载未完成。'
     fi
   fi
   rm -rf -- "$PROGRAM_DIR" || die 'manager 程序目录删除失败；卸载未完成。'
@@ -796,7 +1029,7 @@ uninstall_flow() {
   if [[ "$mode" != 1 ]]; then
     rm -rf -- "$RUNTIME_DIR" || die '运行目录删除失败；卸载未完整结束。'
   fi
-  success '卸载流程完成。本项目没有修改或删除 iptables/nftables/UFW/firewalld/ipset 规则。'
+  success '卸载流程完成。项目只清理了自己明确标记的 Hysteria2 端口跳跃规则，没有修改其他 iptables/nftables/UFW/firewalld/ipset 规则。'
   exit 0
 }
 
@@ -811,7 +1044,7 @@ main_menu() {
     singbox_summary=$(singbox_status_summary) || die '无法查询 sing-box 状态。'
     total_text=$(format_bytes "$total") || die '无法格式化节点流量。'
     printf '\n================================\n       REM Proxy Manager\n================================\n\nSing-box：%s\n节点数量：%s\n本周期总流量：%s\n\n' "$singbox_summary" "$count" "$total_text"
-    printf '1. 添加节点\n2. 删除节点\n3. 修改节点\n4. 查看节点\n5. 节点详细信息\n6. 显示节点链接 / 二维码\n7. 启用 / 停用节点\n\n8. 流量统计\n9. 流量限额\n10. 流量重置\n11. 上传 / 下载限速\n\n12. Sing-box 管理\n13. 更新管理\n14. 备份与恢复\n15. 系统设置\n16. 卸载\n\n0. 退出\n> '
+    printf '1. 添加节点\n2. 删除节点\n3. 修改节点\n4. 查看节点\n5. 节点详细信息\n6. 显示节点链接 / 二维码\n7. 启用 / 停用节点\n\n8. 流量统计\n9. 流量限额\n10. 流量重置\n11. 上传 / 下载限速\n\n12. 订阅管理\n13. Sing-box 管理\n14. 更新管理\n15. 备份与恢复\n16. 系统设置\n17. 卸载\n\n0. 退出\n> '
     local choice
     IFS= read -r choice || exit 0
     case "$choice" in
@@ -826,11 +1059,12 @@ main_menu() {
       9) run_menu_action traffic_quota_flow ;;
       10) run_menu_action traffic_reset_day_flow ;;
       11) run_menu_action bandwidth_flow ;;
-      12) singbox_management_flow ;;
-      13) update_menu_flow ;;
-      14) backup_management_flow ;;
-      15) system_settings_flow ;;
-      16) uninstall_flow ;;
+      12) subscription_management_flow ;;
+      13) singbox_management_flow ;;
+      14) update_menu_flow ;;
+      15) backup_management_flow ;;
+      16) system_settings_flow ;;
+      17) uninstall_flow ;;
       0) exit 0 ;;
       *) warn '无效选项。' ;;
     esac

@@ -43,7 +43,7 @@ INSTALL_TRANSACTION_DIR="$CONFIG_DIR/install-transaction"
 SING_BOX_CONFIG="$TEST_TMP/sing-box.json"
 mkdir -p -- "$CONFIG_DIR" "$DATA_DIR" "$RUNTIME_DIR" "$BACKUP_DIR"
 printf '%s\n' '{"listen_mode":"ipv4","tfo_config_supported":false,"tfo_kernel_enabled":false}' >"$MANAGER_STATE"
-printf '%s\n' '{"schema_version":4,"nodes":[]}' >"$NODES_FILE"
+printf '%s\n' '{"schema_version":5,"nodes":[]}' >"$NODES_FILE"
 printf '%s\n' '{"schema_version":1,"nodes":{}}' >"$TRAFFIC_FILE"
 printf '%s\n' '{"schema_version":1,"cycles":{}}' >"$HISTORY_FILE"
 printf '%s\n' '{"schema_version":1,"interfaces":["eth0"]}' >"$INTERFACES_FILE"
@@ -67,14 +67,20 @@ validate_nodes_file_semantic "$NODES_FILE" || fail 'valid Hysteria2 node was rej
 validate_hysteria2_certificate_state "$NODES_FILE" "$candidate_certs" || fail 'generated certificate failed semantic validation'
 
 legacy_schema3="$TEST_TMP/nodes-schema3.json"
-upgraded_schema4="$TEST_TMP/nodes-schema4.json"
-jq '.schema_version=3' "$NODES_FILE" >"$legacy_schema3"
+upgraded_schema5="$TEST_TMP/nodes-schema5.json"
+jq '.schema_version=3 | .nodes |= map(del(.subscription_enabled,.port_hopping_enabled,.hop_port_start,.hop_port_end,.hop_interval))' "$NODES_FILE" >"$legacy_schema3"
 validate_nodes_file_semantic "$legacy_schema3" || fail 'valid schema-3 Hysteria2 data was rejected'
-nodes_schema_upgrade_copy "$legacy_schema3" "$upgraded_schema4" || fail 'schema-3 to schema-4 migration failed'
+nodes_schema_upgrade_copy "$legacy_schema3" "$upgraded_schema5" || fail 'schema-3 to schema-5 migration failed'
 jq -e --slurpfile old "$legacy_schema3" '
-  .schema_version == 4 and (.nodes == $old[0].nodes)
-' "$upgraded_schema4" >/dev/null || fail 'schema-3 migration changed Hysteria2 identity or TLS data'
-validate_tls_certificate_state "$upgraded_schema4" "$candidate_certs" \
+  .schema_version == 5
+  and (.nodes[0] | del(.subscription_enabled,.port_hopping_enabled,.hop_port_start,.hop_port_end,.hop_interval)) == $old[0].nodes[0]
+  and .nodes[0].subscription_enabled == true
+  and .nodes[0].port_hopping_enabled == false
+  and .nodes[0].hop_port_start == null
+  and .nodes[0].hop_port_end == null
+  and .nodes[0].hop_interval == "30s"
+' "$upgraded_schema5" >/dev/null || fail 'schema-3 migration changed Hysteria2 identity or TLS data'
+validate_tls_certificate_state "$upgraded_schema5" "$candidate_certs" \
   || fail 'schema-3 migration invalidated Hysteria2 certificate state'
 jq '.schema_version=2' "$NODES_FILE" >"$TEST_TMP/nodes-schema2-invalid.json"
 if validate_nodes_file_semantic "$TEST_TMP/nodes-schema2-invalid.json"; then

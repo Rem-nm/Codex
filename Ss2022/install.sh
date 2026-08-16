@@ -20,9 +20,17 @@ source "$SCRIPT_DIR/lib/traffic.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/bandwidth.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/port_hopping.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/backup.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/nodes.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/links.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/export.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/subscription.sh"
 
 require_root
 detect_host
@@ -90,6 +98,10 @@ install_preflight_service_ownership() {
       source="$SCRIPT_DIR/systemd/$(service_systemd_unit_name "$name")"
     elif [[ "$name" == "$SING_BOX_SERVICE" ]]; then
       source="$SCRIPT_DIR/openrc/sing-box"
+    elif [[ "$name" == "$OPENRC_PORTHOP_SERVICE" ]]; then
+      source="$SCRIPT_DIR/openrc/$OPENRC_PORTHOP_SERVICE"
+    elif [[ "$name" == "$OPENRC_SUBSCRIPTION_SERVICE" ]]; then
+      source="$SCRIPT_DIR/openrc/$OPENRC_SUBSCRIPTION_SERVICE"
     else
       source="$SCRIPT_DIR/openrc/$OPENRC_TRAFFIC_SERVICE"
     fi
@@ -155,6 +167,7 @@ install_transaction_exit_handler() {
 }
 trap install_transaction_exit_handler EXIT
 install_transaction_set_phase installing || die '无法持久记录安装事务阶段。'
+subscription_initialize || die '无法初始化订阅设置和低权限服务账户。'
 
 # Upgrade pre-1.0.4 traffic state only after the install transaction has
 # snapshotted the old files.  A failure or crash therefore restores the
@@ -181,7 +194,11 @@ copy_program_to() {
   [[ -f "$SCRIPT_DIR/ss-manager.sh" && ! -L "$SCRIPT_DIR/ss-manager.sh" \
     && -f "$SCRIPT_DIR/VERSION" && ! -L "$SCRIPT_DIR/VERSION" \
     && -f "$SCRIPT_DIR/config/defaults.conf" && ! -L "$SCRIPT_DIR/config/defaults.conf" ]] || return 1
-  install -d -m 700 -- "$target/lib" "$target/config" "$target/systemd" "$target/openrc" || return 1
+  install -d -m 700 -- "$target/lib" "$target/config" "$target/systemd" "$target/openrc" "$target/subscription" || return 1
+  # The subscription daemon runs as a dedicated unprivileged user.  Its
+  # source contains no secrets, but the directory itself must be traversable
+  # so Python can open the script under systemd/OpenRC.
+  chmod 755 -- "$target/subscription" || return 1
   install -m 755 -- "$SCRIPT_DIR/ss-manager.sh" "$target/ss-manager.sh" || return 1
   install -m 644 -- "$SCRIPT_DIR/VERSION" "$target/VERSION" || return 1
   local file list_file
@@ -210,6 +227,8 @@ copy_program_to() {
   rm -f -- "$list_file" || return 1
   ((${#files[@]} > 0)) || return 1
   for file in "${files[@]}"; do install -m 700 -- "$file" "$target/openrc/$(basename -- "$file")" || return 1; done
+  [[ -f "$SCRIPT_DIR/subscription/ss-manager-subscription.py" && ! -L "$SCRIPT_DIR/subscription/ss-manager-subscription.py" ]] || return 1
+  install -m 755 -- "$SCRIPT_DIR/subscription/ss-manager-subscription.py" "$target/subscription/ss-manager-subscription.py" || return 1
   files=()
   list_file=$(runtime_temp_file install-bash-syntax-files) || return 1
   find "$target" -type f -name '*.sh' -print0 >"$list_file" || { rm -f -- "$list_file"; return 1; }
@@ -292,6 +311,7 @@ check_manager_maintenance_service_files
 
 install_singbox_service_unit || die 'sing-box 服务定义安装失败。'
 install_manager_maintenance_service_files || die '流量维护服务定义安装失败。'
+subscription_service_install_definition || die '订阅服务定义安装失败。'
 
 install_rem_command || die 'rem 命令安装失败。'
 
@@ -299,12 +319,15 @@ atomic_json_write "$candidate" "$SING_BOX_CONFIG" 600 || die '候选 sing-box �
 if ! singbox_restart || ! singbox_health_check "$NODES_FILE"; then
   die 'sing-box 安装/修复后的健康检查失败；将由持久安装事务恢复完整安装前状态。'
 fi
+port_hopping_restore "$NODES_FILE" || die 'Hysteria2 端口跳跃规则安装/恢复失败；将由持久安装事务恢复完整安装前状态。'
+subscription_publish_export "$NODES_FILE" || die '订阅派生输出生成失败；安装事务将恢复完整安装前状态。'
 rm -f -- "$candidate" || warn '安装配置已经提交，但候选配置清理失败。'
 
 installed_node_count=$(jq -er '.nodes | length' "$NODES_FILE") || die '无法读取节点数据库，未进入节点创建流程。'
 install_completed=$(manager_state_get install_completed false) || die '无法读取安装完成状态。'
 if (( installed_node_count > 0 )) || [[ "$install_completed" == true ]]; then
-  enable_manager_maintenance_service || die '流量维护服务启用失败。'
+  SS_MANAGER_DEFER_PORTHOP_START=1 enable_manager_maintenance_service \
+    || die '流量维护服务启用失败。'
   manager_state_set_json install_completed true || die '安装完成状态提交失败。'
 fi
 "$PROGRAM_DIR/ss-manager.sh" --self-test >/dev/null 2>&1 || die '安装后的 manager 入口自检失败。'
@@ -326,7 +349,9 @@ printf '本项目不会自动修改服务器防火墙、云安全组或现有安
 
 if (( installed_node_count == 0 )) && [[ "$install_completed" != true ]]; then
   release_manager_lock
+  start_deferred_port_hopping_service || warn '端口跳跃服务已启用，但暂时无法在安装进程退出前启动；下次维护或重启时会自动重试。'
   exec "$PROGRAM_DIR/ss-manager.sh" --first-run
 fi
 release_manager_lock
+start_deferred_port_hopping_service || warn '端口跳跃服务已启用，但暂时无法在安装进程退出前启动；下次维护或重启时会自动重试。'
 exec "$PROGRAM_DIR/ss-manager.sh" menu

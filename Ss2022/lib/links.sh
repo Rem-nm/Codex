@@ -63,11 +63,23 @@ node_vless_uri() {
 
 node_hysteria2_uri() {
   local node=$1 node_id password address address_type port name sni pin host encoded_password encoded_sni encoded_pin encoded_name
+  local hop_enabled hop_start hop_end
   [[ "$(node_protocol "$node")" == hysteria2 ]] || return 1
   password=$(jq -er '.password' <<<"$node") || return 1
   address=$(jq -er '.address' <<<"$node") || return 1
   address_type=$(jq -er '.address_type' <<<"$node") || return 1
   port=$(jq -er '.port' <<<"$node") || return 1
+  # jq -e returns status 1 for a valid boolean false; this field is a normal
+  # optional flag, so read it without -e and validate the true branch below.
+  hop_enabled=$(jq -r '.port_hopping_enabled // false' <<<"$node") || return 1
+  if [[ "$hop_enabled" == true ]]; then
+    hop_start=$(jq -er '.hop_port_start' <<<"$node") || return 1
+    hop_end=$(jq -er '.hop_port_end' <<<"$node") || return 1
+    validate_port "$hop_start" || return 1
+    validate_port "$hop_end" || return 1
+    (( hop_start <= hop_end )) || return 1
+    port="${hop_start}-${hop_end}"
+  fi
   name=$(jq -er '.name' <<<"$node") || return 1
   sni=$(jq -er '.tls_server_name' <<<"$node") || return 1
   pin=$(jq -er '.certificate_sha256' <<<"$node") || return 1

@@ -29,6 +29,8 @@ timer 使用 `OnBootSec=1min` 和 `OnUnitActiveSec=60s`，没有对单调 timer 
 
 每个节点上传、下载各有一个共享 action；所有接口、实际启用的地址族以及协议实际使用的 filter 都绑定到它：SS2022 绑定 TCP/UDP，VLESS Reality Vision 只绑定 TCP，Hysteria2/TUIC 只绑定 UDP。因此限速仍是 Node ID 方向的聚合速率，不会因协议或 filter 数量倍增。TUIC 的 QUIC 拥塞控制 BBR 与该用户限速是两层独立机制。0 使用 `gact pass` 只计数，非零使用 police。
 
+启用 Hysteria2 端口跳跃时，上传规则匹配外部连续范围的 ingress `dst_port`，下载规则匹配对应 egress `src_port`；实际监听端口如果不在范围内还保留一条精确规则，若在范围内则不重复绑定。范围使用 tc flower 的端口区间能力并继续共享同一 Node ID action；系统不支持范围语义、地址族或所有权无法核验时拒绝启用，不能退化成“看似成功但漏计”的精确端口规则。NAT 只负责 manager 自有 REDIRECT，流量归属、默认下载触发配额、上传/下载/合计展示和限速策略不变。
+
 清理前必须同时证明 action cookie/index、每条只有一个预期 action 的精确 filter handle，以及 action 的全部内核 `bind` 都落在保存的计划范围内。qdisc/filter/action 查询失败、JSON 异常、额外绑定、重复规则或混合 action/所有权都会停止删除。只有 ingress 与 egress 查询都成功且确认无任何规则时，才会删除项目创建的空 clsact。
 
 统计和限速依赖保存的主路由表默认出口。默认出口在同一次启动期间变化时，下一次维护会先原子保存仍可读取的共享 action 计数，再在持久安装事务中重新探测接口、应用规则并重置基线；路由查询失败会保持原状态且不写流量增量。主路由表多出口会聚合统计；非主路由表的策略路由不在自动发现范围内，部署前应单独核对。

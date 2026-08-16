@@ -1,0 +1,17 @@
+[Unit]
+Description=Ss2022 Hysteria2 UDP port hopping reconcile
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+# Managed by Ss2022
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/ss-manager/ss-manager.sh --port-hop-restore
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

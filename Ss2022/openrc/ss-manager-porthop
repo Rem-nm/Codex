@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+# Managed by Ss2022
+# shellcheck disable=SC2034
+
+name="Ss2022 Hysteria2 port hopping reconcile"
+description="Ss2022 Hysteria2 UDP port hopping reconcile"
+supervisor="supervise-daemon"
+command="/opt/ss-manager/openrc/ss-manager-porthop-loop.sh"
+pidfile="/run/ss-manager/porthop-supervisor.pid"
+respawn_delay=10
+respawn_max=0
+retry="TERM/10/KILL/5"
+umask=077
+
+depend() {
+  after sing-box
+  need net
+}
+
+start_pre() {
+  exec 9>&-
+  checkpath --directory --mode 0700 /run/ss-manager
+}

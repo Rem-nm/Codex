@@ -202,6 +202,10 @@ copy_program_to() {
     && -f "$SCRIPT_DIR/VERSION" && ! -L "$SCRIPT_DIR/VERSION" \
     && -f "$SCRIPT_DIR/config/defaults.conf" && ! -L "$SCRIPT_DIR/config/defaults.conf" ]] || return 1
   install -d -m 700 -- "$target/lib" "$target/config" "$target/systemd" "$target/openrc" "$target/subscription" || return 1
+  # The optional panel is split into a root-only Core and an HTTP process;
+  # Python source contains no server credentials and may be traversed by the
+  # dedicated panel account when the service is explicitly enabled.
+  install -d -m 755 -- "$target/web" || return 1
   # The subscription daemon runs as a dedicated unprivileged user.  Its
   # source contains no secrets, but the directory itself must be traversable
   # so Python can open the script under systemd/OpenRC.
@@ -236,6 +240,16 @@ copy_program_to() {
   for file in "${files[@]}"; do install -m 700 -- "$file" "$target/openrc/$(basename -- "$file")" || return 1; done
   [[ -f "$SCRIPT_DIR/subscription/ss-manager-subscription.py" && ! -L "$SCRIPT_DIR/subscription/ss-manager-subscription.py" ]] || return 1
   install -m 755 -- "$SCRIPT_DIR/subscription/ss-manager-subscription.py" "$target/subscription/ss-manager-subscription.py" || return 1
+  files=()
+  list_file=$(runtime_temp_file install-web-files) || return 1
+  find "$SCRIPT_DIR/web" -maxdepth 1 -type f -name '*.py' -print0 >"$list_file" \
+    || { rm -f -- "$list_file"; return 1; }
+  while IFS= read -r -d '' file; do files+=("$file"); done <"$list_file"
+  rm -f -- "$list_file" || return 1
+  ((${#files[@]} > 0)) || return 1
+  for file in "${files[@]}"; do install -m 755 -- "$file" "$target/web/$(basename -- "$file")" || return 1; done
+  python3 -m py_compile "$target/web"/*.py || return 1
+  rm -rf -- "$target/web/__pycache__"
   files=()
   list_file=$(runtime_temp_file install-bash-syntax-files) || return 1
   find "$target" -type f -name '*.sh' -print0 >"$list_file" || { rm -f -- "$list_file"; return 1; }

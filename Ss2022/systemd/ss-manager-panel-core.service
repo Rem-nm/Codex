@@ -1,0 +1,26 @@
+# Managed by Ss2022
+[Unit]
+Description=Ss2022 REM Manager Core (local Unix socket)
+After=local-fs.target
+ConditionPathExists=/opt/ss-manager/web/panel_core.py
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=ss-manager-panel
+RuntimeDirectoryMode=0750
+ExecStartPre=/usr/bin/chown root:ss-manager-panel /run/ss-manager-panel
+ExecStartPre=/usr/bin/chmod 0750 /run/ss-manager-panel
+ExecStart=/usr/bin/python3 /opt/ss-manager/web/panel_core.py --socket /run/ss-manager-panel/core.sock --socket-group ss-manager-panel
+Restart=on-failure
+RestartSec=2s
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/ss-manager-panel
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

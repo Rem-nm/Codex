@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+# Managed by Ss2022
+
+name="ss-manager-panel"
+description="Ss2022 REM Web Panel loopback service"
+command="/usr/bin/python3"
+command_args="/opt/ss-manager/web/panel_server.py"
+command_user="ss-manager-panel:ss-manager-panel"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+depend() {
+  need net
+  after ss-manager-panel-core
+}

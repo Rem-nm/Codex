@@ -292,6 +292,10 @@ manager_update_normalize_program_permissions() {
     chmod 755 -- "$root/subscription" || return 1
     find "$root/subscription" -type f -exec chmod 755 -- {} + || return 1
   fi
+  if [[ -d "$root/web" ]]; then
+    chmod 755 -- "$root/web" || return 1
+    find "$root/web" -type f -name '*.py' -exec chmod 755 -- {} + || return 1
+  fi
   find "$root/systemd" -type f -exec chmod 644 -- {} + || return 1
 }
 
@@ -302,8 +306,11 @@ manager_update_validate_package_structure() {
     lib/common.sh lib/certs.sh lib/system.sh lib/service.sh lib/time_sync.sh lib/singbox.sh lib/traffic.sh
     lib/bandwidth.sh lib/port_hopping.sh lib/backup.sh lib/nodes.sh lib/links.sh lib/export.sh lib/subscription.sh lib/update.sh lib/menu.sh
     subscription/ss-manager-subscription.py
+    web/__init__.py web/panel_common.py web/panel_init.py web/panel_core.py web/panel_server.py
     systemd/sing-box.service systemd/ss-manager-traffic.service systemd/ss-manager-traffic.timer systemd/ss-manager-porthop.service systemd/ss-manager-subscription.service
+    systemd/ss-manager-panel-core.service systemd/ss-manager-panel.service
     openrc/sing-box openrc/ss-manager-traffic openrc/ss-manager-traffic-loop.sh openrc/ss-manager-porthop openrc/ss-manager-porthop-loop.sh openrc/ss-manager-subscription
+    openrc/ss-manager-panel-core openrc/ss-manager-panel
   )
   [[ -d "$root" && ! -L "$root" ]] || return 1
   for relative in "${required_files[@]}"; do

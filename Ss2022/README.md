@@ -14,9 +14,9 @@ Ss2022 是一个基于 [sing-box](https://sing-box.sagernet.org/) 的统一代�
 - VLESS（TCP）：仅 `REALITY + xtls-rprx-vision`
 - Hysteria2（UDP）：每个节点独立密码和自签 ECDSA P-256 TLS 证书，客户端使用证书 DER SHA-256 pin
 - TUIC v5（QUIC/UDP）：每个节点独立 UUID、Password 和自签 ECDSA P-256 TLS 证书；固定关闭 0-RTT，QUIC 拥塞控制为 BBR
-- 每个节点一个全局唯一端口；四种协议之间也不允许端口重复
+- 每个节点一个全局唯一实际监听端口；四种协议之间也不允许实际端口重复。Hysteria2 可选地把一个连续 UDP 外部范围由 manager 自有 NAT REDIRECT 指向该实际端口
 
-不支持的发行版或架构会在系统修改前明确退出。安装还会在临时 dummy 接口上探测 `clsact`、flower、当前启用地址族的 TCP/UDP、共享 gact/police action、cookie、action `bind` 计数和实际 `tc -j` 规则语义；IPv4-only 主机不会被强制要求 IPv6 filter，所需能力不完整时不会进入项目安装。项目不会为了 BBR 升级内核。
+不支持的发行版或架构会在系统修改前明确退出。安装还会在临时 dummy 接口上探测 `clsact`、flower、当前启用地址族的 TCP/UDP、共享 gact/police action、cookie、action `bind` 计数和实际 `tc -j` 规则语义；IPv4-only 主机不会被强制要求 IPv6 filter，所需能力不完整时不会进入项目安装。启用 Hysteria2 端口跳跃时，manager 还会在自己的 NAT 命名空间中探测并核验连续 UDP 范围 REDIRECT；探测失败会保持关闭，不会改动用户规则。项目不会为了 BBR 升级内核。
 
 ## 安装
 
@@ -84,6 +84,12 @@ Reality Private Key 永不出现在终端普通输出；VLESS UUID、Public Key 
 
 SS2022 配置采用官方 Shadowsocks inbound 结构；TCP 和 UDP 同时启用时省略 `network` 字段，因为 sing-box 官方文档规定空值表示两者。VLESS 配置采用官方 VLESS inbound、TLS Reality server 和 `xtls-rprx-vision` 用户 Flow 结构。Hysteria2 与 TUIC 配置采用各自官方 UDP/QUIC inbound，服务端 TLS 只引用项目固定证书路径。不增加 WS、gRPC、普通 TLS、ACME 或其他传输。TCP Fast Open 只有在内核和当前 sing-box 构建都通过检测时才写入配置。
 
+### Hysteria2 端口跳跃与订阅服务
+
+Hysteria2 端口跳跃默认关闭。开启后 sing-box 仍只监听节点的一个实际 UDP 端口，manager 仅在自己的 nftables/iptables NAT 对象中维护用户声明的连续 UDP 范围，并同时维护对应的 tc 范围统计/限速规则；不会生成额外 inbound、进程或服务，也不会刷新用户的 filter policy。节点停用、删除、备份恢复、覆盖安装和重启都会执行同一个幂等 reconcile。请自行放行实际端口和外部跳跃范围，项目不管理云安全组或外部防火墙。
+
+订阅服务是可选的单一 default subscription，默认关闭并只监听 `127.0.0.1:18080`。root 管理器从统一节点库生成不含 Reality Private Key、TLS Private Key 或证书私钥的派生快照，专用低权限账号只读取该快照。启用后提供 `/sub/<TOKEN>`（标准 Base64 URI Bundle）、`/raw`、`/base64` 和 `/sing-box` 四个只读 GET/HEAD 路由；停用或节点状态不是 `enabled` 的节点不会输出。Token 轮换立即使旧路径失效，派生内容生成失败时端点明确不可用而不提供陈旧敏感快照。订阅服务或端口跳跃服务故障都不停止 sing-box。
+
 每次添加、删除、修改、启停、限额或限速变更都遵循：
 
 ```text
@@ -118,7 +124,11 @@ SS2022 配置采用官方 Shadowsocks inbound 结构；TCP 和 UDP 同时启用�
 ├── traffic.json
 ├── traffic-history.json
 ├── interfaces.json
-└── bandwidth-plan.json
+├── bandwidth-plan.json
+├── port-hopping-plan.json
+└── subscription/
+    ├── subscription-export.json
+    └── subscription-runtime.json
 
 /etc/sing-box/config.json
 /run/ss-manager/
@@ -142,16 +152,14 @@ manager 状态、包含密钥的节点数据库、流量数据和 sing-box 配�
 
 限速在 Linux `tc` 层按节点端口实现：上传匹配 ingress 目标端口，下载匹配 egress 源端口；分别支持 Mbps，0 表示不限速。tc 地址族以主路由表实际存在的 IPv4/IPv6 默认出口为准：IPv4-only 不创建 IPv6 规则，IPv6-only 也不强制 IPv4 规则。每个节点、每个方向只使用一个带所有权 cookie 的共享 action；SS2022 的 TCP/UDP filter 或 VLESS 的 TCP filter、已启用地址族和多个默认路由接口都绑定到该节点方向的同一个限速桶，不会把设定速率按过滤器倍增。主路由表默认出口在同一次启动期间变化时，下一次维护会先保存仍可读的旧 action 计数，再用持久事务刷新接口、规则和计数基线；默认路由查询失败则不改规则。项目只按已保存的 action 身份、完整 `bind` 数和精确 filter handle 清理自己的规则；同一优先级里的外部规则会保留。无法证明所有权、`tc -j` 查询失败、JSON 异常、重复或混合 action 时会保留整个 clsact，而不是把查询错误当作空规则。非主路由表的策略路由不在自动发现范围内，部署前应单独核对。
 
-本项目绝不会主动修改或放行：
+本项目绝不会主动修改或放行用户的：
 
-- iptables
-- nftables
 - UFW
 - firewalld
 - ipset
 - 云厂商安全组
 
-创建节点后，如果端口不可达，请自行检查服务器防火墙、云安全组和上游网络策略。
+普通节点不会创建任何 NAT 规则。只有明确启用 Hysteria2 端口跳跃时，manager 才会在专属 nftables/iptables NAT table/chain 中创建带 Node ID 所有权标记的 UDP REDIRECT；不会 flush、改 policy、修改用户链或删除无法证明属于本项目的规则。创建节点或开启跳跃后，如果端口不可达，请自行检查服务器防火墙、云安全组和上游网络策略，并放行实际端口及跳跃范围。
 
 ## 更新
 
@@ -175,13 +183,13 @@ manager 状态、包含密钥的节点数据库、流量数据和 sing-box 配�
 2. 删除程序和运行配置，保留备份
 3. 完全卸载项目创建的程序、systemd/OpenRC 服务、sing-box（由本项目管理时）、rem、节点数据、流量、历史和备份
 
-所有模式都会删除本项目自己的 tc 规则；不会删除任何用户已有的防火墙规则。模式 1 会保留运行中的 sing-box 和配置，便于以后重新安装 manager 继续管理。模式 2 和模式 3 会在删除 manager 状态前恢复本项目记录的 BBR/TFO 内核原值并清理运行目录。维护服务或 sing-box 无法确认停止/禁用时，卸载会在删除对应程序和配置前停止。
+所有模式都会删除本项目自己的 tc 规则、端口跳跃 NAT 规则和订阅服务定义；不会删除任何用户已有的防火墙规则或反向代理配置。模式 1 会保留运行中的 sing-box 和配置，便于以后重新安装 manager 继续管理。模式 2 和模式 3 会在删除 manager 状态前恢复本项目记录的 BBR/TFO 内核原值并清理运行目录。维护服务或 sing-box 无法确认停止/禁用时，卸载会在删除对应程序和配置前停止。
 
 ## 安全注意事项
 
 - 不要把 `/etc/ss-manager`、`/var/lib/ss-manager`、`/etc/sing-box/config.json` 或备份上传到 GitHub。
 - 不要在普通聊天、工单或日志中粘贴完整密钥、URI 或二维码。
-- 项目不会自动开放防火墙；请按云厂商和服务器策略手动放行 SS2022 的 TCP/UDP、VLESS 的 TCP 或 Hysteria2/TUIC 的 UDP 端口。
+- 项目不会自动开放外部防火墙；请按云厂商和服务器策略手动放行 SS2022 的 TCP/UDP、VLESS 的 TCP、Hysteria2/TUIC 的 UDP 实际端口，以及已启用 Hysteria2 跳跃的外部 UDP 范围。
 - sing-box 访问日志保持关闭；systemd/journald 或 OpenRC 仅用于必要的服务状态排障，不开发访问监控。
 
 ## 官方能力依据

@@ -591,6 +591,10 @@ traffic_maintenance_no_lock() {
       return 1
     fi
   fi
+  if declare -F port_hopping_reconcile >/dev/null 2>&1; then
+    port_hopping_reconcile "$NODES_FILE" >/dev/null 2>&1 || \
+      warn '流量维护已完成，但 Hysteria2 端口跳跃规则未能修复；可稍后执行 rem --port-hop-restore。'
+  fi
   rm -f -- "$nodes_tmp" "$traffic_tmp" "$history_tmp" \
     || warn '流量维护状态已经提交，但运行时副本清理失败。'
 }

@@ -155,9 +155,9 @@ manager_update_info() {
 
 manager_update_service_names() {
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    printf '%s\n' "$SING_BOX_SERVICE" "$SYSTEMD_TRAFFIC_SERVICE" "$SYSTEMD_TRAFFIC_TIMER"
+    printf '%s\n' "$SING_BOX_SERVICE" "$SYSTEMD_TRAFFIC_SERVICE" "$SYSTEMD_TRAFFIC_TIMER" "$SYSTEMD_PORTHOP_SERVICE" "$SYSTEMD_SUBSCRIPTION_SERVICE"
   else
-    printf '%s\n' "$SING_BOX_SERVICE" "$OPENRC_TRAFFIC_SERVICE"
+    printf '%s\n' "$SING_BOX_SERVICE" "$OPENRC_TRAFFIC_SERVICE" "$OPENRC_PORTHOP_SERVICE" "$OPENRC_SUBSCRIPTION_SERVICE"
   fi
 }
 
@@ -214,7 +214,27 @@ manager_update_install_service_files() {
   fi
   [[ -f "$source" && ! -L "$source" ]] || { error "manager 更新包缺少常规服务模板或模板为符号链接：$source"; return 1; }
   atomic_file_write "$source" "$destination" "$mode" 755 || return 1
-  install_manager_maintenance_service_files
+  install_manager_maintenance_service_files || return 1
+  local subscription_name subscription_source subscription_destination
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    subscription_name="$SYSTEMD_SUBSCRIPTION_SERVICE"
+    subscription_source="$PROGRAM_DIR/systemd/$SYSTEMD_SUBSCRIPTION_SERVICE"
+  else
+    subscription_name="$OPENRC_SUBSCRIPTION_SERVICE"
+    subscription_source="$PROGRAM_DIR/openrc/$OPENRC_SUBSCRIPTION_SERVICE"
+  fi
+  subscription_destination=$(service_definition_path "$subscription_name") || return 1
+  if service_definition_path_present "$subscription_name" && ! service_definition_is_managed "$subscription_name"; then
+    error "$subscription_destination 已存在且不属于 Ss2022，拒绝在更新时覆盖。"
+    return 1
+  fi
+  [[ -f "$subscription_source" && ! -L "$subscription_source" ]] || return 1
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    atomic_file_write "$subscription_source" "$subscription_destination" 644 755 || return 1
+  else
+    atomic_file_write "$subscription_source" "$subscription_destination" 755 755 || return 1
+  fi
+  service_manager_reload
 }
 
 manager_update_finalize_switched_program() {
@@ -267,6 +287,10 @@ manager_update_normalize_program_permissions() {
   chmod 755 -- "$root/ss-manager.sh" || return 1
   chmod 644 -- "$root/VERSION" || return 1
   find "$root/lib" "$root/openrc" -type f -exec chmod 700 -- {} + || return 1
+  if [[ -d "$root/subscription" ]]; then
+    chmod 755 -- "$root/subscription" || return 1
+    find "$root/subscription" -type f -exec chmod 755 -- {} + || return 1
+  fi
   find "$root/systemd" -type f -exec chmod 644 -- {} + || return 1
 }
 
@@ -275,9 +299,10 @@ manager_update_validate_package_structure() {
   local -a required_files=(
     ss-manager.sh VERSION config/defaults.conf
     lib/common.sh lib/certs.sh lib/system.sh lib/service.sh lib/singbox.sh lib/traffic.sh
-    lib/bandwidth.sh lib/backup.sh lib/nodes.sh lib/links.sh lib/update.sh lib/menu.sh
-    systemd/sing-box.service systemd/ss-manager-traffic.service systemd/ss-manager-traffic.timer
-    openrc/sing-box openrc/ss-manager-traffic openrc/ss-manager-traffic-loop.sh
+    lib/bandwidth.sh lib/port_hopping.sh lib/backup.sh lib/nodes.sh lib/links.sh lib/export.sh lib/subscription.sh lib/update.sh lib/menu.sh
+    subscription/ss-manager-subscription.py
+    systemd/sing-box.service systemd/ss-manager-traffic.service systemd/ss-manager-traffic.timer systemd/ss-manager-porthop.service systemd/ss-manager-subscription.service
+    openrc/sing-box openrc/ss-manager-traffic openrc/ss-manager-traffic-loop.sh openrc/ss-manager-porthop openrc/ss-manager-porthop-loop.sh openrc/ss-manager-subscription
   )
   [[ -d "$root" && ! -L "$root" ]] || return 1
   for relative in "${required_files[@]}"; do

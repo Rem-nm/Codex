@@ -162,12 +162,12 @@ validate_nodes_file_semantic "$legacy_nodes" || fail_test 'valid schema-1 SS2022
 
 upgraded_nodes="$TEST_TMP/nodes-schema2-ss.json"
 nodes_schema_upgrade_copy "$legacy_nodes" "$upgraded_nodes" || fail_test 'schema-1 SS2022 upgrade failed'
-assert_equal 4 "$(jq -r '.schema_version' "$upgraded_nodes")" 'node schema was not upgraded to version 4'
+assert_equal 5 "$(jq -r '.schema_version' "$upgraded_nodes")" 'node schema was not upgraded to version 5'
 assert_equal shadowsocks "$(jq -r '.nodes[0].protocol' "$upgraded_nodes")" 'legacy node protocol discriminator was not added'
 jq -e --slurpfile old "$legacy_nodes" '
   .nodes[0] as $new
   | $old[0].nodes[0] as $previous
-  | ($new | del(.protocol)) == $previous
+   | ($new | del(.protocol,.subscription_enabled)) == $previous
 ' "$upgraded_nodes" >/dev/null || fail_test 'schema migration changed legacy identity, credentials, limits or schedule'
 
 install -m 600 -- "$legacy_nodes" "$NODES_FILE"
@@ -184,9 +184,9 @@ backup_create_snapshot() {
 }
 INSTALL_TRANSACTION_ACTIVE=1
 migrate_nodes_schema_if_needed || fail_test 'automatic schema migration failed'
-assert_equal schema-1-to-4-migration "$migration_backup_reason" 'automatic migration did not request its pre-migration snapshot'
-assert_equal 4 "$(jq -r '.schema_version' "$NODES_FILE")" 'automatic migration did not publish schema 4'
-jq -e --slurpfile old "$legacy_nodes" '(.nodes[0] | del(.protocol)) == $old[0].nodes[0]' "$NODES_FILE" >/dev/null \
+assert_equal schema-1-to-5-migration "$migration_backup_reason" 'automatic migration did not request its pre-migration snapshot'
+assert_equal 5 "$(jq -r '.schema_version' "$NODES_FILE")" 'automatic migration did not publish schema 5'
+jq -e --slurpfile old "$legacy_nodes" '(.nodes[0] | del(.protocol,.subscription_enabled)) == $old[0].nodes[0]' "$NODES_FILE" >/dev/null \
   || fail_test 'automatic migration changed an existing SS2022 node'
 
 # Simulate a durability failure reported immediately after the schema-2 file
@@ -224,13 +224,15 @@ assert_equal "$node_id_ss" "$(jq -r '.nodes[0].node_id' "$mixed_nodes")" 'SS2022
 assert_equal "$node_id_vless" "$(jq -r '.nodes[1].node_id' "$mixed_nodes")" 'VLESS Node ID changed'
 
 legacy_schema2="$TEST_TMP/nodes-schema2-mixed.json"
-upgraded_schema4="$TEST_TMP/nodes-schema4-from-2.json"
-jq '.schema_version=2' "$mixed_nodes" >"$legacy_schema2"
+upgraded_schema5="$TEST_TMP/nodes-schema5-from-2.json"
+jq '.schema_version=2 | .nodes |= map(del(.subscription_enabled))' "$mixed_nodes" >"$legacy_schema2"
 validate_nodes_file_semantic "$legacy_schema2" || fail_test 'valid schema-2 SS2022/VLESS data was rejected'
-nodes_schema_upgrade_copy "$legacy_schema2" "$upgraded_schema4" || fail_test 'schema-2 to schema-4 migration failed'
+nodes_schema_upgrade_copy "$legacy_schema2" "$upgraded_schema5" || fail_test 'schema-2 to schema-5 migration failed'
 jq -e --slurpfile old "$legacy_schema2" '
-  .schema_version == 4 and (.nodes == $old[0].nodes)
-' "$upgraded_schema4" >/dev/null || fail_test 'schema-2 migration changed SS2022/VLESS identity data'
+  .schema_version == 5
+  and ([.nodes[] | del(.subscription_enabled)] | sort_by(.node_id)) == ([$old[0].nodes[]] | sort_by(.node_id))
+  and all(.nodes[]; .subscription_enabled == true)
+' "$upgraded_schema5" >/dev/null || fail_test 'schema-2 migration changed SS2022/VLESS identity data'
 
 bad_pair="$TEST_TMP/nodes-bad-pair.json"
 jq '.nodes[1].reality_public_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"' "$mixed_nodes" >"$bad_pair"

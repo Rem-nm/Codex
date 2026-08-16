@@ -107,6 +107,13 @@ backup_create_snapshot() {
     install -m 600 -- "$SING_BOX_CONFIG" "$preparing/config.json" \
       || { rm -rf -- "$preparing"; return 1; }
   fi
+  if [[ -e "$SUBSCRIPTION_CONFIG" || -L "$SUBSCRIPTION_CONFIG" ]]; then
+    [[ -f "$SUBSCRIPTION_CONFIG" && ! -L "$SUBSCRIPTION_CONFIG" ]] \
+      && subscription_validate_settings_file "$SUBSCRIPTION_CONFIG" \
+      || { error '订阅设置不是可备份的常规有效文件。'; rm -rf -- "$preparing"; return 1; }
+    install -m 600 -- "$SUBSCRIPTION_CONFIG" "$preparing/subscription.json" \
+      || { rm -rf -- "$preparing"; return 1; }
+  fi
   if [[ -e "$SING_BOX_BINARY" || -L "$SING_BOX_BINARY" ]]; then
     [[ -f "$SING_BOX_BINARY" && ! -L "$SING_BOX_BINARY" ]] || {
       error 'sing-box 二进制不是常规文件或为符号链接，拒绝在常规备份中跟随。'
@@ -161,12 +168,17 @@ backup_snapshot_is_managed() {
     [[ -f "$backup/$required" && ! -L "$backup/$required" ]] || return 1
   done
   local optional
-  for optional in config.json sing-box manager.json certs; do
+  for optional in config.json sing-box manager.json certs subscription.json; do
     if [[ -e "$backup/$optional" || -L "$backup/$optional" ]]; then
       if [[ "$optional" == certs ]]; then
         [[ -d "$backup/$optional" && ! -L "$backup/$optional" ]] || return 1
       else
         [[ -f "$backup/$optional" && ! -L "$backup/$optional" ]] || return 1
+        if [[ "$optional" == subscription.json ]]; then
+          declare -F subscription_validate_settings_file >/dev/null 2>&1 \
+            || return 1
+          subscription_validate_settings_file "$backup/$optional" || return 1
+        fi
       fi
     fi
   done
@@ -186,6 +198,98 @@ backup_snapshot_is_managed() {
   if [[ -f "$backup/manager.json" ]]; then
     validate_manager_state_semantic "$backup/manager.json" || return 1
   fi
+}
+
+subscription_restore_settings_from_backup() {
+  local selected_settings=$1
+  [[ -f "$selected_settings" && ! -L "$selected_settings" ]] || return 1
+  subscription_validate_settings_file "$selected_settings" || return 1
+  [[ -f "$SUBSCRIPTION_CONFIG" && ! -L "$SUBSCRIPTION_CONFIG" ]] || return 1
+
+  local old_settings candidate old_enabled old_port new_enabled new_port
+  old_settings=$(runtime_temp_file subscription-restore-old) || return 1
+  candidate=$(runtime_temp_file subscription-restore-candidate) || {
+    rm -f -- "$old_settings"
+    return 1
+  }
+  install -m 600 -- "$SUBSCRIPTION_CONFIG" "$old_settings" || {
+    rm -f -- "$old_settings" "$candidate"
+    return 1
+  }
+  old_enabled=$(jq -r '.enabled' "$old_settings") || {
+    rm -f -- "$old_settings" "$candidate"
+    return 1
+  }
+  old_port=$(jq -er '.listen_port' "$old_settings") || {
+    rm -f -- "$old_settings" "$candidate"
+    return 1
+  }
+  new_enabled=$(jq -r '.enabled' "$selected_settings") || {
+    rm -f -- "$old_settings" "$candidate"
+    return 1
+  }
+  new_port=$(jq -er '.listen_port' "$selected_settings") || {
+    rm -f -- "$old_settings" "$candidate"
+    return 1
+  }
+
+  # Validate the selected port before touching the restored proxy state.  The
+  # current subscription service may legitimately own its current port.
+  subscription_port_available "$new_port" "$old_port" || {
+    rm -f -- "$old_settings" "$candidate"
+    return 1
+  }
+  install -m 600 -- "$selected_settings" "$candidate" || {
+    rm -f -- "$old_settings" "$candidate"
+    return 1
+  }
+  atomic_json_write "$candidate" "$SUBSCRIPTION_CONFIG" 600 || {
+    rm -f -- "$old_settings" "$candidate"
+    return 1
+  }
+  rm -f -- "$candidate"
+
+  subscription_restore_settings_rollback() {
+    atomic_json_write "$old_settings" "$SUBSCRIPTION_CONFIG" 600 || true
+    subscription_publish_export "$NODES_FILE" >/dev/null 2>&1 || true
+    if [[ "$old_enabled" == true ]]; then
+      if [[ "$old_port" != "$new_port" ]]; then
+        subscription_service_restart >/dev/null 2>&1 || subscription_service_enable >/dev/null 2>&1 || true
+      else
+        subscription_service_enable >/dev/null 2>&1 || true
+      fi
+    else
+      subscription_service_disable >/dev/null 2>&1 || true
+    fi
+  }
+
+  if ! subscription_publish_export "$NODES_FILE"; then
+    subscription_restore_settings_rollback
+    rm -f -- "$old_settings"
+    return 1
+  fi
+  if [[ "$new_enabled" == true ]]; then
+    if [[ "$old_enabled" == true && "$old_port" != "$new_port" ]]; then
+      subscription_service_restart || {
+        subscription_restore_settings_rollback
+        rm -f -- "$old_settings"
+        return 1
+      }
+    else
+      subscription_service_enable || {
+        subscription_restore_settings_rollback
+        rm -f -- "$old_settings"
+        return 1
+      }
+    fi
+  else
+    subscription_service_disable || {
+      subscription_restore_settings_rollback
+      rm -f -- "$old_settings"
+      return 1
+    }
+  fi
+  rm -f -- "$old_settings"
 }
 
 backup_managed_names() {
@@ -369,6 +473,9 @@ state_transaction_restore() {
   fi
   bandwidth_apply_and_check "$NODES_FILE" >/dev/null 2>&1 || return 1
   traffic_reset_kernel_baselines "$NODES_FILE" "$TRAFFIC_FILE" >/dev/null 2>&1 || return 1
+  if declare -F port_hopping_restore >/dev/null 2>&1; then
+    port_hopping_restore "$NODES_FILE" >/dev/null 2>&1 || return 1
+  fi
   if [[ "$service_was_active" == true ]]; then
     singbox_health_check "$NODES_FILE" >/dev/null 2>&1 || return 1
   elif [[ "$had_config" == true ]]; then
@@ -423,6 +530,9 @@ install_transaction_target_names() {
     certs "$CERTS_DIR" \
     interfaces "$INTERFACES_FILE" \
     bandwidth-plan "$DATA_DIR/bandwidth-plan.json" \
+    port-hopping-plan "$PORTHOP_PLAN" \
+    subscription-config "$SUBSCRIPTION_CONFIG" \
+    subscription-dir "$SUBSCRIPTION_DIR" \
     sing-box-binary "$SING_BOX_BINARY" \
     sing-box-config "$SING_BOX_CONFIG" \
     rem /usr/local/bin/rem \
@@ -431,9 +541,9 @@ install_transaction_target_names() {
 
 install_transaction_service_names() {
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    printf '%s\n' "$SING_BOX_SERVICE" "$SYSTEMD_TRAFFIC_SERVICE" "$SYSTEMD_TRAFFIC_TIMER"
+    printf '%s\n' "$SING_BOX_SERVICE" "$SYSTEMD_TRAFFIC_SERVICE" "$SYSTEMD_TRAFFIC_TIMER" "$SYSTEMD_PORTHOP_SERVICE" "$SYSTEMD_SUBSCRIPTION_SERVICE"
   else
-    printf '%s\n' "$SING_BOX_SERVICE" "$OPENRC_TRAFFIC_SERVICE"
+    printf '%s\n' "$SING_BOX_SERVICE" "$OPENRC_TRAFFIC_SERVICE" "$OPENRC_PORTHOP_SERVICE" "$OPENRC_SUBSCRIPTION_SERVICE"
   fi
 }
 
@@ -826,6 +936,11 @@ restore_runtime_and_state() {
     error '旧配置已恢复，但 tc 计数基线恢复失败。'
     return 1
   fi
+  if declare -F port_hopping_restore >/dev/null 2>&1 \
+    && ! port_hopping_restore "$NODES_FILE" >/dev/null 2>&1; then
+    error '旧配置已恢复，但 Hysteria2 端口跳跃规则恢复失败。'
+    return 1
+  fi
   return 0
 }
 
@@ -960,6 +1075,16 @@ apply_state_transaction() {
     return 1
   fi
 
+  if declare -F port_hopping_reconcile >/dev/null 2>&1; then
+    if ! state_transaction_set_phase applying_port_hop \
+      || ! port_hopping_reconcile "$candidate_nodes"; then
+      error '新的 Hysteria2 端口跳跃规则应用/检查失败，正在恢复上一版本配置和规则。'
+      state_transaction_rollback_after_failure || true
+      rm -f -- "$candidate_config" "$merged_traffic"
+      return 1
+    fi
+  fi
+
   # tc rules are recreated during every transaction, so their byte counters
   # start from zero. Reset persisted baselines to prevent the next sample
   # from comparing a new port/rule counter with an old one.
@@ -1005,6 +1130,9 @@ apply_state_transaction() {
   backup_prune || warn '配置已经提交，但旧备份自动清理失败；可稍后从备份菜单重试。'
   [[ -z "$candidate_certs" || "$candidate_certs" != "$CONFIG_DIR/.certs-candidate."* ]] || rm -rf -- "$candidate_certs"
   rm -f -- "$candidate_config" "$merged_traffic" || warn '配置已经提交，但运行时候选文件清理失败。'
+  if declare -F subscription_publish_export >/dev/null 2>&1; then
+    subscription_publish_export "$NODES_FILE" || warn '代理事务已提交，但订阅派生输出更新失败；订阅端点将保持明确的不可用状态。'
+  fi
   success "配置事务已提交，备份：$backup_path"
   return 0
 }
@@ -1066,6 +1194,20 @@ backup_restore_flow() {
     rm -f -- "$restore_nodes"
     die '恢复失败，已自动回滚。'
   }
+  if [[ -f "$selected/subscription.json" && ! -L "$selected/subscription.json" ]]; then
+    subscription_restore_settings_from_backup "$selected/subscription.json" || {
+      rm -f -- "$restore_nodes"
+      die '代理状态已恢复，但订阅设置/服务恢复失败；订阅恢复证据已保留，请检查服务状态后重试。'
+    }
+  elif declare -F subscription_publish_export >/dev/null 2>&1; then
+    # Older snapshots did not contain subscription.json.  Preserve the
+    # current settings/token, but rebuild the derived output for the restored
+    # node database rather than serving a snapshot from the previous state.
+    subscription_publish_export "$NODES_FILE" || {
+      rm -f -- "$restore_nodes"
+      die '代理状态已恢复，但订阅派生输出重建失败；订阅端点已保持不可用。'
+    }
+  fi
   rm -f -- "$restore_nodes" || warn '备份已恢复，但节点候选暂存文件清理失败。'
   success '备份恢复完成。'
 }

@@ -20,11 +20,17 @@ source "$SCRIPT_DIR/lib/traffic.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/bandwidth.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/port_hopping.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/backup.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/nodes.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/links.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/export.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/subscription.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/update.sh"
 # shellcheck disable=SC1091
@@ -117,7 +123,10 @@ recover_incomplete_state_transaction
 validate_installed_state_files
 ensure_managed_singbox_binary_identity || die 'sing-box 二进制所有权校验失败；请重新运行固定版本 install.sh 修复。'
 initialize_state_files
+subscription_initialize || die '订阅设置初始化失败；请先使用备份恢复。'
+subscription_publish_export "$NODES_FILE" || warn '订阅派生输出暂未更新；订阅服务将保持明确的不可用状态。'
 ensure_tc_capabilities
+port_hopping_check "$NODES_FILE" || warn 'Hysteria2 端口跳跃规则缺失或不一致；可稍后执行 rem --port-hop-restore 修复。'
 startup_install_completed=$(manager_state_get install_completed false) || die '无法读取安装完成状态。'
 startup_node_count=$(jq -er '.nodes | length' "$NODES_FILE") || die '无法读取节点数量。'
 if [[ "$startup_install_completed" != true ]] && (( startup_node_count > 0 )); then
@@ -135,7 +144,10 @@ case "${1:-menu}" in
     traffic_collect_flow
     ;;
   --health)
-    singbox_health_check "$NODES_FILE"
+    singbox_health_check "$NODES_FILE" && port_hopping_check "$NODES_FILE"
+    ;;
+  --port-hop-restore)
+    port_hopping_restore "$NODES_FILE"
     ;;
   --version)
     printf 'Ss2022 manager %s\n' "$MANAGER_VERSION"

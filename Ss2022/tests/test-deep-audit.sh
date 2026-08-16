@@ -19,6 +19,9 @@ source "$ROOT/lib/traffic.sh"
 source "$ROOT/lib/bandwidth.sh"
 # shellcheck disable=SC1091
 source "$ROOT/lib/backup.sh"
+# Subscription settings are part of backup semantics; load the validator so
+# the fixture never falls through to a host-global /etc/ss-manager file.
+source "$ROOT/lib/subscription.sh"
 # shellcheck disable=SC1091
 source "$ROOT/lib/nodes.sh"
 # shellcheck disable=SC1091
@@ -59,6 +62,9 @@ make_fixture() {
   printf '%s\n' '{"schema_version":1,"cycles":{}}' >"$base/data/traffic-history.json"
   printf '%s\n' '{"schema_version":1,"interfaces":["eth0"]}' >"$base/data/interfaces.json"
   printf '%s\n' '{"inbounds":[]}' >"$base/sing-box/config.json"
+  jq -n '{schema_version:1,enabled:false,listen_address:"127.0.0.1",listen_port:18080,
+    public_base_url:null,token:null,created_at:"2026-01-01T00:00:00Z",updated_at:"2026-01-01T00:00:00Z"}' \
+    >"$base/config/subscription.json"
 }
 
 fixture="$test_tmp/fixture"
@@ -75,6 +81,8 @@ RUNTIME_DIR="$fixture/run"
 BACKUP_DIR="$fixture/backups"
 STATE_TRANSACTION_DIR="$CONFIG_DIR/state-transaction"
 SING_BOX_CONFIG="$fixture/sing-box/config.json"
+SUBSCRIPTION_CONFIG="$fixture/config/subscription.json"
+SUBSCRIPTION_DIR="$fixture/data/subscription"
 
 validate_manager_state_semantic "$MANAGER_STATE" || fail_test 'valid manager state rejected'
 validate_nodes_file_semantic "$NODES_FILE" || fail_test 'valid node state rejected'
@@ -147,6 +155,8 @@ fi
   RUNTIME_DIR="$backup_case/run"
   BACKUP_DIR="$backup_case/backups"
   SING_BOX_CONFIG="$backup_case/sing-box/config.json"
+  SUBSCRIPTION_CONFIG="$backup_case/config/subscription.json"
+  SUBSCRIPTION_DIR="$backup_case/data/subscription"
   SING_BOX_BINARY="$backup_case/missing-sing-box"
   snapshot=$(backup_create_snapshot manual) || fail_test 'atomic backup snapshot creation failed'
   backup_snapshot_is_managed "$snapshot" || fail_test 'new snapshot was not recognized as managed'
@@ -392,7 +402,7 @@ grep -Fq 'singbox_cleanup_download_workspace' "$ROOT/lib/update.sh" \
   service_remove_managed_definition() { removed=$((removed + 1)); }
   service_manager_reload() { return 0; }
   remove_manager_maintenance_service_files || fail_test 'verified maintenance-service removal failed'
-  assert_equal 2 "$removed" 'not all maintenance service definitions were removed after stop verification'
+  assert_equal 3 "$removed" 'not all maintenance service definitions were removed after stop verification'
 )
 if (
   INIT_SYSTEM=openrc
@@ -527,8 +537,11 @@ fi
   probe_log="$test_tmp/ipv4-probe.log"
   tc_active_families() { printf '%s\n' ip; }
   tc_action_counter_from_json() { return 0; }
-  tc_action_bind_count_from_json() { printf '%s' 2; }
+  tc_action_bind_count_from_json() {
+    if [[ "${2:-}" == gact ]]; then printf '%s' 4; else printf '%s' 2; fi
+  }
   tc_rule_json_match_count() { printf '%s' 1; }
+  tc_rule_json_match_count_range() { printf '%s' 1; }
   tc_rule_json_handles() { printf '%s\n' 0x1; }
   manager_state_set_json() { return 0; }
   success() { :; }
@@ -541,7 +554,11 @@ fi
     printf '\n' >>"$probe_log"
     if [[ "${1:-}" == -V ]]; then printf '%s\n' 'tc utility, iproute2-test'; return 0; fi
     if [[ "${1:-}" == -j && "${2:-}" == actions ]]; then printf '%s\n' '[]'; return 0; fi
-    if [[ "${1:-}" == -s && "${2:-}" == -j && "${3:-}" == filter ]]; then printf '%s\n' '[{"options":{}},{"options":{}}]'; return 0; fi
+    if [[ "${1:-}" == -s && "${2:-}" == -j && "${3:-}" == filter ]]; then
+      if [[ "${7:-}" == ingress ]]; then printf '%s\n' '[{"options":{}},{"options":{}},{"options":{}},{"options":{}}]';
+      else printf '%s\n' '[{"options":{}},{"options":{}}]'; fi
+      return 0
+    fi
     if [[ "${1:-}" == -s && "${2:-}" == -j && "${3:-}" == actions ]]; then printf '%s\n' '{}'; return 0; fi
     return 0
   }

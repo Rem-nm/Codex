@@ -304,7 +304,7 @@ Token 备份恢复、订阅停用/启用和安装事务恢复通过；VPS 真实
 
 ### 阶段 F：系统时间同步与 sing-box NTP
 
-状态：代码已接入，Ubuntu/Alpine 非破坏性验证已完成；按用户明确授权提交 GitHub。真实覆盖安装、重启、时间跳变、备份恢复和卸载验证仍作为合并后的后续工作项。
+状态：代码已接入，Ubuntu/Alpine 非破坏性验证已完成；PR #27 已提交并合并。真实覆盖安装、重启、时间跳变、备份恢复和卸载验证仍作为合并后的后续工作项。
 
 前置基线：
 
@@ -370,11 +370,108 @@ Ubuntu（systemd）与 Alpine 3.21（OpenRC）临时源目录；未覆盖现有�
 
 下一步：
 
-1. 按用户授权提交、推送并合并本阶段 GitHub PR；
-2. 合并后继续完成 Ubuntu 与 Alpine 的覆盖安装前置检查；
-3. 按开发文档执行 Debian 11/12、Ubuntu、Alpine、CentOS、AlmaLinux 的 Provider/重启/时间跳变矩阵；
-4. 完成备份恢复、卸载保留 Provider 和四协议回归；
-5. 汇总所有通过/失败证据，修复后再次执行全套测试。
+1. 合并后继续完成 Ubuntu 与 Alpine 的覆盖安装前置检查；
+2. 按开发文档执行 Debian 11/12、Ubuntu、Alpine、CentOS、AlmaLinux 的 Provider/重启/时间跳变矩阵；
+3. 完成备份恢复、卸载保留 Provider 和四协议回归；
+4. 汇总所有通过/失败证据，修复后再次执行全套测试；
+5. Web Panel 需求已进入阶段 G，开发前先完成本文件的兼容边界复核。
+
+### 阶段 F 发布记录
+
+- 发布分支：`agent/tuic-support`；PR：[#27](https://github.com/Rem-nm/Codex/pull/27)。
+- 合并方式：squash；`main` 合并提交：`e84431d316aece8c69aad6d964ff69eb31d4b2c6`。
+- 发布内容仅位于 `Ss2022/`；未包含 VPS 凭据、真实节点数据、Token、URI、证书私钥或备份。
+
+### 阶段 G：REM Web Panel 需求静态核对与第一阶段只读基础
+
+状态：需求已完整阅读并与当前 Ss2022 稳定实现静态核对；确认无硬冲突。第一阶段只读基础已实现并完成 Ubuntu/Debian 12 与 Alpine 3.21.7 隔离验证；写事务、远程 REM 和公网 HTTPS 仍未实现。
+
+#### 核对结论
+
+这份 Web Panel 需求可以作为现有 REM 的增量阶段，不会改变以下已经稳定的边界：
+
+- SS2022、VLESS、Hysteria2、TUIC 仍使用统一 `nodes.json`、Node ID、流量/配额/限速和备份恢复；
+- 所有协议仍由一个 sing-box 服务/进程管理，Web 只是新增管理入口；
+- HY2 Port Hopping、订阅、时间同步和现有健康检查继续由当前 manager 负责；
+- `rem` CLI 必须继续可用，Web/CLI 争用同一个 `/run/ss-manager/manager.lock`；
+- Web 不得读取或直接改写 `nodes.json`、`config.json`、nftables/iptables/tc，必须走现有候选配置、`sing-box check`、备份、应用、健康检查和回滚路径；
+- 现有低权限订阅服务仍只读取无服务端私钥的派生快照，不能改作 Web 写 API。
+
+#### 当前实现缺口（不是现有功能冲突）
+
+这些能力在当前代码中尚未存在，后续开发必须补齐，不能把“需求已记录”当作“功能已实现”：
+
+1. 没有写事务 Manager Core API；当前新增的 Core 只提供只读业务方法。节点/流量/订阅/时间同步/备份写操作仍必须通过受限的本地特权边界调用公共事务函数，不能让非 root Web 进程直接执行 `ss-manager.sh` 或获得 `nodes.json` 读取权限。
+2. 第一阶段已新增只读 Web 服务、`/api/v1/` 路由、管理员账号哈希、Session、登录限速、固定入口 Token 和面板服务模板；仍缺 `rem` 菜单接入、IP Allowlist 管理、审计日志和完整前端，面板默认必须关闭。
+3. 当前 `manager.json` 没有 `instance_id`、机器密钥、面板认证、远程实例和 trusted instance 状态；应使用独立 root-only 状态或在受事务保护的 manager schema 中增量迁移，不能破坏旧状态。
+4. 当前 `nodes.json` schema 5 对每个协议使用严格字段集合，节点没有 `core`/`direction` 字段。第一版应先以兼容方式把 `core=sing-box`、`direction=inbound` 作为适配层能力或单独元数据表达；不得未经 schema 迁移直接给现有节点添加字段，否则现有语义校验会拒绝。
+5. 当前状态事务快照主要覆盖 nodes/traffic/history/config/certs，常规备份虽保存 `manager.json`，恢复流程并不把所有 manager 设置逐项恢复；面板 Token、管理员、远程信任和 IP 白名单必须定义独立的备份/恢复/回滚边界。
+6. 现有订阅 Token 与面板入口 Token 必须使用不同命名空间和不同状态文件。订阅 Token 可轮换且服务只读；面板入口 Token 默认长期固定并保护管理 API，不能复用或混淆。
+7. 没有 REM-to-REM Instance Identity、机器签名/短期机器 Session、Pairing、权限绑定、能力协商或直接远程实例列表；远程操作必须由目标 REM 获取自身 Manager Lock 并执行本地事务，不能通过 SSH 或复制远程数据库实现。
+8. Web Panel 的 systemd/OpenRC 可选、低权限、默认 loopback 服务模板已加入源码，但尚未由安装流程创建账号、安装/启用服务；仍需明确与反向代理 HTTPS（模式 A）的信任边界。
+
+#### 开发时必须保留的兼容决策
+
+- 第一阶段只实现 sing-box Core Adapter，协议 UI 通过 Protocol Registry/Capabilities 选择；不实现 Xray、Mihomo、Routing、RuleSet、DNS、Chain、Telegram 或多管理员 RBAC。
+- Manager Core 的业务操作必须覆盖节点增删改/启停、流量/配额/限速、Port Hopping、订阅、时间同步、备份恢复、sing-box 管理和更新，并统一返回成功、校验失败、BUSY、回滚失败等结构化结果。
+- Web 写操作必须复用现有锁和事务；锁争用不能覆盖状态，返回 BUSY 或受控等待。Web 挂掉不得影响 CLI、sing-box、节点、流量维护或订阅服务。
+- 管理员密码只保存可靠哈希；Cookie 只保存 HttpOnly/Secure/SameSite Session 标识；任何响应、日志、审计或错误都不得输出密码、Password Hash、Reality/HY2/TUIC 私钥或机器私钥。
+- 固定入口 Token、IP Allowlist、TLS、Human Auth、Machine Auth、Authorization、Session/短期 Token 必须分层；错误 Token、根路径和不在白名单的请求统一 404，不泄露真实入口。
+- 远程首次绑定可使用目标管理员账号/密码，但成功 Pairing 后必须清除，不得在本地长期保存远程管理员明文密码；后续只使用机器身份和短期访问令牌。
+- 面板必须通过现有 Share Exporter 提供 URI/Base64/二维码；不得重新实现协议分享生成器，也不得显示服务端私钥。
+- 开发顺序按需求文档执行：Manager Core 非交互化 → 内部业务 API → Web Auth/Secret Path/Session → Dashboard/节点 → 流量/配额/限速 → Port Hopping → Subscription → Time Sync → Backup/sing-box 管理 → Remote Pairing/Remote VPS → Allowlist/TOTP。
+
+#### 需求范围记录
+
+阶段 G 的后续开发必须先更新本文件，再进行本地模型/安全测试、Debian/Ubuntu/Alpine 等实机验证和完整四协议回归；未完成前不得把面板服务默认安装、监听公网或提交真实服务器数据。
+
+#### 2026-08-16 G1/G2 实现记录
+
+范围：
+
+Manager Core 非交互只读边界、Web Auth/Secret Path/Session 基础、Dashboard/节点/流量/系统/订阅/时间同步只读 API、安装包结构接入；不启用现有 VPS 的面板服务，不修改现有节点或 sing-box 运行状态。
+
+修改：
+
+- 新增 `web/panel_core.py`：root-only Unix socket 服务；每个请求以非阻塞独占方式争用现有 `/run/ss-manager/manager.lock`，锁被 CLI/事务占用时结构化返回 `BUSY`；只允许固定业务方法，不提供 Shell、命令执行或原始配置写入。
+- 新增 `web/panel_server.py`：默认仅监听 `127.0.0.1` 的低权限 HTTP 层；根路径、错误 Token、白名单外请求统一 404；登录后才允许 `/api/v1/` 只读业务 API；响应不记录访问日志，设置 no-store、安全响应头。
+- 新增 `web/panel_init.py` / `web/panel_common.py`：PBKDF2-HMAC-SHA256 管理员密码哈希、43 字符 Base64URL 入口 Token、永久 `instance_id`、严格的 root-only 私有状态和低权限公共描述文件；密码只经 stdin 进入，不出现在命令参数或响应。
+- 新增 systemd/OpenRC 的 `ss-manager-panel-core` 与 `ss-manager-panel` 模板；模板默认不启用，面板仍须显式初始化和启用，Core socket 使用专用运行目录和面板组权限。
+- 安装包/manager 更新包结构校验与权限归一化已包含 `web/` 和上述服务模板；原有四协议、订阅、端口跳跃、时间同步、事务模块未改变。
+- 新增 `tests/test-web-panel.py`，并更新 manager 包结构回归夹具；夹具包含 SS2022、VLESS、Hysteria2、TUIC 的服务端私有字段，用于验证 HTTP/API 不泄漏。
+
+本地验证：
+
+- Python 3 编译、`git diff --check`、Web/服务模板静态审计通过；当前 Windows 工作区没有 Bash，因此 Bash 语法和 Unix socket 测试转到两台 Linux VPS 执行。
+
+VPS 验证：
+
+- Alpine 实机：Alpine Linux 3.21.7，Python 3.12、Bash 5.2；Web Panel 两项端到端测试通过，Shell/OpenRC 语法通过，原有 smoke、deep-audit、四协议模型、端口跳跃、订阅、时间同步、TUIC/VLESS、validation、regression 全部通过；初始化器的 Token 长度、文件权限、重复初始化保护通过。
+- 第二台实机：实际识别为 Debian GNU/Linux 12（不是 Ubuntu），Python 3.11、Bash 5.2；同一套 Web Panel、Shell/systemd/OpenRC 语法、初始化器和全部既有回归测试通过。
+- 测试均使用 `/tmp/rem-panel-src` 隔离副本与临时数据；没有覆盖 `/opt/ss-manager`、`/etc/sing-box/config.json`、节点/流量数据库或现有服务。一次早期夹具环境变量错误在 Alpine 创建了精确的临时 Panel 状态文件，已核对并删除；节点、流量、sing-box 配置均未触碰。
+
+结果：
+
+通过（只读基础和回归）。已验证：固定入口 Token/404、PBKDF2 登录、登录失败限速、HttpOnly/Secure/SameSite Session、四协议统一节点模型、敏感字段过滤、Manager Lock 竞争返回 `BUSY`、Debian 12/Alpine 兼容。没有把只读基础误报为完整 Web Panel。
+
+未实现/后续：
+
+1. 节点增删改、启停、配额、限速、Port Hopping、备份/恢复、sing-box 管理和更新的 Web 写 API；这些必须先抽象为公共 Manager Core 事务并复用现有候选配置/`sing-box check`/健康检查/回滚。
+2. CLI `rem` 菜单中的 Panel 初始化/启停/Token 轮换/密码修改入口；当前可用 `panel_init.py --password-stdin` 作为受控基础工具，服务模板未默认安装、未启用。
+3. Panel 专属状态进入现有备份、安装事务和恢复事务；当前 `panel.json` 是独立 root-only 状态，尚未纳入恢复提交边界。
+4. 反向代理 HTTPS 部署向导、证书管理、IP Allowlist UI、TOTP/Passkey、审计日志和完整前端页面。
+5. REM-to-REM Pairing、机器密钥/短期令牌、直接绑定权限和能力协商；不实现 Master/Agent 分裂，也不复制远程节点数据库。
+
+回滚/恢复证据：
+
+- 本轮只写入隔离 `/tmp` 测试目录；VPS 现场状态检查未发现项目目录、节点库、sing-box 配置或服务被修改。面板初始化器和服务均未在现有安装上启用。
+
+下一步：
+
+1. 抽象现有 Bash 节点/流量/订阅/时间同步/备份操作为受限 Core 写事务，先完成单节点启停/配额/限速的候选配置与回滚验证；
+2. 将 Panel 状态加入安装事务、常规备份/恢复和更新回滚，并通过 `rem` 提供显式启用/停用入口；
+3. 在两台 VPS 上进行实际“启用后再停用”的服务生命周期测试，再实现完整 Web UI 和 HTTPS 反代文档；
+4. 写 API、远程 Pairing 和多 VPS 管理完成并通过全协议回归后，才提交 GitHub。
 
 ## 5. 关键设计决策
 
@@ -477,8 +574,9 @@ Debian 12 与 Alpine 3.21 均完成覆盖安装；两台均完成跳跃开启/�
 
 ## 7. 当前下一步
 
-1. 重新读取 `development-requirements-time-sync-and-ntp.md` 与本进度文件；
-2. 按用户授权完成阶段 F 的 GitHub 提交、推送、PR 和合并；
-3. 合并后按时间同步测试矩阵执行 Debian/Ubuntu/Alpine/CentOS/AlmaLinux VPS 测试，并回归四协议、端口跳跃和订阅；
-4. 完成覆盖安装、重启、时间跳变、备份恢复和卸载验证；
-5. 不把任何真实运行数据、凭据或派生订阅内容写入仓库。
+1. 记忆压缩或新阶段开始时先重新读取本进度文件，沿阶段 G 的兼容边界继续；
+2. 将现有节点/流量/订阅/时间同步/备份操作逐项接入受限 Manager Core 写事务，先验证启停、配额和限速；
+3. 把 `panel.json` 纳入安装事务、备份恢复和更新回滚，并补上 `rem` 的 Panel 显式启停/初始化入口；
+4. 在 Ubuntu/Debian 12 与 Alpine 继续进行实际服务生命周期、反向代理 HTTPS 和四协议回归；
+5. 完成 Web 写 API、远程 Pairing、多 VPS 管理并通过全套测试后，再通过 GitHub 插件提交并合并；
+6. 不把任何真实运行数据、凭据、Session、Token 或私钥写入仓库。

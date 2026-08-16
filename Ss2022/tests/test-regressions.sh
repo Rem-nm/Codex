@@ -89,9 +89,11 @@ for required_file in \
   lib/common.sh lib/certs.sh lib/system.sh lib/service.sh lib/time_sync.sh lib/singbox.sh lib/traffic.sh \
   lib/bandwidth.sh lib/port_hopping.sh lib/backup.sh lib/nodes.sh lib/links.sh lib/export.sh lib/subscription.sh lib/update.sh lib/menu.sh \
   subscription/ss-manager-subscription.py \
+  web/__init__.py web/panel_common.py web/panel_init.py web/panel_core.py web/panel_server.py \
   systemd/sing-box.service systemd/ss-manager-porthop.service systemd/ss-manager-traffic.service systemd/ss-manager-traffic.timer \
-  systemd/ss-manager-subscription.service \
-  openrc/sing-box openrc/ss-manager-porthop openrc/ss-manager-porthop-loop.sh openrc/ss-manager-traffic openrc/ss-manager-traffic-loop.sh openrc/ss-manager-subscription; do
+  systemd/ss-manager-subscription.service systemd/ss-manager-panel-core.service systemd/ss-manager-panel.service \
+  openrc/sing-box openrc/ss-manager-porthop openrc/ss-manager-porthop-loop.sh openrc/ss-manager-traffic openrc/ss-manager-traffic-loop.sh openrc/ss-manager-subscription \
+  openrc/ss-manager-panel-core openrc/ss-manager-panel; do
   mkdir -p -- "$manager_package_fixture/$(dirname -- "$required_file")"
   : >"$manager_package_fixture/$required_file"
 done

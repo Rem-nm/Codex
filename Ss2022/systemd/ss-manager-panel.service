@@ -1,0 +1,24 @@
+# Managed by Ss2022
+[Unit]
+Description=Ss2022 REM Web Panel (loopback, optional)
+Requires=ss-manager-panel-core.service
+After=ss-manager-panel-core.service
+ConditionPathExists=/run/ss-manager-panel/public.json
+
+[Service]
+Type=simple
+User=ss-manager-panel
+Group=ss-manager-panel
+ExecStart=/usr/bin/python3 /opt/ss-manager/web/panel_server.py
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/ss-manager/web /run/ss-manager-panel/public.json
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

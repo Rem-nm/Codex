@@ -14,6 +14,8 @@ source "$SCRIPT_DIR/lib/system.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/service.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/time_sync.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/singbox.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/traffic.sh"
@@ -128,6 +130,7 @@ ensure_dir "$BACKUP_DIR" 700
 acquire_manager_lock
 recover_incomplete_install_transaction
 recover_incomplete_state_transaction
+time_sync_prepare_provider || die '系统时间同步 Provider 准备失败；项目状态尚未提交。'
 if (( pending_recovery == 1 )); then
   install_preflight_existing_paths
   install_preflight_service_ownership
@@ -180,11 +183,15 @@ if [[ ! -f "$MANAGER_STATE" ]]; then
     --arg manager_version "$MANAGER_VERSION" \
     --arg init_system "$INIT_SYSTEM" \
     --arg created_at "$manager_created_at" \
-    '{schema_version:1,manager_version:$manager_version,init_system:$init_system,install_completed:false,sing_box_version:"",sing_box_binary_managed:false,sing_box_binary_sha256:"",sing_box_version_lock:null,created_at:$created_at,listen_mode:"ipv4",listen_address:"0.0.0.0",tfo_kernel_supported:false,tfo_kernel_enabled:false,tfo_config_supported:false,bbr_supported:false,bbr_enabled:false,tc_capabilities_verified:false,tc_capability_signature:"",quota_include_unauthenticated_upload:false}' \
+    --argjson time_sync "$(time_sync_default_json)" \
+    '{schema_version:1,manager_version:$manager_version,init_system:$init_system,install_completed:false,sing_box_version:"",sing_box_binary_managed:false,sing_box_binary_sha256:"",sing_box_version_lock:null,created_at:$created_at,listen_mode:"ipv4",listen_address:"0.0.0.0",tfo_kernel_supported:false,tfo_kernel_enabled:false,tfo_config_supported:false,bbr_supported:false,bbr_enabled:false,tc_capabilities_verified:false,tc_capability_signature:"",quota_include_unauthenticated_upload:false,time_sync:$time_sync}' \
     | atomic_json_from_stdin "$MANAGER_STATE" 600 || die '无法创建 manager.json。'
 else
   jq -e . "$MANAGER_STATE" >/dev/null || die 'manager.json 无效，安装不会覆盖；请先使用备份恢复。'
 fi
+
+time_sync_migrate_manager_state || die 'manager.json 时间同步设置迁移失败；安装事务将恢复安装前状态。'
+time_sync_record_status >/dev/null || warn '系统时间同步状态暂未写入 manager.json；不影响 sing-box NTP 候选配置。'
 
 initialize_state_files || die '无法初始化状态文件。'
 ensure_tc_capabilities || die '当前系统缺少 Ss2022 所需的 tc 能力；安装前状态将完整恢复。'

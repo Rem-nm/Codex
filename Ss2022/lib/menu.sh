@@ -848,7 +848,7 @@ subscription_management_flow() {
 system_settings_flow() {
   local choice listen_mode listen_address bbr_enabled tfo_kernel_enabled tfo_config_supported
   while true; do
-    printf '\n系统设置\n1. 查看系统能力\n2. 检查/启用 BBR\n3. 检查/启用 TCP Fast Open\n4. 刷新流量接口\n5. 查看 tc 流控规则\n0. 返回\n> '
+    printf '\n系统设置\n1. 查看系统能力\n2. 检查/启用 BBR\n3. 检查/启用 TCP Fast Open\n4. 刷新流量接口\n5. 查看 tc 流控规则\n6. 时间同步\n0. 返回\n> '
     IFS= read -r choice || die '读取输入失败。'
     case "$choice" in
       1)
@@ -864,6 +864,7 @@ system_settings_flow() {
       3) run_menu_action system_tfo_action ;;
       4) run_menu_action system_refresh_interfaces_action ;;
       5) bandwidth_status ;;
+      6) time_sync_menu ;;
       0) return 0 ;;
       *) warn '无效选项。' ;;
     esac

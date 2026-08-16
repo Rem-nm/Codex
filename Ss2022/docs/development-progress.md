@@ -9,6 +9,7 @@
 ~~~text
 docs/development-requirements-port-hopping-and-subscription.md
 docs/development-progress.md
+docs/development-requirements-time-sync-and-ntp.md
 ~~~
 
 每完成一个可验证阶段，必须更新本文件的状态、验证结果、失败点、回滚结果和下一步。不得把 VPS 密码、真实 token、完整订阅 URL、真实节点 URI、Reality Private Key、TLS Private Key 或真实备份写入本文件。
@@ -301,6 +302,80 @@ Token 备份恢复、订阅停用/启用和安装事务恢复通过；VPS 真实
 
 通过。端口跳跃与订阅阶段已提交并合并；后续如需发布新安装入口，应以 main 合并后的正式 Release commit 和归档 SHA256 更新 README 固定值。
 
+### 阶段 F：系统时间同步与 sing-box NTP
+
+状态：代码已接入，Ubuntu/Alpine 非破坏性验证已完成；按用户明确授权提交 GitHub。真实覆盖安装、重启、时间跳变、备份恢复和卸载验证仍作为合并后的后续工作项。
+
+前置基线：
+
+- 阶段 B、C、D 的端口跳跃、订阅和四协议回归已经完成并合并；
+- 当前节点数据库为 schema 5，配额继续使用全局策略，默认只按下载触发限额；
+- 当前项目保持一个 sing-box 服务和一个 sing-box 进程；
+- 当前系统设置、安装、健康检查和配置生成已接入时间同步功能，仍需完成实机覆盖安装、重启、时间跳变、备份恢复和卸载验证。
+
+本阶段文档修改：
+
+- 新增 `docs/development-requirements-time-sync-and-ntp.md`，整理系统 Provider、sing-box NTP、`manager.json.time_sync`、安装/迁移、菜单、健康检查、事务、备份、卸载和测试矩阵；
+- 更新 `docs/data-model.md`，定义 `manager.json.time_sync` 默认结构、合法值和迁移规则；
+- 更新 `docs/architecture.md`，加入系统 NTP 主机制与 sing-box NTP fallback 的两层路径；
+- 更新 `docs/transaction-and-recovery.md`，明确时间设置进入候选配置、检查、提交和回滚边界，且不接管系统 Provider 的卸载；
+- 更新 `docs/release-and-update.md`，明确 Provider 复用、旧 manager 迁移、NTP 配置检查和卸载保留策略；
+- 更新 `README.md`，补充安装提示、系统设置入口、健康警告和支持范围。
+
+已确认的实现原则：
+
+- 先检测并复用已运行的 chrony/chronyd 或 systemd-timesyncd，不同时启动两套 daemon；
+- Debian/Ubuntu 无 Provider 时优先 systemd-timesyncd，CentOS/AlmaLinux 优先 chrony，Alpine 使用 chrony/OpenRC；
+- 默认启用 sing-box NTP：`time.apple.com:123`，周期 `30m`；配置必须由完整候选配置生成并通过官方 `sing-box check`；
+- 不自动修改时区、RTC、防火墙或云安全组；
+- 系统时间同步异常只显示辅助警告，不停止 SS2022、VLESS、Hysteria2、TUIC 或整个 sing-box；
+- 卸载 REM 不删除或停止系统原有、或本次补装的时间同步软件；
+- SS2022 创建前只做时间状态提示，sing-box NTP 已开启时不因系统状态暂时未知而拒绝创建。
+
+已完成的代码接入：
+
+- 新增 `lib/time_sync.sh`，实现 Provider 检测/复用、chrony/timesyncd 原生同步、冲突拒绝、状态展示和 sing-box NTP 设置事务；
+- 安装与 manager 启动/更新路径补齐 `manager.json.time_sync` 迁移、状态记录和候选配置生成；
+- `generate_singbox_config` 增加顶层 NTP 模块，系统设置菜单增加时间同步入口，健康检查增加辅助状态和 SS2022 创建前提示；
+- 新增 `tests/test-time-sync-model.sh`，覆盖旧状态迁移、NTP 参数校验、Provider 选择/冲突和配置生成。
+
+当前未完成：
+
+- CentOS/AlmaLinux 以及无 Provider 主机的安装实机验证；
+- 覆盖安装、重启、时间跳变、备份恢复和卸载验证；
+- 完整脚本回归与四协议/端口跳跃/订阅组合实机验证；
+- 合并后的发布分支现场复核。
+
+### 2026-08-16 阶段 F 非破坏性验证
+
+范围：
+
+Ubuntu（systemd）与 Alpine 3.21（OpenRC）临时源目录；未覆盖现有项目状态、节点、配置或 sing-box 服务。
+
+本地/远端验证：
+
+- Ubuntu：全部 shell 语法、时间同步模型、SS/VLESS/Hysteria2/TUIC、端口跳跃、订阅（含 HTTP）、JSON、校验、平台、回归和深度审计测试通过；现场检测到 `systemd-timesyncd` 且 `Synchronized`；从现有节点生成带 `ntp` 的完整配置并通过实际 sing-box `check`；
+- Alpine：同一套模型、协议、端口跳跃、订阅（含 HTTP）、JSON、校验、平台、回归、深度审计和语法测试通过；现场原本无可确认 Provider，安装并启用 chrony 时因容器缺少 `CAP_SYS_TIME` 启动失败；修复后按设计只记录警告、保留 sing-box NTP fallback，SS2022 创建前检查仍可继续。
+- 最后一轮仅修改了 Provider 无服务时的识别和状态展示；Ubuntu 最新语法/模型已复跑通过，Alpine SSH 随后返回 `Not allowed at this time`，未能复跑该微小差异；此前 Alpine 全套回归证据仍保留。
+
+结果：
+
+通过（模型/静态/只读现场验证）。Provider 启动失败不再阻断安装或其他协议，但真实覆盖安装、重启、时间跳变、备份恢复和卸载仍未执行。
+
+修复与证据：
+
+- 修正 Provider 成功状态码判定、无效 interval 测试引号和 manager 更新包 fixture；
+- 对无法修改系统时钟的宿主机，Provider 安装/启用失败改为明确警告并继续使用 sing-box NTP fallback；不自动安装第二个 daemon；
+- Ubuntu 现场 NTP 状态及实际 `sing-box check` 输出未包含任何真实凭据，未写入仓库。
+
+下一步：
+
+1. 按用户授权提交、推送并合并本阶段 GitHub PR；
+2. 合并后继续完成 Ubuntu 与 Alpine 的覆盖安装前置检查；
+3. 按开发文档执行 Debian 11/12、Ubuntu、Alpine、CentOS、AlmaLinux 的 Provider/重启/时间跳变矩阵；
+4. 完成备份恢复、卸载保留 Provider 和四协议回归；
+5. 汇总所有通过/失败证据，修复后再次执行全套测试。
+
 ## 5. 关键设计决策
 
 ### 5.1 端口跳跃
@@ -402,6 +477,8 @@ Debian 12 与 Alpine 3.21 均完成覆盖安装；两台均完成跳跃开启/�
 
 ## 7. 当前下一步
 
-1. 如继续增量开发，重新读取开发规范和本进度文件；
-2. 新变更仍必须先完成本地、两台 VPS 和全功能回归，再建立新的发布 PR；
-3. 不把任何真实运行数据、凭据或派生订阅内容写入仓库。
+1. 重新读取 `development-requirements-time-sync-and-ntp.md` 与本进度文件；
+2. 按用户授权完成阶段 F 的 GitHub 提交、推送、PR 和合并；
+3. 合并后按时间同步测试矩阵执行 Debian/Ubuntu/Alpine/CentOS/AlmaLinux VPS 测试，并回归四协议、端口跳跃和订阅；
+4. 完成覆盖安装、重启、时间跳变、备份恢复和卸载验证；
+5. 不把任何真实运行数据、凭据或派生订阅内容写入仓库。

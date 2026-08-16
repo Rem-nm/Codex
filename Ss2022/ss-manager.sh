@@ -14,6 +14,8 @@ source "$SCRIPT_DIR/lib/system.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/service.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/time_sync.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/singbox.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/traffic.sh"
@@ -113,6 +115,30 @@ if [[ "${1:-}" == --update-preflight ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == --update-finalize ]]; then
+  require_root
+  detect_host
+  assert_standard_destructive_paths
+  ensure_runtime_dirs
+  time_sync_migrate_manager_state
+  time_sync_record_status >/dev/null || true
+  candidate_time_sync_config=$(runtime_temp_file config.update-finalize) || exit 1
+  generate_singbox_config "$NODES_FILE" "$candidate_time_sync_config" || exit 1
+  singbox_check_config "$candidate_time_sync_config" >/dev/null 2>&1 || exit 1
+  atomic_json_write "$candidate_time_sync_config" "$SING_BOX_CONFIG" 600 || exit 1
+  rm -f -- "$candidate_time_sync_config" || exit 1
+  finalize_active_status=0
+  singbox_is_active || finalize_active_status=$?
+  if (( finalize_active_status == 0 )); then
+    singbox_restart && singbox_health_check "$NODES_FILE" || exit 1
+  elif (( finalize_active_status == 1 )); then
+    singbox_check_config "$SING_BOX_CONFIG" >/dev/null 2>&1 || exit 1
+  else
+    exit 1
+  fi
+  exit 0
+fi
+
 require_root
 detect_host
 assert_standard_destructive_paths
@@ -120,9 +146,11 @@ ensure_runtime_dirs
 acquire_manager_lock
 recover_incomplete_install_transaction
 recover_incomplete_state_transaction
+time_sync_migrate_manager_state || die 'manager.json 时间同步设置迁移失败；请先使用备份恢复。'
 validate_installed_state_files
 ensure_managed_singbox_binary_identity || die 'sing-box 二进制所有权校验失败；请重新运行固定版本 install.sh 修复。'
 initialize_state_files
+time_sync_record_status >/dev/null || warn '系统时间同步状态暂未写入 manager.json；不影响其他协议运行。'
 subscription_initialize || die '订阅设置初始化失败；请先使用备份恢复。'
 subscription_publish_export "$NODES_FILE" || warn '订阅派生输出暂未更新；订阅服务将保持明确的不可用状态。'
 ensure_tc_capabilities
@@ -145,6 +173,8 @@ case "${1:-menu}" in
     ;;
   --health)
     singbox_health_check "$NODES_FILE" && port_hopping_check "$NODES_FILE"
+    time_sync_print_status || true
+    time_sync_health_warning
     ;;
   --port-hop-restore)
     port_hopping_restore "$NODES_FILE"

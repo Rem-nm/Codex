@@ -2,12 +2,12 @@
 
 所有会改变运行 inbound 的节点、状态、限额和限速操作都调用同一个状态事务入口：
 
-1. 对现有 `manager.json`、节点、流量、历史、接口、bandwidth plan、port-hopping plan 和订阅设置执行结构、类型、取值、唯一性与交叉引用校验。
+1. 对现有 `manager.json`（包括 `time_sync`）、节点、流量、历史、接口、bandwidth plan、port-hopping plan 和订阅设置执行结构、类型、取值、唯一性与交叉引用校验。
 2. 在 `/run/ss-manager/` 生成候选节点、流量、历史和 sing-box 配置，执行 `sing-box check`。
 3. 创建常规备份，并在 `/etc/ss-manager/state-transaction/` 保存事务前节点、流量、历史、配置、服务运行状态和阶段日志。
 4. 对每个快照和目录执行 `fsync`，再写入 `switching_config`、`applying_tc`、`committing_state` 等持久阶段。
 5. 切换配置；操作前服务正在运行时快速 restart，用户已停止服务时保持停止。
-6. 检查服务状态、唯一 sing-box PID、完整配置以及每个启用节点和预期地址族的监听 PID 所有权；SS2022 检查 TCP/UDP，VLESS 检查 TCP，Hysteria2/TUIC 检查 UDP。新节点和全部原有节点都必须仍然存在。
+6. 检查服务状态、唯一 sing-box PID、完整配置以及每个启用节点和预期地址族的监听 PID 所有权；SS2022 检查 TCP/UDP，VLESS 检查 TCP，Hysteria2/TUIC 检查 UDP。新节点和全部原有节点都必须仍然存在。时间同步状态作为辅助检查显示，不因系统 Provider 暂时未知而误停其他协议。
 7. 应用并检查带 action cookie、index 和精确 filter handle 所有权的 tc 规则；若存在跳跃节点，再安装并核验 manager 自有 NAT 范围规则；重置候选内核计数基线。
 8. 依次原子提交节点、流量和历史文件，再做最终运行健康检查；提交后重建订阅派生输出，生成失败只让订阅端点不可用，不回滚已健康的 sing-box。
 9. 持久写入 `committed` 才是提交点；之后日志或旧备份清理失败只会延后清理，不会错误回滚已生效状态。
@@ -20,11 +20,11 @@
 
 ## 安装、系统设置和 manager 更新
 
-`install.sh`、BBR/TFO 与默认路由接口系统设置、sing-box/manager 自更新使用更宽的 `/etc/ss-manager/install-transaction/`。它会保存程序目录、全部状态文件、tc/port-hop 计划、订阅设置和派生目录、sing-box 二进制与配置、`rem`、项目 sysctl 文件、服务定义/启用状态、每个服务的运行状态、程序切换暂存路径以及实时 BBR/TFO 值。事务前快照中的嵌套文件和目录都会同步到磁盘后才开始修改；写入 `committed` 前还会再次同步全部当前目标、删除所在父目录和服务启用目录，确保提交标记不会先于它声明的数据落盘。回滚会先依据当前持久 tc/port-hop 计划清理当前规则，再恢复并重建旧计划和订阅输出，最后恢复各服务原有运行状态。
+`install.sh`、BBR/TFO、时间同步与默认路由接口系统设置、sing-box/manager 自更新使用更宽的 `/etc/ss-manager/install-transaction/`。它会保存程序目录、全部状态文件（包括 `manager.json.time_sync`）、tc/port-hop 计划、订阅设置和派生目录、sing-box 二进制与配置、`rem`、项目 sysctl 文件、服务定义/启用状态、每个服务的运行状态、程序切换暂存路径以及实时 BBR/TFO 值。事务前快照中的嵌套文件和目录都会同步到磁盘后才开始修改；写入 `committed` 前还会再次同步全部当前目标、删除所在父目录和服务启用目录，确保提交标记不会先于它声明的数据落盘。回滚会先依据当前持久 tc/port-hop 计划清理当前规则，再恢复并重建旧计划和订阅输出，最后恢复各服务原有运行状态。chrony/timesyncd 属于系统基础 Provider，不伪装成项目服务，也不因 REM 卸载删除；若本轮只复用已有 Provider，事务不会覆盖其配置文件。
 
 安装范围内的 TFO 配置更新可能短暂建立内层状态事务。外层安装事务是权威恢复边界：外层回滚完成程序、状态、服务和 tc 恢复后才清除该内层日志；反过来，存在未恢复状态事务时拒绝建立新的安装事务。
 
-安装依赖由系统包管理器在事务建立前补齐，已安装的软件包不会在失败时卸载；项目自身的程序、数据、服务、HY2/TUIC 证书、port-hop NAT/tc 规则和内核设置会完整回滚，订阅服务故障不会停止 sing-box。重复安装检测到现有 VLESS 节点时，还会在提交前用已选择的 sing-box 和本机安全随机源实际验证 UUID、Reality KeyPair 与 Short ID 的生成/校验能力；存在 TUIC 节点时验证 UUID/Password 生成能力，存在 HY2/TUIC 节点时验证证书、私钥、SAN 和 pin。manager 更新在切换前验证官方 Release SHA256、版本、归档结构、无链接归档、全部 shell 语法及新入口自检能力；新程序还会在不迁移、不提交状态的只读预检中把现有 schema 1/2/3/4/5 节点生成完整候选配置，并用当前受管 sing-box 检查。该预检除权限为 700 的 `/run/ss-manager/` 候选文件外不创建或修改永久目录；旧版 traffic 状态仍需迁移时则拒绝 manager-only 更新并保留给完整安装事务处理。现有 VLESS/TUIC 节点存在时，预检还会验证对应凭据生成能力，存在 HY2/TUIC 时验证证书状态。若断电恰好发生在目录重命名间隙，增强后的 `rem` 只会从唯一、root 所有的旧程序目录启动持久恢复；恢复完成后按日志清理准确的暂存目录，发现多个候选时拒绝猜测。
+安装依赖由系统包管理器在事务建立前补齐，已安装的软件包不会在失败时卸载；项目自身的程序、数据、服务、HY2/TUIC 证书、port-hop NAT/tc 规则和内核设置会完整回滚，订阅服务故障不会停止 sing-box。时间同步 Provider 只选择一套并优先复用已有服务；chrony/timesyncd 不属于项目维护服务，不在卸载时删除。重复安装检测到现有 VLESS 节点时，还会在提交前用已选择的 sing-box 和本机安全随机源实际验证 UUID、Reality KeyPair 与 Short ID 的生成/校验能力；存在 TUIC 节点时验证 UUID/Password 生成能力，存在 HY2/TUIC 节点时验证证书、私钥、SAN 和 pin。manager 更新在切换前验证官方 Release SHA256、版本、归档结构、无链接归档、全部 shell 语法及新入口自检能力；新程序还会在不迁移、不提交状态的只读预检中把现有 schema 1/2/3/4/5 节点生成完整候选配置，并用当前受管 sing-box 检查，同时验证 `manager.json.time_sync` 默认迁移和 NTP 配置字段。该预检除权限为 700 的 `/run/ss-manager/` 候选文件外不创建或修改永久目录；旧版 traffic 状态仍需迁移时则拒绝 manager-only 更新并保留给完整安装事务处理。现有 VLESS/TUIC 节点存在时，预检还会验证对应凭据生成能力，存在 HY2/TUIC 时验证证书状态。若断电恰好发生在目录重命名间隙，增强后的 `rem` 只会从唯一、root 所有的旧程序目录启动持久恢复；恢复完成后按日志清理准确的暂存目录，发现多个候选时拒绝猜测。
 
 旧 schema 1/2/3/4 节点迁移发生在任何菜单编辑之前。安装/修复路径由外层安装事务保护；迁移本身还会先创建语义完整的常规快照，并以原子文件替换把旧 SS2022 节点增加 `protocol: "shadowsocks"`、`subscription_enabled: true`，为 HY2 补齐跳跃默认值，最终写入 schema 5。候选验证或持久提交失败时恢复迁移前节点、证书、bandwidth/port-hop 计划和订阅设置，避免留下半升级状态。
 
